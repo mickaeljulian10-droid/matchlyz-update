@@ -2674,7 +2674,7 @@ def _turbo_concat(d, fps, ext):
     try:
         with open(lst, "w") as f:
             for p in pieces:
-                f.write("file '%s'\n" % os.path.abspath(p))
+                f.write("file '%s'\n" % os.path.abspath(p).replace("\\", "/"))
     except Exception as e:
         return None, "liste concat: " + str(e)
     out = d / ("turbo_out." + ext)
@@ -2780,7 +2780,7 @@ def _render_turbo_build(d, vkey, w, h, fps, ext, runs):
     try:
         with open(lst, "w") as f:
             for p in pieces:
-                f.write("file '%s'\n" % os.path.abspath(p))
+                f.write("file '%s'\n" % os.path.abspath(p).replace("\\", "/"))
     except Exception as e:
         return None, "liste concat: " + str(e), 0
     out = d / ("turbo_out." + ext)
