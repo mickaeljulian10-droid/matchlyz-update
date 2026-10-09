@@ -2661,9 +2661,10 @@ def _turbo_piece_any(run, d, k, vf, fps, vkey):
             err = info or err
     return None, err
 
-def _turbo_concat(d, fps, ext):
+def _turbo_concat(d, fps, ext, total_n=0):
     """Colle les pièces p_*.mp4 (dans l'ordre) + audio. concat -c copy puis repli ré-encodé."""
     ff = _ffexe()
+    _dur = (float(total_n) / float(fps)) if (total_n and fps) else 0.0
     import glob as _glob
     pieces = sorted(_glob.glob(str(d / "p_*.mp4")))
     if not pieces:
@@ -2693,6 +2694,8 @@ def _turbo_concat(d, fps, ext):
             cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(fps)]
         if have_audio:
             cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        if _dur > 0:
+            cmd += ["-t", ("%.3f" % _dur)]
         cmd += ["-movflags", "+faststart", str(out)]
         try:
             subprocess.run(cmd, capture_output=True, timeout=36000)
@@ -2728,7 +2731,7 @@ async def render_turbo_finish(sid: str = Form(...), fps: int = Form(24), fmt: st
     if not d or not d.exists():
         return JSONResponse({"ok": False, "error": "session inconnue"}, status_code=400)
     ext = "mov" if (fmt or "mov") == "mov" else "mp4"
-    out, err = await asyncio.to_thread(_turbo_concat, d, int(fps), ext)
+    out, err = await asyncio.to_thread(_turbo_concat, d, int(fps), ext, int(nframes))
     if not out:
         return JSONResponse({"ok": False, "error": err or "assemblage échoué"}, status_code=500)
     dest = REC / (safe + "." + ext)
@@ -2791,6 +2794,8 @@ def _render_turbo_build(d, vkey, w, h, fps, ext, runs):
     cmd += ["-c:v", "copy"]
     if have_audio:
         cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+    if total_n > 0:
+        cmd += ["-t", ("%.3f" % (float(total_n) / float(fps)))]
     cmd += ["-movflags", "+faststart", str(out)]
     ok = False
     try:
@@ -2813,6 +2818,8 @@ def _render_turbo_build(d, vkey, w, h, fps, ext, runs):
         cmd += chosen + ["-r", str(fps)]
         if have_audio:
             cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        if total_n > 0:
+            cmd += ["-t", ("%.3f" % (float(total_n) / float(fps)))]
         cmd += ["-movflags", "+faststart", str(out)]
         try:
             p = subprocess.run(cmd, capture_output=True, timeout=36000)
