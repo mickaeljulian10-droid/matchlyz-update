@@ -5083,7 +5083,7 @@ function fzTotalDur(fz){ if(fz&&Array.isArray(fz.states)&&fz.states.length) retu
 // dans fz.dur — sinon fzEnsureStates réécrit fz.dur = somme des états et la modif faite sur la timeline
 // « revenait à sa durée de départ ». La variation est portée par le DERNIER état. Renvoie la nouvelle durée.
 function _fzSetTotal(fz,total){ fzEnsureStates(fz); total=Math.max(0.2,total); const li=fz.states.length-1; let others=0; for(let i=0;i<li;i++)others+=Math.max(0.2,(fz.states[i].dur!=null?fz.states[i].dur:2)); fz.states[li].dur=+Math.max(0.2,total-others).toFixed(2); fz.dur=+fzTotalDur(fz).toFixed(3); return fz.dur; }
-async function openAnno(fz){ anno.fz=fz; fzEnsureStates(fz); anno.curState=1; anno.sel=null; anno.drag=null; buildAnnoTools(); resetToSel(); const rec=await dbGet('blobs',fz.imgId); if(!rec)return;
+async function openAnno(fz){ const _real=(fz&&fz._fz)||fz; fzEnsureStates(_real); if(fz!==_real){ fz.states=_real.states; fz.annotations=_real.annotations; } anno.fz=fz; fzEnsureStates(fz); anno.curState=1; anno.sel=null; anno.drag=null; buildAnnoTools(); resetToSel(); const rec=await dbGet('blobs',fz.imgId); if(!rec)return;
   const img=await blobToImg(rec.blob); anno.img=img; cv.width=img.width; cv.height=img.height; redrawAnno(); renderAnnoParams(); $('anno').classList.remove('hidden'); kickAnnoLoop(); }
 let _annoRaf=0;
 function _hasAnimRing(){ if(!anno.fz)return false; const cs=anno.curState||1; return (anno.fz.annotations||[]).some(a=>(a.st||1)===cs && ringAnimated(a)); }
