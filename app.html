@@ -2608,7 +2608,7 @@ async function projMenuFor(id,x,y){ const p=await dbGet('projects',id); if(!p)re
   {label:'👤 Changer de joueur ▸', sub:true, fn:()=>showMenu(x,y, [{label:'(aucun — sans joueur)',fn:async()=>{ p.playerId=null; p.updated=Date.now(); await dbPut('projects',p); refreshList(); }}].concat(players.length?players.map(pl=>({label:(pl.id===p.playerId?'✓ ':'')+playerName(pl),fn:async()=>{ p.playerId=pl.id; p.updated=Date.now(); await dbPut('projects',p); refreshList(); }})):[{label:'(aucun joueur créé)',fn:()=>{}}]).concat([{label:'← retour',sub:true,fn:()=>projMenuFor(id,x,y)}])) },
   {label:'💾 Enregistrer dans un fichier', fn:()=>exportOneProject(id)},
   {sep:true},
-  {label:'🗑 Supprimer', fn:async()=>{ if(confirm('Supprimer le match « '+p.name+' » ? (définitif)')){ await dbDel('projects',id); refreshList(); } }},
+  {label:'🗑 Supprimer', fn:async()=>{ if(confirm('Supprimer le match « '+p.name+' » ? (définitif)')){ await dbDel('projects',id); const _f=await gcSweepSilent(id); refreshList(); try{ if(_f>1048576)alert('🗑 Match supprimé — '+_fmtGo(_f)+' libéré(s) directement.'); }catch(e){} } }},
 ]); }
 // ===== NETTOYAGE DU STOCKAGE =====
 // Supprime les blobs (vidéos, images d'arrêt sur image, voix) qui ne sont PLUS référencés par aucun match/
@@ -2643,6 +2643,16 @@ async function cleanStorage(){
   const res=await _gcScanBlobs(refs,true);
   alert('✅ Terminé : '+res.count+' élément(s) supprimé(s), ~'+_fmtGo(res.bytes)+' libéré(s).\n\nFerme et rouvre MatchLyz : l\'espace disque va redescendre (Chromium libère les fichiers).');
 }
+// Nettoyage SILENCIEUX ciblé : appelé juste après la suppression d'un dossier/montage pour
+// libérer immédiatement les blobs (voix, arrêts sur image, miniatures) devenus orphelins,
+// sans dialogue. `deletedId` = l'élément qu'on vient de supprimer (exclu même s'il est encore
+// ouvert en mémoire). Ne touche QUE les blobs qui ne servent plus à aucun élément conservé.
+async function gcSweepSilent(deletedId){ try{
+  const refs=new Set();
+  for(const s of ['projects','boards','montages']){ let arr=[]; try{ arr=await dbAll(s); }catch(e){} for(const rec of arr)_gcCollectRefs(rec,refs,0); }
+  try{ if(typeof project!=='undefined'&&project&&project.id!==deletedId)_gcCollectRefs(project,refs,0); }catch(e){}
+  const res=await _gcScanBlobs(refs,true); return (res&&res.bytes)||0;
+}catch(e){ return 0; } }
 // DOSSIER DE TRAVAIL DU MOTEUR sur DISQUE EXTERNE (cache vidéos + rendus) -> le Mac ne se remplit plus.
 async function _refreshEngineStoreLabel(){ const el=document.getElementById('engStoreCur'); if(!el)return;
   let cur=''; try{ if(window.matchlyzEngineStorage)cur=await window.matchlyzEngineStorage.get(); }catch(e){}
@@ -2803,7 +2813,7 @@ async function renderPlayer(pid){ currentPlayerId=pid; const p=await dbGet('play
 }
 async function gearMenu(id,backPid){ const p=await dbGet('projects',id); if(!p)return;
   const c=prompt('Renommer le match (ou tape SUPPR pour le supprimer) :',p.name); if(c===null)return;
-  if(c.trim().toUpperCase()==='SUPPR'){ if(confirm('Supprimer « '+p.name+' » ?')){await dbDel('projects',id); backPid?renderPlayer(backPid):renderHome();} return; }
+  if(c.trim().toUpperCase()==='SUPPR'){ if(confirm('Supprimer « '+p.name+' » ?')){await dbDel('projects',id); const _f=await gcSweepSilent(id); try{ if(_f>1048576)alert('🗑 Match supprimé — '+_fmtGo(_f)+' libéré(s) directement.'); }catch(e){} backPid?renderPlayer(backPid):renderHome();} return; }
   p.name=c.trim()||p.name; p.updated=Date.now(); await dbPut('projects',p); backPid?renderPlayer(backPid):renderHome();
 }
 async function newProject(pid){ const name=prompt('Nom du match :','Match '+(new Date().toLocaleDateString())); if(!name)return;
@@ -8500,7 +8510,7 @@ function openBoard(existing){
 // ===== BIBLIOTHÈQUE GLOBALE DE MONTAGES NOMMÉS =====
 let _montDoc=null;
 async function montLibList(){ try{ const a=await dbAll('montages'); return (a||[]).sort((x,y)=>(y.updated||0)-(x.updated||0)); }catch(e){ return []; } }
-async function montLibDelete(id){ try{ await dbDel('montages',id); }catch(e){} }
+async function montLibDelete(id){ try{ await dbDel('montages',id); }catch(e){} try{ await gcSweepSilent(id); }catch(e){} }
 function montUsedMedia(pj){ pj=pj||project; const used=new Set(); ((pj.timeline&&pj.timeline.clips)||[]).forEach(c=>{ if(c.mediaId)used.add(c.mediaId); }); return (pj.media||[]).filter(m=>used.has(m.id)).map(m=>JSON.parse(JSON.stringify(m))); }
 async function montSaveCurrent(name,silent){ if(!project){ alert('Ouvre un dossier.'); return null; } const id=_montDoc||('mont_'+Date.now()+'_'+Math.random().toString(36).slice(2,6)); _montDoc=id;
   if(name)window._montName=name;
@@ -8573,7 +8583,9 @@ async function montageGalleryOpen(){ if(!project)ensureScratchProject();
   // se fait UNIQUEMENT depuis l'Accueil, pour éviter d'effacer un dossier entier en croyant retirer un montage).
   const folderCards=projs.map(p=>{ const n=((p.timeline&&p.timeline.clips)||[]).length; const nm=(p.name||'Analyse').replace(/</g,'&lt;'); return '<div class="mgfolder" data-pid="'+p.id+'" style="background:#12181c;border:1px solid #2b3a2f;border-radius:10px;padding:10px;cursor:pointer;display:flex;flex-direction:column;min-height:84px"><b style="color:#7fe0b0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📁 '+nm+'</b><span style="color:#7f8c95;font-size:10px;margin:3px 0 auto">Montage du dossier · '+n+' clip(s)</span><div style="display:flex;gap:6px;margin-top:6px"><button class="mgfclear btn sm" data-pid="'+p.id+'" title="Retirer de cette liste (vide le montage du dossier — garde le dossier et ses tags)">✕ Retirer de la liste</button></div></div>'; }).join('');
   const docCards=list.length?list.map(e=>{ const nm=(e.name||'Montage').replace(/</g,'&lt;'); const n=((e.data&&e.data.clips)||[]).length; return '<div class="mgcard" data-id="'+e.id+'" style="background:#12181c;border:1px solid #26313a;border-radius:10px;padding:10px;cursor:pointer;display:flex;flex-direction:column;min-height:84px"><b style="color:#e6eef2;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">🎞 '+nm+'</b><span style="color:#7f8c95;font-size:10px;margin:3px 0 auto">'+n+' clip(s) · '+new Date(e.updated||0).toLocaleDateString()+'</span><div style="display:flex;gap:6px;margin-top:6px"><button class="mgren btn sm" data-id="'+e.id+'" style="flex:1">✎ Renommer</button><button class="mgdel btn sm danger" data-id="'+e.id+'">🗑</button></div></div>'; }).join(''):'';
-  grid.innerHTML=curCard+folderCards+docCards;
+  // Galerie = UNIQUEMENT les montages enregistrés (les « Montage du dossier » verts sont masqués
+  // pour éviter la confusion dossier/montage ; on rouvre le montage d'un match via son dossier à l'Accueil).
+  grid.innerHTML = docCards || '<div style="grid-column:1/-1;color:#7f8c95;text-align:center;padding:36px 16px;font-size:13px">Aucun montage enregistré pour l\'instant.<br>Crée ton premier montage avec le bouton ci-dessous.</div>';
   g.querySelector('#mgClose').onclick=()=>{ g.style.display='none'; try{navTo('home');}catch(e){} };
   g.querySelector('#mgNew').onclick=async()=>{ const nm=(g.querySelector('#mgName').value||'Montage').trim()||'Montage'; _montDoc=null; window._montName=nm;
     // Nouveau montage = espace PROPRE (aucun clip d'un dossier) : on repart d'un espace libre vide.
@@ -11289,8 +11301,31 @@ function renderMTL(){ const host=$('mtl'); if(!host)return; const _sl=host.scrol
     const ph=document.createElement('div'); ph.className='mtl-ph'; ph.dataset.mph='1'; body.appendChild(ph);
     row.appendChild(body); host.appendChild(row); });
   if(mtlUserH==null){ host.style.height=mtlAutoHeight()+'px'; } else { host.style.height=mtlUserH+'px'; }
-  drawMPh(); host.scrollLeft=_sl;
+  drawMPh(); host.scrollLeft=_sl; layoutMStage();
 }
+// Agrandit l'aperçu vidéo pour occuper tout l'espace libre de la scène montage :
+// quand on réduit la hauteur de la timeline, le canvas grandit (et inversement).
+function layoutMStage(){ try{
+  const stage=document.querySelector('#montage .mstage'); if(!stage||!stage.clientHeight)return;
+  const mcv=$('mcv'); if(!mcv)return;
+  let used=0; const kids=Array.from(stage.children);
+  kids.forEach(ch=>{ if(ch!==mcv) used+=ch.offsetHeight; });
+  const cs=getComputedStyle(stage);
+  const gap=parseFloat(cs.rowGap||cs.gap||'0')||0;
+  const padY=(parseFloat(cs.paddingTop)||0)+(parseFloat(cs.paddingBottom)||0);
+  const padX=(parseFloat(cs.paddingLeft)||0)+(parseFloat(cs.paddingRight)||0);
+  const availH=stage.clientHeight - used - gap*Math.max(0,kids.length-1) - padY - 4;
+  const availW=stage.clientWidth - padX - 4;
+  if(availH<120||availW<120)return;
+  // On DIMENSIONNE explicitement l'aperçu pour remplir la place libre (agrandissement
+  // autorisé), en gardant le ratio. width:auto + max-height ne faisaient que rétrécir.
+  const ar=((mcv.width||RW)/(mcv.height||RH))||(16/9);
+  let w=availW, h=w/ar;
+  if(h>availH){ h=availH; w=h*ar; }
+  mcv.style.maxWidth='none'; mcv.style.maxHeight='none';
+  mcv.style.width=Math.floor(w)+'px'; mcv.style.height=Math.floor(h)+'px';
+}catch(e){} }
+window.addEventListener('resize',()=>{ try{ layoutMStage(); }catch(e){} });
 function makeClipEl(c){ const el=document.createElement('div'); el.className='mclip'+((c===mtlSel||mtlSelSet.has(c.id))?' sel':''); el.dataset.cid=c.id;
   el.style.left=(c.start*mtlPx)+'px'; el.style.width=Math.max(10,c.dur*mtlPx)+'px'; el.style.background=c.color||'#ff7a45';
   const lbl=c.kind==='text'?('🅣 '+(c.text||'Texte').split('\n')[0]):(c.name||c.kind);
@@ -11589,7 +11624,7 @@ document.addEventListener('mouseup',()=>{ if(mScrub){ mScrub=false; scrubRender(
 function drawMPh(){ document.querySelectorAll('[data-mph]').forEach(p=>p.style.left=(mPlayT*mtlPx)+'px'); }
 let mtlhDrag=null;
 $('mtlresize').addEventListener('mousedown',ev=>{ mtlhDrag={y:ev.clientY,h:$('mtl').offsetHeight}; ev.preventDefault(); });
-document.addEventListener('mousemove',ev=>{ if(!mtlhDrag)return; const h=Math.max(80,Math.min(window.innerHeight*0.78, mtlhDrag.h+(mtlhDrag.y-ev.clientY))); mtlUserH=h; $('mtl').style.maxHeight='none'; $('mtl').style.height=h+'px'; });
+document.addEventListener('mousemove',ev=>{ if(!mtlhDrag)return; const h=Math.max(80,Math.min(window.innerHeight*0.78, mtlhDrag.h+(mtlhDrag.y-ev.clientY))); mtlUserH=h; $('mtl').style.maxHeight='none'; $('mtl').style.height=h+'px'; layoutMStage(); });
 document.addEventListener('mouseup',()=>{ mtlhDrag=null; });
 // déplacer l'image à la souris sur l'écran (quand zoomée)
 let mcvDrag=null, mcvRaf=0;
@@ -11606,7 +11641,7 @@ function seekAndDraw(el,target,c){ return new Promise(res=>{ const _draw=()=>{ t
     try{ if(el && el.readyState>=2 && Math.abs((el.currentTime||0)-target) < 0.021){ _draw(); return res(); } }catch(e){}
     let did=false; let tm; const fin=()=>{ if(did)return; did=true; el.removeEventListener('seeked',fin); clearTimeout(tm); _draw(); res(); }; el.addEventListener('seeked',fin); tm=setTimeout(fin,500); try{el.currentTime=Math.max(0,target);}catch(e){fin();} }); }
 async function drawStaticAt(t){ try{$('mcv').style.cursor=(mtlSel&&(mtlSel.zoom>1||mtlSel.kind==='text'))?'move':'default';}catch(e){} if(mPlaying)return; if(!project.timeline.clips.length)return;
-  setRenderDims(); const cvEl=$('mcv'); if(cvEl.width!==RW||cvEl.height!==RH){cvEl.width=RW;cvEl.height=RH;} rctx=cvEl.getContext('2d');
+  setRenderDims(); const cvEl=$('mcv'); if(cvEl.width!==RW||cvEl.height!==RH){cvEl.width=RW;cvEl.height=RH;layoutMStage();} rctx=cvEl.getContext('2d');
   if(mAssetsDirty||!mAssets){ if(!_mAssetsBuild){ mAssetsDirty=false; _mAssetsBuild=prepareAssets(project.timeline.clips).then(_a=>{mAssets=_a;}).catch(()=>{}).finally(()=>{_mAssetsBuild=null;}); } try{ await _mAssetsBuild; }catch(e){} if(!mAssets){ return; } }
   engineClips=project.timeline.clips;
   const CLR=()=>{ rctx.fillStyle='#000'; rctx.fillRect(0,0,RW,RH); };
