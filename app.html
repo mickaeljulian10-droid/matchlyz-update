@@ -4201,6 +4201,11 @@ function openSettings(){
         <div class="setSec"><h4>Apparence</h4>
         <div class="setItem"><label>Couleur de l'interface (accent)</label><input type="color" id="setAccent" value="${accentCur}" style="width:54px;height:34px;padding:2px;border:1px solid var(--line);border-radius:8px;background:#15181c;cursor:pointer"><button class="btn" id="setAccentReset">Défaut</button></div>
         <div class="setSub">Change la couleur principale de l'app (boutons, sélections, lignes). Appliquée partout, immédiatement.</div>
+        </div>
+        <div class="setSec"><h4>Abonnement</h4>
+        <div class="setItem"><label>Changer de code d'activation sur cet ordinateur</label><button class="btn danger" id="setLicLogout">🔓 Se déconnecter / changer de code</button></div>
+        <div class="setSub">Déconnecte le code actuel de <b>cet ordinateur</b> et revient à l'écran d'activation pour saisir un autre code. Ton abonnement n'est pas annulé — seul l'appareil est libéré (utile pour changer d'ordinateur ou de code).</div>
+        <div class="setItem" style="margin-top:8px"><label>Gérer mon abonnement (facture, carte, résiliation)</label><button class="btn" id="setLicPortal">💳 Gérer mon abonnement</button></div>
         </div>`;
       if(hasP) h+=`<div class="setSec"><h4>Espace de travail — ${esc(project.name)}</h4>
         <div class="setItem"><label>Nom de l'espace</label><input id="setName" value="${esc(project.name)}" style="width:240px"><button class="btn" id="setRename">Renommer</button></div>
@@ -4211,6 +4216,13 @@ function openSettings(){
       const _f=$('setFmt'); _f.value=fmtDef; _f.onchange=()=>{ const v=_f.value; try{localStorage.setItem('mlz_fmt',v);}catch(e){} if(hasP){ project.exportFormat=v; save(); } const m=$('mFormat'); if(m)m.value=v; };
       const _ac=$('setAccent'); if(_ac){ _ac.oninput=()=>{ const c=_ac.value; document.documentElement.style.setProperty('--accent',c); try{localStorage.setItem('mlz_accent',c);}catch(e){} }; }
       const _acr=$('setAccentReset'); if(_acr){ _acr.onclick=()=>{ document.documentElement.style.setProperty('--accent','#00e08f'); try{localStorage.setItem('mlz_accent','#00e08f');}catch(e){} if(_ac)_ac.value='#00e08f'; }; }
+      { const _llo=$('setLicLogout'); if(_llo){ _llo.onclick=async()=>{
+          if(!confirm('Se déconnecter de ce code sur cet ordinateur ?\n\nTu reviendras à l’écran d’activation pour saisir un autre code. Ton abonnement n’est PAS annulé.')) return;
+          _llo.disabled=true; _llo.textContent='…';
+          try{ await fetch('/license/release',{method:'POST'}); }catch(e){}
+          try{ location.reload(); }catch(e){ location.href=location.href; }
+        }; } }
+      { const _lpp=$('setLicPortal'); if(_lpp){ _lpp.onclick=()=>{ try{ window.open('https://billing.stripe.com/p/login/8x2dRa5uG0PSfWm2REbAs00','_blank'); }catch(e){ location.href='https://billing.stripe.com/p/login/8x2dRa5uG0PSfWm2REbAs00'; } }; } }
       if(hasP){ $('setRename').onclick=()=>{ const v=$('setName').value.trim(); if(v){ project.name=v; const pn=$('projName'); if(pn)pn.textContent=v; save(); render('general'); } };
         $('setClearTl').onclick=()=>{ if(confirm('Vider toute la timeline du montage ?')){ project.timeline.clips=[]; save(); } }; }
     }
