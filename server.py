@@ -4082,33 +4082,6 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
                         "ok": bool(conf >= 0.7), "kind": ("anchor" if i in anc_idx else "snap"), "_pre": _pre})
         cap4.release(); _tSnap = _time.perf_counter()
         out.sort(key=lambda k: k["t"])
-        # ===== FILTRE DE COHÉRENCE (anti « terrain qui part dans tous les sens ») =====
-        # Le terrain physique a des dimensions FIXES : d'une frame à l'autre, la largeur basse (touche proche)
-        # et la hauteur projetées ne doivent varier que doucement (la caméra bouge, pas le terrain). Sur la Veo
-        # 4K, les ancres PnL donnent parfois des dimensions incohérentes (bas 2.0 puis 4.3 puis 3.8...). On
-        # calcule la MÉDIANE du clip et on écarte les frames trop éloignées -> il ne reste que des frames
-        # cohérentes entre elles. On ne vide jamais tout (repli : si trop peu resterait, on garde l'original).
-        try:
-            def _wbh(k):
-                p = k["pts"]; xTL,yTL = p[0]["i"]; xTR,yTR = p[1]["i"]; xBR,yBR = p[2]["i"]; xBL,yBL = p[3]["i"]
-                return abs(xBR-xBL), abs(((yBL+yBR)/2.0)-((yTL+yTR)/2.0))
-            if len(out) >= 5:
-                _wb = []; _hh = []
-                for k in out:
-                    wb, hh = _wbh(k); _wb.append(wb); _hh.append(hh)
-                _sw = sorted(_wb); _sh = sorted(_hh)
-                _mwb = _sw[len(_sw)//2]; _mhh = _sh[len(_sh)//2]   # médianes (robustes aux aberrations)
-                _kept = []
-                for i, k in enumerate(out):
-                    wb, hh = _wb[i], _hh[i]
-                    okw = (_mwb <= 1e-6) or (0.78*_mwb <= wb <= 1.25*_mwb)
-                    okh = (_mhh <= 1e-6) or (0.78*_mhh <= hh <= 1.25*_mhh)
-                    if okw and okh: _kept.append(k)
-                if len(_kept) >= 3 and len(_kept) < len(out):
-                    _cdiag("  cohérence terrain : %d/%d frame(s) écartée(s) (hors 0.78–1.25× médiane bas=%.2f h=%.2f)" % (len(out)-len(_kept), len(out), _mwb, _mhh))
-                    out = _kept
-        except Exception as _ce:
-            _cdiag("  cohérence terrain err: %s" % _ce)
         # DIAG terrain : largeur haute (touche lointaine), largeur basse (touche proche) et hauteur du
         # terrain projeté, par frame -> si ça varie beaucoup d'une frame à l'autre = terrain qui "saute".
         try:
