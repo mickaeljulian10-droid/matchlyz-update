@@ -10947,9 +10947,16 @@ $('mBg').onclick=()=>addBgClip();
 { const _at=$('mAddTrack'); if(_at)_at.onclick=()=>{ addMTrack(); mstat('Piste ajoutée — glisse tes clips, images, textes ou voix dessus.'); }; }
 function addBgClip(){ if(!project){return;} const s=mPlayT||0; const clip={id:'c_'+uid(),track:'V1',kind:'bg',start:s,dur:5,color:'#1e2b4d',name:'Fond'}; project.timeline.clips.push(clip); rippleTrack('V1'); mtlSel=clip; mtlSelSet.clear(); mtlSelSet.add(clip.id); mAssetsDirty=true; save(); renderMTL(); showParam(); drawStaticAt(mPlayT); mstat('Fond ajouté — choisis la couleur dans Paramètres, puis ajoute un Texte (🅣) par-dessus.'); }
 $('mDiag').onclick=()=>exportDiagnostic();
-function addTextClip(){ if(!project){return;} const s=mPlayT||0;
-  const clip={id:'c_'+uid(),track:'T1',kind:'text',start:s,dur:3,text:'Situation défensive',fontSize:54,fontFamily:'Montserrat',color:'#ffffff',bg:true,bgColor:'#000000',bgAlpha:0.55,bold:true,italic:false,align:'center',posX:0.5,posY:0.85};
-  project.timeline.clips.push(clip); rippleTrack('T1'); mtlSel=clip; mtlSelSet.clear(); mtlSelSet.add(clip.id); save(); renderMTL(); showParam(); drawStaticAt(mPlayT); mstat('Texte ajouté — édite-le dans Paramètres (à droite).'); }
+// Première piste LIBRE à l'instant [s, s+d] (aucun clip qui chevauche), piste non verrouillée. Sinon on CRÉE
+// une nouvelle piste -> plusieurs textes AU MÊME MOMENT ont chacun leur propre ligne, tous visibles/éditables.
+function firstFreeTrackAt(s,d){ const ts=mtracks();
+  for(const tr of ts){ if(tr.locked)continue;
+    const clash=(project.timeline.clips||[]).some(c=>c.track===tr.id && s < (c.start+(c.dur||0)) && (s+d) > c.start);
+    if(!clash)return tr.id; }
+  const nid='P'+uid(); project.timeline.tracks=project.timeline.tracks||ts; project.timeline.tracks.push({id:nid,label:'Piste '+(project.timeline.tracks.length+1)}); return nid; }
+function addTextClip(){ if(!project){return;} const s=mPlayT||0; const tid=firstFreeTrackAt(s,3);
+  const clip={id:'c_'+uid(),track:tid,kind:'text',start:s,dur:3,text:'Situation défensive',fontSize:54,fontFamily:'Montserrat',color:'#ffffff',bg:true,bgColor:'#000000',bgAlpha:0.55,bold:true,italic:false,align:'center',posX:0.5,posY:0.85};
+  project.timeline.clips.push(clip); mtlSel=clip; mtlSelSet.clear(); mtlSelSet.add(clip.id); save(); renderMTL(); showParam(); drawStaticAt(mPlayT); mstat('Texte ajouté sur une piste libre — édite-le dans Paramètres (à droite).'); }
 async function previewAction(a){ const vd=await measureVoice(a); const plan=planAnalytic(a,vd);
   await runEngine({clips:[{id:'prev',track:'V1',kind:'analytic',actionId:a.id,start:0,dur:plan.dur,voiceDur:vd}],record:false,startAt:0}); }
 // --- enregistrement voix dans le montage (items 39 & 41) ---
