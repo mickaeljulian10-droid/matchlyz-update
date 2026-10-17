@@ -7549,12 +7549,19 @@ function consolidateCalibs(a, win){ win=win||0.7; if(!a||!a.calibs||a.calibs.len
     let i=0; while(i<seq.length){ if(seq[i].bad){ let j=i; while(j<seq.length&&seq[j].bad)j++;
         const span=seq[j-1].c.t-seq[i].c.t; if((j-i)<2 && span<0.5){ for(let k=i;k<j;k++)seq[k].bad=false; } i=j; } else i++; }
     let run=[], curBad=null;
-    const flush=()=>{ if(!run.length)return; const bad=run.some(x=>x.bad);
-      const arr=run.map(x=>x.c);
-      const rep = bad ? arr.reduce((m,c)=>((c.conf||0)<(m.conf||0)?c:m),arr[0])
-                      : arr.reduce((m,c)=>((c.conf||0)>(m.conf||0)?c:m),arr[0]);
+    const _pushRep=(arr,bad)=>{ const rep = bad ? arr.reduce((m,c)=>((c.conf||0)<(m.conf||0)?c:m),arr[0])
+                                               : arr.reduce((m,c)=>((c.conf||0)>(m.conf||0)?c:m),arr[0]);
       if(bad) rep.ok=false;
-      if(!manual.some(mc=>Math.abs(mc.t-rep.t)<0.4)) keep.push(rep); run=[]; };
+      if(!manual.some(mc=>Math.abs(mc.t-rep.t)<0.35)) keep.push(rep); };
+    // On GARDE une frame ~toutes les 0,5 s (au lieu d'une seule pour tout un segment) : le terrain reste
+    // calibré sur CHAQUE instant -> il suit le mouvement de caméra. (Avant : 1 point/segment + chemin
+    // caméra, qui laissait le terrain figé quand la caméra bougeait.) Ne change pas le CALCUL du terrain.
+    const flush=()=>{ if(!run.length)return; const bad=run.some(x=>x.bad); const arr=run.map(x=>x.c);
+      if(bad){ _pushRep(arr,true); run=[]; return; }
+      let seg=[], t0=arr[0].t;
+      arr.forEach(c=>{ if(seg.length && (c.t-t0)>0.5){ _pushRep(seg,false); seg=[]; t0=c.t; } seg.push(c); });
+      if(seg.length) _pushRep(seg,false);
+      run=[]; };
     seq.forEach(s=>{ if(curBad===null||s.bad===curBad){ run.push(s); } else { flush(); run.push(s); } curBad=s.bad; });
     flush();
   } else {
@@ -7576,12 +7583,20 @@ async function aiCalibrateClip(vkey){ const a=aiwin.action; const pid='cal_'+Mat
       a.camPath=(r.cam&&r.cam.length)?r.cam.map(s=>({t:+s.t, r:s.r.map(p=>[+p[0],+p[1]])})):null;
       a.calVis=(r.field_ranges&&r.field_ranges.length)?r.field_ranges.map(x=>[+x[0],+x[1]]):null;   // plages où le TERRAIN est visible (hors = public/gros plan : pas de terrain)
       r.keyframes.forEach(kf=>{ const pts=kf.pts.map(p=>({f:[+p.f[0],+p.f[1]],i:[+p.i[0],+p.i[1]]})); if(pts.length>=4)a.calibs.push({t:+kf.t,pts,Hf2i:solveHN(pts.map(p=>p.f),pts.map(p=>p.i)),Hi2f:solveHN(pts.map(p=>p.i),pts.map(p=>p.f)),w:FIELD_W,h:FIELD_H,auto:true,conf:(kf.conf!=null?kf.conf:1),ok:(kf.ok!==false),kind:kf.kind||'anchor'}); });
-      a.calibs.sort((x,y)=>x.t-y.t); consolidateCalibs(a,0.7); if(typeof aiwin!=='undefined'&&aiwin)aiwin._hc=null; aiwin._calProgOn=false; return a.calibs.length; }
+      const _nRecu=r.keyframes.length, _nPush=a.calibs.length, _nValid=a.calibs.filter(c=>c&&c.Hf2i).length;
+      const _nAnchor=a.calibs.filter(c=>c&&c.kind==='anchor').length;
+      a.calibs.sort((x,y)=>x.t-y.t); consolidateCalibs(a,0.7); const _nKeep=a.calibs.length;
+      try{ console.log('[CAL] reçues='+_nRecu+' poussées='+_nPush+' Hf2iValides='+_nValid+' ancres='+_nAnchor+' -> gardées='+_nKeep); }catch(e){}
+      if(typeof aiwin!=='undefined'&&aiwin)aiwin._hc=null; aiwin._calProgOn=false; return a.calibs.length; }
   }catch(e){ aiwin._calProgOn=false; }
   aiwin._calProgOn=false; return 0; }
 // À L'OUVERTURE DU SUIVI IA : l'IA place les points et calibre le terrain automatiquement.
 // Si elle réussit -> terrain calibré (tu corriges si besoin). Sinon -> mappage manuel guidé.
 async function aiAutoCalibOnOpen(){ const a=aiwin.action; if(!a||!aiwin.open)return;
+  // PURGE d'un calibrage AUTO dégénéré (1 seule frame, sans point manuel ni chemin caméra) laissé par une
+  // session précédente : sinon la réouverture le GARDE et on reste bloqué à « 1 frame ». On le jette ->
+  // la détection fraîche se relance juste après comme sur un dossier neuf.
+  try{ const _cc=a.calibs||[]; if(_cc.length && _cc.length<2 && !_cc.some(c=>c&&c.manual) && !(a.camPath&&a.camPath.length)){ a.calibs=[]; a.camPath=null; a.calVis=null; } }catch(e){}
   if(hasCalib(a)){ const n0=(a.calibs||[]).length;
     // RÉPARATION des données abîmées (bug consolidateCalibs) : doublons quasi au même instant -> on garde le meilleur (manuel prioritaire)
     { a.calibs.sort((x,y)=>x.t-y.t); const out=[]; a.calibs.forEach(c=>{ const last=out[out.length-1];
@@ -9519,8 +9534,9 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
     const up=()=>{ document.removeEventListener('mousemove',mv); document.removeEventListener('mouseup',up); const bx=aiwin._fixNew; aiwin._fixNew=null; if(!bx)return;
       const X0=Math.min(bx.x0,bx.x1),X1=Math.max(bx.x0,bx.x1),Y0=Math.min(bx.y0,bx.y1),Y1=Math.max(bx.y0,bx.y1);
       const w=Math.max(0.02,X1-X0), h=Math.max(0.05,Y1-Y0), cx=(X0+X1)/2, feet=Y1;
-      // accroche à la détection sur laquelle on a posé la boîte (gardien inclus) — sinon on garde le tracé.
-      let sxr=cx, syr=feet, sbw=w, sbh=h; { const dbx=(aiwin._detBoxes||[]); let bb=null; for(const b of dbx){ const bw2=(b.w||0.05),bh2=(b.h||0.13); if(cx>=b.x-bw2/2&&cx<=b.x+bw2/2&&feet>=b.y-bh2&&feet<=b.y+bh2*0.15){ if(!bb||Math.hypot(b.x-cx,b.y-feet)<Math.hypot(bb.x-cx,bb.y-feet))bb=b; } } if(bb){ sxr=bb.x; syr=bb.y; sbw=bb.w||w; sbh=bb.h||h; } }
+      // SUIVI INDÉPENDANT : on part EXACTEMENT de la boîte que TU as dessinée (aucune accroche à une
+      // détection YOLO voisine, aucun déplacement vers un autre rectangle). Ta position = la graine.
+      let sxr=cx, syr=feet, sbw=w, sbh=h;
       // REPRISE d'un joueur SÉLECTIONNÉ (après disparition) : on ne crée PAS un nouveau suivi, on relance
       // CE joueur à partir de cet instant. Le début déjà bon est conservé ; le trou d'absence est remplacé.
       const fs=aiwin._fixMode?aiwin._fixSel:null;
@@ -9531,13 +9547,11 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
         if(fs.slot<0){ fs.an._fixok=(performance.now?performance.now():Date.now())+1600; aiRecompute(fs.an,+t.toFixed(3),sxr,syr,sbw,sbh); }
         else { const fk=fs.an.follow&&fs.an.follow[fs.slot]; if(fk)fk._fixok=(performance.now?performance.now():Date.now())+1600; aiRecomputeFollow(fs.an,fs.slot,+t.toFixed(3),sxr,syr); }
         aiwinParams(); renderAiTimeline(); aiBar('🔄 Reprise du suivi du joueur — recalcul à partir d\'ici.'); setTimeout(aiBarHide,1600); return; }
-      const nn=mkAnno('spot'); nn._fixbox=true; nn.trackOnly=true; nn._pid='t'+uid(); nn.t0=+t.toFixed(3); placeStatic(nn,{x:cx,y:feet,w:w,h:h});
-      // Si l'encadré tombe sur un joueur DÉJÀ suivi (piste robuste) -> on la réutilise, aucun recalcul.
-      const _cd2=nearestCandAt(cx,feet,t,null);
-      if(_cd2){ nn.trk=stitchTrackFrom(_cd2,_cd2.points[0].t); nn.tin=a.in; nn.tout=a.out; a.aiAnnos.push(nn); aiwin.sel=nn; aiwin.selMulti=[nn]; save(); aiwinParams(); renderAiTimeline(); aiBar('👤 Joueur ajouté (piste robuste continue réutilisée).'); setTimeout(aiBarHide,1400); return; }
-      // piste amorcée immédiatement (point de départ) : elle existe et reste visible même si le
-      // serveur ne détecte pas encore ce joueur (gardien/arbitre) -> encadré MANUEL, suivi seedé.
-      nn.trk=[{t:nn.t0,x:cx,y:feet,w:w,h:h}]; nn.tin=a.in; nn.tout=a.out; a.aiAnnos.push(nn); aiwin.sel=nn; aiwin.selMulti=[nn]; nn._fixok=(performance.now?performance.now():Date.now())+1600; save(); aiwinParams(); renderAiTimeline(); aiRecompute(nn,+t.toFixed(3),cx,feet,w,h); aiBar('➕ Suivi lancé (encadré manuel).'); setTimeout(aiBarHide,1400); };
+      // NOUVEAU rectangle INDÉPENDANT : piste seedée EXACTEMENT sur ta boîte, suivi mono-joueur frais
+      // depuis cet instant jusqu'à la fin (ou coupure). AUCUNE réutilisation d'une piste YOLO voisine
+      // -> le calcul ne dépend QUE de ta boîte, zéro interférence avec les autres rectangles.
+      const nn=mkAnno('spot'); nn._fixbox=true; nn.trackOnly=true; nn._indep=true; nn._pid='t'+uid(); nn.t0=+t.toFixed(3); placeStatic(nn,{x:cx,y:feet,w:w,h:h});
+      nn.trk=[{t:nn.t0,x:cx,y:feet,w:w,h:h}]; nn.tin=a.in; nn.tout=a.out; a.aiAnnos.push(nn); aiwin.sel=nn; aiwin.selMulti=[nn]; nn._fixok=(performance.now?performance.now():Date.now())+1600; save(); aiwinParams(); renderAiTimeline(); aiRecompute(nn,+t.toFixed(3),cx,feet,sbw,sbh); aiBar('➕ Suivi INDÉPENDANT lancé depuis ta boîte ('+(+t).toFixed(1)+'s → fin).'); setTimeout(aiBarHide,1800); };
     document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up); ev.preventDefault(); return;
   }
   // ===== MODE ATTACHE : clique le(s) joueur(s) que le dessin sélectionné doit suivre =====
@@ -9932,7 +9946,7 @@ function aiwinParams(){ const pr=document.getElementById('aiwPr'); if(!pr)return
     const pp=document.getElementById('calProp'); if(pp)pp.onclick=async()=>{ const vk=await aiEnsureUploaded(); if(vk){ const n=await aiPropagateCalib(vk); if(n){ aiBar('✅ Calibrage propagé sur '+n+' instants du clip.'); setTimeout(aiBarHide,2200); } } };
     const pph=document.getElementById('calPropHere'); if(pph)pph.onclick=async()=>{ const ft=+vid.currentTime; if(ft<=((aiwin.action.in||0)+0.1)){ aiBar('ⓘ « Depuis ici » recalcule d\'ici jusqu\'à la fin — place-toi APRÈS le début du clip (là où ça décroche).'); setTimeout(aiBarHide,3200); return; } const vk=await aiEnsureUploaded(); if(vk){ const n=await aiPropagateCalib(vk, ft); if(n){ aiBar('✅ Recalculé depuis '+ft.toFixed(1)+'s (début conservé).'); setTimeout(aiBarHide,2200); } } };
     const cwp=document.getElementById('calWipe'); if(cwp)cwp.onclick=()=>{ if(!confirm('Effacer TOUS les calibrages (auto + manuels) et le suivi caméra de ce clip ?\\n\\nTu repars d\'un terrain vierge : pose 4 repères pour le recréer.'))return; const a=aiwin.action; a.calibs=[]; a.camPath=null; a.calVis=null; aiwin._autoTrackAfter=false; aiwin.calBase=null; aiwin.calPts=[]; aiwin.calActive=null; aiwin._calH=null; aiwin._calProj=null; aiwin._lastGoodCalH=null; aiwin._lastManualKf=null; aiwin._calFa=null; try{save();}catch(e){} aiCalLoadAt(vid.currentTime,true); aiwinParams(); try{renderAiTimeline();}catch(e){} try{aiwinDraw();}catch(e){} aiBar('🗑 Clip vierge — pose 4 repères pour un nouveau terrain.'); setTimeout(aiBarHide,2600); };
-    const crd=document.getElementById('calRedetect'); if(crd)crd.onclick=async()=>{ if(!confirm('Relancer la détection AUTOMATIQUE du terrain sur tout le clip ?\\n\\nÇa efface le calibrage actuel (y compris tes points manuels) puis l\'IA recale seule.'))return; const a=aiwin.action; a.calibs=[]; a.camPath=null; a.calVis=null; aiwin._autoTrackAfter=false; aiwin.calBase=null; aiwin.calPts=[]; aiwin.calActive=null; aiwin._calH=null; aiwin._calProj=null; aiwin._lastGoodCalH=null; aiwin._lastManualKf=null; aiwin._calFa=null; try{save();}catch(e){} try{renderAiTimeline();}catch(e){} try{ await aiAutoCalibOnOpen(); }catch(e){} aiwinParams(); try{renderAiTimeline();}catch(e){} try{aiwinDraw();}catch(e){} };
+    const crd=document.getElementById('calRedetect'); if(crd)crd.onclick=async()=>{ if(!confirm('Relancer la détection AUTOMATIQUE du terrain sur tout le clip ?\\n\\nÇa efface le calibrage actuel (y compris tes points manuels) puis l\'IA recale seule.'))return; const a=aiwin.action; a.calibs=[]; a.camPath=null; a.calVis=null; aiwin._autoTrackAfter=false; aiwin.calBase=null; aiwin.calPts=[]; aiwin.calActive=null; aiwin._calH=null; aiwin._calProj=null; aiwin._lastGoodCalH=null; aiwin._lastManualKf=null; aiwin._calFa=null; try{ if(aiwin._calAbort){ aiwin._calAbort.abort(); aiwin._calAbort=null; } }catch(e){} aiwin._calBusy=false; aiwin._calProgOn=false; try{save();}catch(e){} try{renderAiTimeline();}catch(e){} try{ await aiAutoCalibOnOpen(); }catch(e){} aiwinParams(); try{renderAiTimeline();}catch(e){} try{aiwinDraw();}catch(e){} };
     pr.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{ const c=cs[+b.dataset.edit]; if(c){ seekTo(c.t).then(()=>{ aiCalLoadAt(c.t); aiwinParams(); }); } });
     pr.querySelectorAll('[data-delk]').forEach(b=>b.onclick=()=>{ aiDelCalib(+b.dataset.delk); });
     pr.querySelectorAll('[data-shot]').forEach(b=>b.onclick=()=>{ const s=+b.dataset.shot; seekTo(s).then(()=>{ aiCalLoadAt(s); aiwinParams(); }); });
@@ -10218,8 +10232,11 @@ function cancelAiJobs(list){ (list||[]).forEach(j=>{ try{ fetch(AI_BASE+'/cancel
 // Trouve le joueur ANALYSÉ (cand) sous le clic : test d'appartenance au rectangle (corps), pas seulement les pieds.
 // Renvoie les POINTS d'un joueur DÉJÀ suivi (piste .trk ou joueur d'un dessin follow) sous (nx,ny) à t.
 // Sert à RATTACHER un nouveau dessin au suivi existant (1 joueur = 1 piste), au lieu de recréer une ligne.
-function fixExistingTrackPts(nx,ny,t,exclude){ const a=aiwin.action; if(!a)return null; let best=null,bd=0.06,bestPid=null;
-  const _t=(pts,pid)=>{ if(!pts||!pts.length)return; if(typeof trkCovers==='function'&&!trkCovers(pts,t))return; const p=trkInterp({points:pts},t); if(!p)return; const bw=(p.w||0.05),bh=(p.h||0.13); if(nx>=p.x-bw/2&&nx<=p.x+bw/2&&ny>=p.y-bh&&ny<=p.y+bh*0.1){ const d=Math.hypot(p.x-nx,p.y-ny); if(d<bd){bd=d;best=pts;bestPid=(pid!=null?pid:null);} } };
+function fixExistingTrackPts(nx,ny,t,exclude){ const a=aiwin.action; if(!a)return null; let best=null,bd=0.5,bestPid=null;
+  // ACCROCHE = clic N'IMPORTE OÙ DANS le rectangle du joueur (corps, tête, pieds). On ne gate plus sur la
+  // distance aux PIEDS (qui obligeait à viser le bas « à côté ») : containment d'abord, puis on départage
+  // au CENTRE de la boîte pour choisir le bon joueur quand deux rectangles se chevauchent.
+  const _t=(pts,pid)=>{ if(!pts||!pts.length)return; if(typeof trkCovers==='function'&&!trkCovers(pts,t))return; const p=trkInterp({points:pts},t); if(!p)return; const bw=(p.w||0.05),bh=(p.h||0.13); if(nx>=p.x-bw*0.6&&nx<=p.x+bw*0.6&&ny>=p.y-bh*1.05&&ny<=p.y+bh*0.12){ const d=Math.hypot(p.x-nx,(p.y-bh/2)-ny); if(d<bd){bd=d;best=pts;bestPid=(pid!=null?pid:null);} } };
   (a.aiAnnos||[]).forEach(o=>{ if(o===exclude||o.type==='trace'||o.space==='field')return; if(o.trk)_t(o.trk,o._pid); if(o.follow)o.follow.forEach(fk=>{ if(fk&&fk.pts)_t(fk.pts,o._pid); }); });
   // AUSSI les rectangles blancs du Suivi (a.tracks) : un dessin posé dessus réutilise LEUR trajectoire
   // EXACTE -> le dessin et le rectangle blanc partagent la même piste, et hérite de l'IDENTITÉ du joueur (id).
@@ -10320,6 +10337,16 @@ function applyRecompute(an,d,fromT,endT,seed,startT){ if(an&&(an.manualLock||an.
   let best=null,bd=1e9; list.forEach(tk=>{ const p=trkInterp({points:tk.points},fromT); if(!p)return; const dd=Math.hypot(p.x-seed.x,p.y-seed.y); if(dd<bd){bd=dd;best=tk;} });
   if(!best){ aiBarHide(); return; }
   const seg=smoothTrk(best.points.map(p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h}))).filter(p=>p.t>=startT-0.05&&p.t<=endT+0.05);
+  // ANTI-TROU : si le moteur ne verrouille le joueur qu'APRÈS ta frame (ex. boîte tracée à 0s mais 1er point
+  // calculé à 3s), la boîte manquait de startT à 3s -> impossible d'y poser un dessin. On COMBLE en tenant
+  // TA boîte dessinée (sa position + sa taille) depuis startT jusqu'au 1er point calculé -> visible dès ta frame.
+  try{
+    const _seedP=(an.trk||[]).reduce((m,p)=>(m&&Math.abs(m.t-startT)<=Math.abs(p.t-startT)?m:p),null);
+    const _sx=(_seedP?_seedP.x:seed.x), _sy=(_seedP?_seedP.y:seed.y);
+    const _sw=(_seedP&&_seedP.w)||(seg[0]&&seg[0].w)||0.04, _sh=(_seedP&&_seedP.h)||(seg[0]&&seg[0].h)||0.1;
+    if(seg.length){ if(seg[0].t>startT+0.06){ seg.unshift({t:+(seg[0].t-0.04).toFixed(3),x:_sx,y:_sy,w:_sw,h:_sh}); seg.unshift({t:+startT.toFixed(3),x:_sx,y:_sy,w:_sw,h:_sh}); } }
+    else { seg.push({t:+startT.toFixed(3),x:_sx,y:_sy,w:_sw,h:_sh}); }
+  }catch(e){}
   const before=(an.trk||[]).filter(p=>p.t<startT-0.001), after=(an.trk||[]).filter(p=>p.t>endT+0.001);
   an.trk=before.concat(seg).concat(after).sort((x,y)=>x.t-y.t);
   an.corr=[]; an._cuts=(an._cuts||[]).filter(tt=>Math.abs(tt-fromT)>0.2).concat([fromT]).sort((x,y)=>x-y);
@@ -12802,7 +12829,8 @@ function wcStop(){ try{ _WC.on=false; }catch(e){} try{ if(_WC.reader)_WC.reader.
 function lmSupported(){ try{ return (typeof MediaSource!=='undefined') && !!mseMime && MediaSource.isTypeSupported(mseMime); }catch(e){ return false; } }
 function lmBufEnd(){ try{ const b=_LM.sb&&_LM.sb.buffered; if(b&&b.length)return b.end(b.length-1); }catch(e){} return 0; }
 function lmBufStart(){ try{ const b=_LM.sb&&_LM.sb.buffered; if(b&&b.length)return b.start(0); }catch(e){} return 0; }
-function lmDiag(){ try{ const el=document.getElementById('lmDiag'); if(!el)return; if(!liveMode){ el.style.display='none'; return; } el.style.display='block';
+function lmDiag(){ try{ const el=document.getElementById('lmDiag'); if(el)el.style.display='none'; }catch(e){} return; /* HUD diag Direct retiré (clients) */
+  try{ const el=document.getElementById('lmDiag'); if(!el)return; if(!liveMode){ el.style.display='none'; return; } el.style.display='block';
   let bs='—'; try{ if(_LM.sb){ const b=_LM.sb.buffered,r=[]; for(let i=0;i<b.length;i++)r.push(Math.round(b.start(i))+'-'+Math.round(b.end(i))); bs=r.join(', ')||'vide'; } }catch(e){}
   el.textContent='DIAG '+(window._lmMode?(window._wcMode?'FLUX-WC':'FLUX'):'repli')+' · live:'+(_LM.live?1:0)+' · pause:'+(vid.paused?1:0)+' · t:'+((vid.currentTime||0).toFixed(1))+' · buf['+bs+'] · file:'+_LM.q.length+(window._wcMode?(' · f'+_WC.n):'')+(_LM.err?(' · ERR '+_LM.err):''); }catch(e){} }
 function lmEvict(force){ try{ if(!_LM.sb||_LM.sb.updating)return; const b=_LM.sb.buffered; if(!b.length)return; const st=b.start(0), cur=vid.currentTime||0, keep=force?300:_LM.windowS; if(cur-st>keep){ _LM.sb.remove(st, Math.max(st+0.1, cur-keep+60)); } }catch(e){} }

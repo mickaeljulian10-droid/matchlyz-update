@@ -1082,6 +1082,44 @@ def line_refine(dt, corners_px, iters=5):
         if float(np.linalg.norm(cur - np.array(corners_px), axis=1).max()) > 0.25 * max(Ww, Hh): break
     return best, best_res
 
+def _cdiag(s):
+    """Diagnostic calibrage : imprime dans le Terminal ET écrit dans calib_diag.log (lisible après coup)."""
+    try: print(s, flush=True)
+    except Exception: pass
+    try:
+        with open(str(BASE / "calib_diag.log"), "a") as _f:
+            import time as _t; _f.write(_t.strftime("%H:%M:%S ") + str(s) + "\n")
+    except Exception: pass
+
+def _json_safe(o):
+    """Convertit récursivement tout objet (numpy float32/int64/arrays, etc.)
+    en types Python natifs sérialisables en JSON. Évite les 500 silencieuses
+    quand FastAPI ne sait pas encoder une valeur numpy du traitement 4K."""
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+    if isinstance(o, dict):
+        return {str(k): _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    if _np is not None:
+        if isinstance(o, _np.ndarray):
+            return [_json_safe(v) for v in o.tolist()]
+        if isinstance(o, _np.generic):
+            o = o.item()
+    if isinstance(o, float):
+        # NaN / Inf ne sont pas du JSON valide -> on neutralise
+        if o != o or o in (float("inf"), float("-inf")):
+            return None
+        return o
+    if isinstance(o, (int, str, bool)) or o is None:
+        return o
+    try:
+        return float(o)
+    except Exception:
+        return str(o)
+
 def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
     """Calibration forte PnLCalib : image -> caméra -> 4 coins terrain (repère 105x68).
     refine=True : optimise l'homographie sur les lignes blanches (précis mais coûteux ~qq s).
@@ -1107,6 +1145,12 @@ def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
         #  la reconnaissance. La confusion ligne/panneau est gérée en aval par la cohérence temporelle
         #  des ancres, qui n'enlève aucune détection.)
         kp_dict, lines_dict = P["complete"](kp[0], ln[0], w=w, h=h, normalize=True)
+        try:
+            _nk = sum(1 for _v in (kp_dict.values() if hasattr(kp_dict, "values") else []) if isinstance(_v, dict) and _v)
+            _nl = sum(1 for _v in (lines_dict.values() if hasattr(lines_dict, "values") else []) if _v)
+            _cdiag("    [PNL-DIAG] img=%dx%d  points-cles=%d  lignes=%d  (seuils kp=%.3f ligne=%.3f)" % (W0, H0, _nk, _nl, kp_th, line_th))
+        except Exception as _de:
+            _cdiag("    [PNL-DIAG] compteur err: %s" % _de)
         cam = P["Cal"](iwidth=W0, iheight=H0, denormalize=True)
         cam.update(kp_dict, lines_dict)
         # Homographie du SOL (terrain plat) + RAFFINEMENT PAR LES LIGNES : l'homographie est optimisée
@@ -1123,8 +1167,10 @@ def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
             except Exception:
                 res = None
         if not res or res.get("homography") is None:
+            _cdiag("    [PNL-DIAG] -> VOTE CAMERA ECHOUE (pas d'homographie) : terrain non reconnu sur cette image")
             return None
         globals()["_PNL_ERR"] = float(res.get("rep_err") or 0.0)
+        _cdiag("    [PNL-DIAG] -> OK homographie, err reproj=%.4f" % (globals().get("_PNL_ERR") or 0.0))
         Hi2f = np.array(res["homography"], dtype="float64")   # image(px) -> terrain (centré m)
         Hf2i = np.linalg.inv(Hi2f)                              # terrain (centré m) -> image(px)
         out = []
@@ -3774,6 +3820,27 @@ def _quad_proportions_ok(q):
         return False
     return True
 
+def _terrain_plausible(q, Ws, Hs):
+    """Rejette un TERRAIN projeté géométriquement aberrant (vue basse/large type Veo : l'extrapolation
+    du terrain lointain explose ou s'inverse). q = [TL,TR,BR,BL] en pixels. Complète _quad_ok :
+    - perspective inversée (touche lointaine plus large que la proche) = homographie retournée ;
+    - terrain démesurément large (touche proche > 9x l'image) = échelle partie en vrille ;
+    - hauteur aberrante. Ces cas produisent le 'terrain qui grandit/rétrécit / lignes en biais'."""
+    import numpy as np
+    P = np.array(q, dtype="float64")
+    if P.shape != (4, 2) or not np.isfinite(P).all():
+        return False
+    wtop = abs(P[1][0] - P[0][0]) / max(1.0, Ws)   # largeur touche lointaine (haut)
+    wbot = abs(P[2][0] - P[3][0]) / max(1.0, Ws)   # largeur touche proche (bas)
+    hgt = abs(((P[3][1] + P[2][1]) / 2) - ((P[0][1] + P[1][1]) / 2)) / max(1.0, Hs)
+    if wtop > wbot * 1.02:   # la touche lointaine ne peut pas être plus large que la proche
+        return False
+    if wbot > 9.0:           # terrain démesurément large -> homographie dégénérée
+        return False
+    if hgt > 1.8 or hgt < 0.05:
+        return False
+    return True
+
 @app.post("/calibrate_smart")
 def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Form(0.0),
                     anchor_dt: float = Form(4.0), minp: int = Form(15), pid: str = Form("")):
@@ -3797,6 +3864,7 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
     try:
         import cv2, numpy as np, time as _time
         _tA = _time.perf_counter(); _anc_errs = []; _snap_res = []
+        _cdiag("\n===== NOUVEAU CALIBRAGE  vkey=%s  t0=%.1f t1=%.1f =====" % (os.path.basename(vp), t0, t1))
         _cp(pid, 2, "préparation…")
         cap = cv2.VideoCapture(vp); fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0); dur = (total / fps) if fps else 0
@@ -3918,10 +3986,12 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
                 Hf = cv2.getPerspectiveTransform(src, dst)  # terrain(m) -> image normalisée
                 cs = np.array([[[float(_aph(Hf, c[0], c[1])[0]) * Ws,
                                  float(_aph(Hf, c[0], c[1])[1]) * Hs] for c in corners_f]], dtype="float32")
-                if _quad_ok(cs[0], Ws, Hs):
+                if _quad_ok(cs[0], Ws, Hs) and _terrain_plausible(cs[0], Ws, Hs):
                     anchors.append((idx, cs, aconf)); anc_idx.add(idx)
+                elif _quad_ok(cs[0], Ws, Hs):
+                    _cdiag("    ancre @%.1fs REJETÉE (terrain aberrant : inversé/démesuré)" % (times[idx] + T_OFF))
         cap2.release(); _tAnc = _time.perf_counter()
-        print("  ancres terrain VALIDES : %d / %d" % (len(anchors), len(idxs)), flush=True)
+        _cdiag("  ancres terrain VALIDES : %d / %d  (si 0 -> terrain non reconnu)" % (len(anchors), len(idxs)))
         if not anchors:
             print("  -> AUCUNE ancre valide : le terrain n'est pas reconnu sur ce clip -> recalage lignes NON lancé (calibrage auto impossible, passe en manuel).", flush=True)
             return {"keyframes": [], "n": 0, "reason": "pnl_fail"}
@@ -3973,7 +4043,7 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
             # CANDIDATS : les 2 ancres qui encadrent le mieux l'image. On propage depuis chacune, on
             # recale sur les lignes, et on GARDE la meilleure (résidu le plus faible) -> corrige la dérive
             # héritée d'un seul côté (médiane en biais / touche qui déborde sur les images faibles).
-            corners_px = None; conf = 0.0; _bres = None
+            corners_px = None; conf = 0.0; _bres = None; _best_cpx0 = None
             for (aidx, cs, aconf) in sorted(anchors, key=lambda an: abs(an[0] - i))[:2]:
                 Hrel = (cums[i] @ np.linalg.inv(cums[aidx])).astype("float32")
                 cc = cv2.perspectiveTransform(cs, Hrel)[0]
@@ -3996,16 +4066,63 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
                             pass
                         cpx = snapped; rr = float(res); cf = round(max(0.6, min(1.0, 1.0 - res / 12.0)), 2)
                 if corners_px is None or cf > conf:
-                    corners_px = cpx; conf = cf; _bres = rr
+                    corners_px = cpx; conf = cf; _bres = rr; _best_cpx0 = cpx0
             if _bres is not None: _snap_res.append(_bres)
-            if corners_px is None or not _quad_ok(corners_px, Ws, Hs):
-                _degen += 1; continue   # terrain écrasé/dégénéré : on n'émet PAS (le client interpole)
+            if corners_px is None or not _quad_ok(corners_px, Ws, Hs) or not _terrain_plausible(corners_px, Ws, Hs):
+                _degen += 1; continue   # terrain écrasé/dégénéré/aberrant : on n'émet PAS (le client interpole entre les bonnes frames)
             ni = [[corners_px[k][0] / Ws, corners_px[k][1] / Hs] for k in range(4)]
             pts = [{"f": list(corners_f[k]), "i": [round(ni[k][0], 4), round(ni[k][1], 4)]} for k in range(4)]
+            _pre = None
+            try:
+                if _best_cpx0 is not None:
+                    _p0=[[_best_cpx0[k][0]/Ws,_best_cpx0[k][1]/Hs] for k in range(4)]
+                    _pre=[round(abs(_p0[1][0]-_p0[0][0]),2), round(abs(_p0[2][0]-_p0[3][0]),2), round(abs(((_p0[3][1]+_p0[2][1])/2)-((_p0[0][1]+_p0[1][1])/2)),2)]
+            except Exception: _pre=None
             out.append({"t": round(times[i] + T_OFF, 2), "pts": pts, "conf": conf,
-                        "ok": bool(conf >= 0.7), "kind": ("anchor" if i in anc_idx else "snap")})
+                        "ok": bool(conf >= 0.7), "kind": ("anchor" if i in anc_idx else "snap"), "_pre": _pre})
         cap4.release(); _tSnap = _time.perf_counter()
         out.sort(key=lambda k: k["t"])
+        # ===== FILTRE DE COHÉRENCE (anti « terrain qui part dans tous les sens ») =====
+        # Le terrain physique a des dimensions FIXES : d'une frame à l'autre, la largeur basse (touche proche)
+        # et la hauteur projetées ne doivent varier que doucement (la caméra bouge, pas le terrain). Sur la Veo
+        # 4K, les ancres PnL donnent parfois des dimensions incohérentes (bas 2.0 puis 4.3 puis 3.8...). On
+        # calcule la MÉDIANE du clip et on écarte les frames trop éloignées -> il ne reste que des frames
+        # cohérentes entre elles. On ne vide jamais tout (repli : si trop peu resterait, on garde l'original).
+        try:
+            def _wbh(k):
+                p = k["pts"]; xTL,yTL = p[0]["i"]; xTR,yTR = p[1]["i"]; xBR,yBR = p[2]["i"]; xBL,yBL = p[3]["i"]
+                return abs(xBR-xBL), abs(((yBL+yBR)/2.0)-((yTL+yTR)/2.0))
+            if len(out) >= 5:
+                _wb = []; _hh = []
+                for k in out:
+                    wb, hh = _wbh(k); _wb.append(wb); _hh.append(hh)
+                _sw = sorted(_wb); _sh = sorted(_hh)
+                _mwb = _sw[len(_sw)//2]; _mhh = _sh[len(_sh)//2]   # médianes (robustes aux aberrations)
+                _kept = []
+                for i, k in enumerate(out):
+                    wb, hh = _wb[i], _hh[i]
+                    okw = (_mwb <= 1e-6) or (0.78*_mwb <= wb <= 1.25*_mwb)
+                    okh = (_mhh <= 1e-6) or (0.78*_mhh <= hh <= 1.25*_mhh)
+                    if okw and okh: _kept.append(k)
+                if len(_kept) >= 3 and len(_kept) < len(out):
+                    _cdiag("  cohérence terrain : %d/%d frame(s) écartée(s) (hors 0.78–1.25× médiane bas=%.2f h=%.2f)" % (len(out)-len(_kept), len(out), _mwb, _mhh))
+                    out = _kept
+        except Exception as _ce:
+            _cdiag("  cohérence terrain err: %s" % _ce)
+        # DIAG terrain : largeur haute (touche lointaine), largeur basse (touche proche) et hauteur du
+        # terrain projeté, par frame -> si ça varie beaucoup d'une frame à l'autre = terrain qui "saute".
+        try:
+            _cdiag("  --- terrain par frame : APRES recalage (haut/bas/hauteur) | AVANT recalage (propagation pure) ---")
+            for k in out:
+                _p = k["pts"]  # ordre TL,TR,BR,BL en coord terrain ; i = [x,y] normalisés image
+                _xTL,_yTL=_p[0]["i"]; _xTR,_yTR=_p[1]["i"]; _xBR,_yBR=_p[2]["i"]; _xBL,_yBL=_p[3]["i"]
+                _wtop=abs(_xTR-_xTL); _wbot=abs(_xBR-_xBL); _hgt=abs(((_yBL+_yBR)/2)-((_yTL+_yTR)/2))
+                _pr = k.get("_pre")
+                _cdiag("    t=%5.1fs conf=%.2f  APRES haut=%.2f bas=%.2f h=%.2f | AVANT %s  (%s)" % (k["t"], k["conf"], _wtop, _wbot, _hgt, (str(_pr) if _pr else "-"), k["kind"]))
+            for k in out: k.pop("_pre", None)   # ne pas renvoyer ce champ de debug au client
+        except Exception as _de:
+            _cdiag("  diag terrain err: %s" % _de)
+            for k in out: k.pop("_pre", None)
         _metrics = {}
         try:
             _oks = sum(1 for k in out if k.get("ok"))
@@ -4037,9 +4154,20 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         except Exception as _e:
             print("metrics err:", _e)
         _cp(pid, 100, "terminé")
-        return {"keyframes": out, "n": len(out), "anchors": len(anchors), "cam": cam, "field_ranges": field_ranges, "metrics": _metrics}
+        _result = {"keyframes": out, "n": len(out), "anchors": len(anchors), "cam": cam, "field_ranges": field_ranges, "metrics": _metrics}
+        _result = _json_safe(_result)   # types natifs -> plus de 500 silencieuse à la sérialisation
+        try:
+            import json as _json
+            _sz = len(_json.dumps(_result))
+            _cdiag("==> RETOUR calibrate_smart : OK — %d keyframes envoyées au client (anchors=%d, cam=%d) — payload %d octets, JSON OK" % (len(out), len(anchors), len(cam), _sz))
+        except Exception as _je:
+            _cdiag("==> RETOUR calibrate_smart : PAYLOAD NON-JSON malgré nettoyage -> " + str(_je))
+        return _result
     except Exception as e:
-        import traceback; traceback.print_exc(); return JSONResponse({"error": str(e)}, status_code=500)
+        import traceback
+        _cdiag("==> RETOUR calibrate_smart : ERREUR -> " + str(e))
+        _cdiag(traceback.format_exc())
+        traceback.print_exc(); return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/ai_status")
 def ai_status():
