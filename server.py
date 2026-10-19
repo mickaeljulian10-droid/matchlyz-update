@@ -2213,6 +2213,150 @@ def rec_get(name: str):
     mt = "video/mp4" if safe.endswith(".mp4") else ("video/quicktime" if safe.endswith(".mov") else "video/webm")
     return FileResponse(str(p), media_type=mt)
 
+# ============ CONVERSION AUTO À L'IMPORT (iPhone HEVC/HDR 10 bits -> H.264 1080p SDR) ============
+# Le lecteur du navigateur (Chromium) n'affiche PAS le HEVC 10 bits HDR (vidéos iPhone 4K) : on a le
+# son mais l'image reste noire. On transcode UNE fois en H.264 8 bits SDR (lisible partout), on met en
+# cache (réutilisé à la réouverture) et on lit directement le fichier par son chemin (aucun envoi réseau).
+CONV = WORK / "_convert"
+try: CONV.mkdir(exist_ok=True)
+except Exception: pass
+_HDR_TRC = {"smpte2084", "arib-std-b67"}   # HDR10 (PQ) et HLG
+
+def _probe_vinfo(path):
+    """Métadonnées de la 1re piste vidéo (ffprobe) : codec, pix_fmt, transfert couleur, dimensions."""
+    import subprocess
+    probes = []
+    for ff in _ffmpeg_bins():
+        if ff.endswith("ffmpeg"): probes.append(ff[:-6] + "ffprobe")
+    probes.append(str(BASE / "miniforge" / "bin" / "ffprobe")); probes.append("ffprobe")
+    for probe in probes:
+        try:
+            out = subprocess.run([probe, "-v", "error", "-select_streams", "v:0",
+                                  "-show_entries", "stream=codec_name,pix_fmt,color_transfer,width,height",
+                                  "-of", "default=noprint_wrappers=1", path],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=60).stdout
+            d = {}
+            for line in out.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1); d[k.strip()] = v.strip()
+            if d.get("codec_name"):
+                return d
+        except Exception:
+            continue
+    return {}
+
+def _vinfo_needs_h264(info):
+    """True s'il faut transcoder : tout sauf du H.264 8 bits SDR (déjà lisible partout)."""
+    if not info:
+        return False   # illisible -> on ne touche à rien (flux normal)
+    codec = (info.get("codec_name") or "").lower()
+    pix   = (info.get("pix_fmt") or "").lower()
+    trc   = (info.get("color_transfer") or "").lower()
+    is10  = ("10" in pix) or ("12" in pix)
+    hdr   = trc in _HDR_TRC
+    # Codecs que le navigateur (Chromium) lit nativement en 8 bits SDR : on n'y touche pas.
+    # Tout le reste (HEVC/H.265 iPhone, 10 bits, HDR, ProRes, mpeg2…) -> transcodage H.264.
+    playable = codec in ("h264", "vp8", "vp9", "av1")
+    if playable and not is10 and not hdr:
+        return False
+    return True
+
+def _conv_out_for(path):
+    import hashlib
+    try:
+        st = os.stat(path); key = "%s|%d|%d" % (os.path.abspath(path), st.st_size, int(st.st_mtime))
+    except Exception:
+        key = os.path.abspath(path or "")
+    h = hashlib.sha1(key.encode("utf-8", "ignore")).hexdigest()[:16]
+    return CONV / (h + ".mp4")
+
+def _convert_to_h264(vpath, pid="", target_h=1080):
+    """Transcode vpath -> H.264 8 bits SDR (<=1080p), tonemap HDR->SDR si besoin, progression -> _cp(pid).
+    Essaie videotoolbox (GPU Apple) puis libx264 ; tonemap zscale puis repli simple. Cache réutilisé."""
+    out = _conv_out_for(vpath)
+    if out.exists() and out.stat().st_size > 0 and _mp4_ok(str(out)):
+        _cp(pid, 100, "déjà converti"); return str(out)
+    info = _probe_vinfo(vpath)
+    hdr = (info.get("color_transfer") or "").lower() in _HDR_TRC
+    dur = _src_dur(vpath) or 0.0
+    part = str(out) + ".part"
+    import subprocess
+    scale = "scale=-2:%d" % int(target_h)
+    vf_tonemap = (scale + ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                  "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+    vf_simple  = scale + ",format=yuv420p"
+    filters = ([vf_tonemap] if hdr else []) + [vf_simple]
+    encs = [["-c:v", "h264_videotoolbox", "-b:v", "8M"],
+            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]]
+    tail = ["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-f", "mp4"]
+    for ff in _ffmpeg_bins():
+        for vf in filters:
+            # si on n'a PAS tonemappé un HDR, on force des tags SDR BT.709 (sinon affichage délavé)
+            force_sdr = [] if (hdr and vf == vf_tonemap) else ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+            for enc in encs:
+                try:
+                    if os.path.exists(part): os.remove(part)
+                except Exception: pass
+                cmd = [ff, "-y", "-i", vpath, "-vf", vf] + enc + force_sdr + tail + [part]
+                try:
+                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                except Exception:
+                    continue
+                try:
+                    for line in p.stdout:
+                        if pid and dur > 0 and line.startswith("out_time_us="):
+                            try:
+                                us = int(line.strip().split("=")[1]); pct = min(99, int(100 * (us / 1e6) / dur))
+                                _cp(pid, pct, "conversion de la vidéo… %d%%" % pct)
+                            except Exception: pass
+                    p.wait()
+                except Exception:
+                    try: p.kill()
+                    except Exception: pass
+                if os.path.exists(part) and os.path.getsize(part) > 0 and _mp4_ok(part):
+                    try: os.replace(part, out)
+                    except Exception: pass
+                    if out.exists():
+                        print("  -> conversion H.264 prête :", os.path.basename(ff), enc[1], flush=True)
+                        _cp(pid, 100, "conversion terminée")
+                        try: _prune_video_cache()
+                        except Exception: pass
+                        return str(out)
+    try:
+        if os.path.exists(part): os.remove(part)
+    except Exception: pass
+    _cp(pid, 100, "conversion impossible")
+    return ""
+
+@app.post("/import_check")
+async def import_check(path: str = Form(...)):
+    """Dit à l'app si la vidéo doit être convertie pour être AFFICHABLE (image), sans rien ré-encoder."""
+    if not path or not os.path.exists(path):
+        return {"ok": False, "error": "introuvable"}
+    info = await asyncio.to_thread(_probe_vinfo, path)
+    return {"ok": True, "needs": _vinfo_needs_h264(info),
+            "codec": info.get("codec_name", ""), "pix": info.get("pix_fmt", ""),
+            "trc": info.get("color_transfer", ""), "w": info.get("width", ""), "h": info.get("height", "")}
+
+@app.post("/import_convert")
+async def import_convert(path: str = Form(...), pid: str = Form("")):
+    """Transcode la vidéo en H.264 lisible (cache). Progression via /calib_progress?pid=…"""
+    if not path or not os.path.exists(path):
+        return JSONResponse({"ok": False, "error": "introuvable"}, status_code=404)
+    out = await asyncio.to_thread(_convert_to_h264, path, pid)
+    if not out:
+        return JSONResponse({"ok": False, "error": "conversion impossible"}, status_code=500)
+    return {"ok": True, "url": "/conv/" + os.path.basename(out), "path": out}
+
+@app.get("/conv/{name}")
+def conv_get(name: str):
+    """Sert la vidéo convertie (FileResponse gère le Range -> seek fluide)."""
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", name or "")
+    p = CONV / safe
+    if not safe or not p.exists():
+        return JSONResponse({"error": "introuvable"}, status_code=404)
+    return FileResponse(str(p), media_type="video/mp4")
+
 # ===================== SAUVEGARDE DURABLE (principe LiveTag) =====================
 # La base de l'app (IndexedDB) peut être purgée par le navigateur si le disque sature. Pour éviter toute perte,
 # l'app envoie régulièrement une copie de ses données ; on l'écrit dans un VRAI FICHIER sur le disque
