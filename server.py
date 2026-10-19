@@ -2223,8 +2223,10 @@ except Exception: pass
 _HDR_TRC = {"smpte2084", "arib-std-b67"}   # HDR10 (PQ) et HLG
 
 def _probe_vinfo(path):
-    """Métadonnées de la 1re piste vidéo (ffprobe) : codec, pix_fmt, transfert couleur, dimensions."""
-    import subprocess
+    """Métadonnées de la 1re piste vidéo : codec, pix_fmt, transfert couleur, dimensions.
+    1) ffprobe si dispo ; 2) REPLI « ffmpeg -i » (présent partout, même quand ffprobe manque
+    dans le build embarqué -> sinon le codec restait vide et on ratait la conversion iPhone)."""
+    import subprocess, re as _re
     probes = []
     for ff in _ffmpeg_bins():
         if ff.endswith("ffmpeg"): probes.append(ff[:-6] + "ffprobe")
@@ -2243,6 +2245,26 @@ def _probe_vinfo(path):
                 return d
         except Exception:
             continue
+    # REPLI : parse la sortie de « ffmpeg -i » (stderr). Exemple d'une vidéo iPhone HDR :
+    #   Stream #0:0 ... Video: hevc (Main 10) ... yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67), 3840x2160 ...
+    for ff in _ffmpeg_bins():
+        try:
+            res = subprocess.run([ff, "-hide_banner", "-i", path], capture_output=True, text=True, timeout=90).stderr
+        except Exception:
+            continue
+        m = _re.search(r"Stream #\d+:\d+.*?:\s*Video:\s*([A-Za-z0-9_]+)", res)
+        if not m:
+            continue
+        line = res[m.start():m.start() + 400].split("\n")[0]
+        d = {"codec_name": m.group(1).lower()}
+        mp = _re.search(r"\b(yuv[0-9a-z]+|gbr[0-9a-z]+|nv[0-9a-z]+|p01[02][0-9a-z]*)\b", line)
+        if mp: d["pix_fmt"] = mp.group(1)
+        if "arib-std-b67" in line: d["color_transfer"] = "arib-std-b67"
+        elif "smpte2084" in line:  d["color_transfer"] = "smpte2084"
+        md = _re.search(r"\b(\d{2,5})x(\d{2,5})\b", line)
+        if md: d["width"] = md.group(1); d["height"] = md.group(2)
+        if d.get("codec_name"):
+            return d
     return {}
 
 def _vinfo_needs_h264(info):
