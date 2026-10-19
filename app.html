@@ -4574,6 +4574,8 @@ async function mlzAutoConvert(f){
 // Convertit la vidéo au CHEMIN donné (HEVC/HDR -> H.264 lisible) avec barre de progression, puis bascule l'affichage.
 async function mlzConvertPath(path){
   if(!path)return false;
+  if(window._mlzConvRunning) return false;   // anti-chevauchement : une seule conversion à la fois
+  window._mlzConvRunning=true;
   try{
     let chk=null;
     for(let i=0;i<8;i++){   // le moteur met un peu à démarrer : on réessaie ~12s au lieu d'abandonner
@@ -4584,11 +4586,14 @@ async function mlzConvertPath(path){
     if(!chk.ok){ aiBar('⚠️ Le moteur ne trouve pas le fichier à convertir.<br><span class="hint">'+(path||'')+'</span>'); setTimeout(aiBarHide,8000); return false; }
     if(!chk.needs) return false;   // déjà lisible (H.264/VP9 8 bits) -> rien à faire
     const pid='conv_'+Date.now(); let polling=true;
-    (async()=>{ while(polling){ try{ const s=await fetch(AI_BASE+'/calib_progress?pid='+pid).then(r=>r.json()); if(polling&&s&&s.p!=null) aiBar('🎬 Conversion de la vidéo iPhone (HEVC/HDR) '+pctBar(s.p)+' <span class="hint">'+(s.msg||'')+' — c\'est fait une seule fois</span>'); }catch(e){} await new Promise(r=>setTimeout(r,500)); } })();
-    aiBar('🎬 Conversion de la vidéo iPhone (HEVC/HDR)… <span class="hint">première ouverture, patiente quelques minutes</span>');
+    window._mlzConvPid=pid; window._mlzConvCancelled=false;
+    const STOP=' <button onclick="mlzCancelConv()" style="margin-left:8px;padding:4px 10px;border-radius:8px;border:0;background:#c6414f;color:#fff;font-weight:800;cursor:pointer">⏹ Arrêter</button>';
+    (async()=>{ while(polling){ try{ const s=await fetch(AI_BASE+'/calib_progress?pid='+pid).then(r=>r.json()); if(polling&&s&&s.p!=null) aiBar('🎬 Conversion de la vidéo iPhone (HEVC/HDR) '+pctBar(s.p)+' <span class="hint">'+(s.msg||'')+' — c\'est fait une seule fois</span>'+STOP); }catch(e){} await new Promise(r=>setTimeout(r,500)); } })();
+    aiBar('🎬 Préparation de la vidéo iPhone (HEVC/HDR)… <span class="hint">quasi instantané</span>'+STOP);
     let res=null;
     try{ const d=new FormData(); d.append('path',path); d.append('pid',pid); res=await fetch(AI_BASE+'/import_convert',{method:'POST',body:d}).then(r=>r.json()); }catch(e){ res=null; }
-    polling=false;
+    polling=false; window._mlzConvPid=null;
+    if(window._mlzConvCancelled){ return false; }   // arrêté par l'utilisateur -> message déjà affiché
     if(res&&res.ok&&res.url){
       try{ vid.src=AI_BASE+res.url; vid.load(); }catch(e){}
       project.videoUrl=AI_BASE+res.url; if(res.path)project.videoPath=res.path; project.videoConverted=true;
@@ -4597,6 +4602,13 @@ async function mlzConvertPath(path){
     }
     aiBar('⚠️ Conversion impossible (moteur éteint ?). Sur ce format iPhone, le son marche mais pas l\'image.'); setTimeout(aiBarHide,6500); return false;
   }catch(e){ try{aiBarHide();}catch(_){} return false; }
+  finally{ window._mlzConvRunning=false; }
+}
+// Arrête la conversion en cours (bouton « Arrêter » ou changement de page).
+function mlzCancelConv(){
+  const pid=window._mlzConvPid; window._mlzConvCancelled=true; window._mlzConvPid=null;
+  if(pid){ try{ const d=new FormData(); d.append('pid',pid); fetch(AI_BASE+'/import_convert_cancel',{method:'POST',body:d}).catch(()=>{}); }catch(e){} }
+  try{ aiBar('⏹ Conversion arrêtée.'); setTimeout(aiBarHide,2000); }catch(e){}
 }
 // FILET : si la vidéo chargée a une DURÉE mais AUCUNE image (codec non décodable : iPhone HEVC/HDR…),
 // on déclenche la conversion (ou on propose de relier le fichier) — même à l'ouverture d'un match.

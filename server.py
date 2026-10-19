@@ -2221,6 +2221,9 @@ CONV = WORK / "_convert"
 try: CONV.mkdir(exist_ok=True)
 except Exception: pass
 _HDR_TRC = {"smpte2084", "arib-std-b67"}   # HDR10 (PQ) et HLG
+_CONV_PROC = {}     # pid -> process ffmpeg en cours (pour pouvoir l'arrêter)
+_CONV_CANCEL = set()  # pids demandés à l'arrêt
+_LAST_CONV_ERR = ""   # dernière erreur de conversion (consultable via /conv_lasterr)
 
 def _probe_vinfo(path):
     """Métadonnées de la 1re piste vidéo : codec, pix_fmt, transfert couleur, dimensions.
@@ -2274,12 +2277,12 @@ def _vinfo_needs_h264(info):
     codec = (info.get("codec_name") or "").lower()
     pix   = (info.get("pix_fmt") or "").lower()
     trc   = (info.get("color_transfer") or "").lower()
-    is10  = ("10" in pix) or ("12" in pix)
     hdr   = trc in _HDR_TRC
-    # Codecs que le navigateur (Chromium) lit nativement en 8 bits SDR : on n'y touche pas.
-    # Tout le reste (HEVC/H.265 iPhone, 10 bits, HDR, ProRes, mpeg2…) -> transcodage H.264.
-    playable = codec in ("h264", "vp8", "vp9", "av1")
-    if playable and not is10 and not hdr:
+    # L'app (Electron + flag HEVC) lit nativement H.264/VP8/VP9/AV1 ET HEVC (8 ou 10 bits) en SDR.
+    # Le SEUL cas qui plante en noir : une étiquette HDR (HLG / HDR10). Donc on n'intervient que pour
+    # l'HDR, ou pour un codec vraiment exotique (ProRes, mpeg2…) qui, lui, demande un ré-encodage.
+    playable = codec in ("h264", "vp8", "vp9", "av1", "hevc", "h265")
+    if playable and not hdr:
         return False
     return True
 
@@ -2299,10 +2302,77 @@ def _convert_to_h264(vpath, pid="", target_h=1080):
     if out.exists() and out.stat().st_size > 0 and _mp4_ok(str(out)):
         _cp(pid, 100, "déjà converti"); return str(out)
     info = _probe_vinfo(vpath)
+    codec = (info.get("codec_name") or "").lower()
     hdr = (info.get("color_transfer") or "").lower() in _HDR_TRC
     dur = _src_dur(vpath) or 0.0
     part = str(out) + ".part"
     import subprocess
+    _cp(pid, 1, "préparation…")
+    # ===== CAS RAPIDE (iPhone HEVC/HDR) : on RETIRE juste l'étiquette HDR, SANS ré-encoder =====
+    # L'app décode le HEVC (8 et 10 bits) ; c'est uniquement le tag HDR qui la fait planter en noir.
+    # On recopie le flux (quasi instantané) en réécrivant les métadonnées couleur en BT.709 (SDR).
+    if codec in ("hevc", "h265"):
+        # On retire les données Dolby Vision (NAL 62/63) PUIS on réécrit l'étiquette couleur en BT.709 (SDR).
+        # Sans ré-encodage -> rapide. Si un essai échoue, on log l'erreur ffmpeg dans le Terminal.
+        bsf_chain = ("filter_units=remove_types=62|63,"
+                     "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1")
+        for ff in _ffmpeg_bins():
+            for bsf in (bsf_chain, "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1"):
+                try:
+                    if os.path.exists(part): os.remove(part)
+                except Exception: pass
+                errlog = str(out) + ".err.txt"
+                # Conteneur .mov (QuickTime) : il ACCEPTE le flux métadonnées iPhone (mebx) que le MP4 refuse.
+                # On garde tous les flux (image + son), on réécrit juste l'étiquette couleur en SDR. Sans ré-encodage.
+                cmd = [ff, "-y", "-i", vpath, "-map", "0", "-c", "copy",
+                       "-tag:v", "hvc1", "-bsf:v", bsf,
+                       "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-f", "mov", part]
+                print("MLZ_REMUX_CMD >>>", " ".join(cmd), flush=True)   # DIAG : commande réellement exécutée
+                try:
+                    _ef = open(errlog, "w")
+                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=_ef, text=True)
+                except Exception:
+                    continue
+                if pid: _CONV_PROC[pid] = p
+                try:
+                    for line in p.stdout:
+                        if pid and pid in _CONV_CANCEL:
+                            try: p.kill()
+                            except Exception: pass
+                            break
+                        if pid and dur > 0 and line.startswith("out_time_us="):
+                            try:
+                                us = int(line.strip().split("=")[1]); pc = min(99, int(100 * (us / 1e6) / dur))
+                                _cp(pid, pc, "préparation de la vidéo… %d%%" % pc)
+                            except Exception: pass
+                    p.wait()
+                except Exception:
+                    try: p.kill()
+                    except Exception: pass
+                finally:
+                    try: _ef.close()
+                    except Exception: pass
+                    if pid: _CONV_PROC.pop(pid, None)
+                if pid and pid in _CONV_CANCEL:
+                    try:
+                        if os.path.exists(part): os.remove(part)
+                    except Exception: pass
+                    _CONV_CANCEL.discard(pid); _cp(pid, 100, "conversion arrêtée"); return ""
+                if os.path.exists(part) and os.path.getsize(part) > 0 and _mp4_ok(part):
+                    try: os.replace(part, out)
+                    except Exception: pass
+                    if out.exists():
+                        print("  -> HDR retiré par remux (sans ré-encodage, HEVC conservé) :", os.path.basename(ff), flush=True)
+                        _cp(pid, 100, "prête")
+                        try: os.remove(errlog)
+                        except Exception: pass
+                        try: _prune_video_cache()
+                        except Exception: pass
+                        return str(out)
+                try:
+                    with open(errlog) as _f: _tail = _f.read()[-600:]
+                    print("  [remux HEVC ÉCHEC] (%s)\n%s" % (os.path.basename(ff), _tail), flush=True)
+                except Exception: pass
     scale = "scale=-2:%d" % int(target_h)
     vf_tonemap = (scale + ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                   "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
@@ -2330,12 +2400,19 @@ def _convert_to_h264(vpath, pid="", target_h=1080):
                 if os.path.exists(part): os.remove(part)
             except Exception: pass
             cmd = [ff, "-y"] + hw + ["-i", vpath, "-vf", vf] + enc + fs + tail + [part]
+            if pid and pid in _CONV_CANCEL:   # arrêt demandé avant même de lancer l'essai suivant
+                break
             try:
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
             except Exception:
                 continue
+            if pid: _CONV_PROC[pid] = p
             try:
                 for line in p.stdout:
+                    if pid and pid in _CONV_CANCEL:
+                        try: p.kill()
+                        except Exception: pass
+                        break
                     if pid and dur > 0 and line.startswith("out_time_us="):
                         try:
                             us = int(line.strip().split("=")[1]); pct = min(99, int(100 * (us / 1e6) / dur))
@@ -2345,6 +2422,14 @@ def _convert_to_h264(vpath, pid="", target_h=1080):
             except Exception:
                 try: p.kill()
                 except Exception: pass
+            finally:
+                if pid: _CONV_PROC.pop(pid, None)
+            if pid and pid in _CONV_CANCEL:   # annulé -> on nettoie et on sort proprement
+                try:
+                    if os.path.exists(part): os.remove(part)
+                except Exception: pass
+                _CONV_CANCEL.discard(pid); _cp(pid, 100, "conversion arrêtée")
+                return ""
             if os.path.exists(part) and os.path.getsize(part) > 0 and _mp4_ok(part):
                 try: os.replace(part, out)
                 except Exception: pass
@@ -2357,8 +2442,321 @@ def _convert_to_h264(vpath, pid="", target_h=1080):
     try:
         if os.path.exists(part): os.remove(part)
     except Exception: pass
+    if pid and pid in _CONV_CANCEL:
+        _CONV_CANCEL.discard(pid); _cp(pid, 100, "conversion arrêtée"); return ""
     _cp(pid, 100, "conversion impossible")
     return ""
+
+# ============ CONVERSION INSTANTANÉE HDR->SDR (patch moov, 0 recopie — vitesse LiveTag) ============
+# Idée clé : une vidéo iPhone 4K HDR n'affiche rien dans Chromium À CAUSE de l'étiquette HDR, pas du HEVC
+# lui-même (le 10 bits SDR s'affiche bien). Or cette étiquette tient dans ~20 octets du 'moov' (quelques Ko
+# en fin de fichier), PAS dans les 14 Go d'image. On ne recopie donc RIEN : le moteur sert le fichier
+# d'origine tel quel en HTTP, en SUPERPOSANT à la volée ces quelques octets réécrits en BT.709 (SDR).
+# -> instantané quel que soit le poids, aucun fichier dupliqué, l'original n'est jamais modifié.
+_SDR_MAP = {}   # token -> {"src","size","mtime","patches":[(offset,bytes)...]}
+
+def _sdr_token_for(path):
+    import hashlib
+    try:
+        st = os.stat(path); key = "%s|%d|%d" % (os.path.abspath(path), st.st_size, int(st.st_mtime))
+    except Exception:
+        key = os.path.abspath(path or "")
+    return hashlib.sha1(key.encode("utf-8", "ignore")).hexdigest()[:16]
+
+def _sdr_unescape(b):
+    out = bytearray(); z = 0; i = 0
+    while i < len(b):
+        if z >= 2 and b[i] == 3 and i + 1 < len(b) and b[i + 1] <= 3:
+            z = 0; i += 1; continue
+        out.append(b[i]); z = z + 1 if b[i] == 0 else 0; i += 1
+    return bytes(out)
+
+def _sdr_escape(b):
+    out = bytearray(); z = 0
+    for x in b:
+        if z >= 2 and x <= 3:
+            out.append(3); z = 0
+        out.append(x); z = z + 1 if x == 0 else 0
+    return bytes(out)
+
+class _SdrBR:
+    __slots__ = ("b", "p")
+    def __init__(s, b): s.b = b; s.p = 0
+    def u(s, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | ((s.b[s.p >> 3] >> (7 - (s.p & 7))) & 1); s.p += 1
+        return v
+    def ue(s):
+        z = 0
+        while s.u(1) == 0: z += 1
+        return (1 << z) - 1 + (s.u(z) if z else 0)
+
+def _sdr_find_color_bit(rbsp):
+    """Renvoie la position (en bits) de colour_primaries dans le RBSP du SPS HEVC, ou None."""
+    try:
+        r = _SdrBR(rbsp)
+        r.u(4); maxsub = r.u(3); r.u(1)
+        def ptl(maxsub):
+            r.u(2); r.u(1); r.u(5)
+            for _ in range(32): r.u(1)
+            for _ in range(4): r.u(1)
+            r.u(43); r.u(1); r.u(8)
+            spf = []; slf = []
+            for i in range(maxsub): spf.append(r.u(1)); slf.append(r.u(1))
+            if maxsub > 0:
+                for i in range(maxsub, 8): r.u(2)
+            for i in range(maxsub):
+                if spf[i]:
+                    r.u(2); r.u(1); r.u(5)
+                    for _ in range(32): r.u(1)
+                    for _ in range(4): r.u(1)
+                    r.u(43); r.u(1)
+                if slf[i]: r.u(8)
+        ptl(maxsub)
+        r.ue(); cf = r.ue()
+        if cf == 3: r.u(1)
+        r.ue(); r.ue()
+        if r.u(1):
+            r.ue(); r.ue(); r.ue(); r.ue()
+        r.ue(); r.ue(); r.ue()
+        sub = r.u(1)
+        for i in range(0 if sub else maxsub, maxsub + 1): r.ue(); r.ue(); r.ue()
+        r.ue(); r.ue(); r.ue(); r.ue(); r.ue(); r.ue()
+        if r.u(1):
+            if r.u(1): return None   # scaling_list présent -> on s'abstient (repli remux)
+        r.u(1); r.u(1)
+        if r.u(1): r.u(4); r.u(4); r.ue(); r.ue(); r.u(1)
+        num = r.ue(); sets = []
+        for idx in range(num):
+            inter = r.u(1) if idx != 0 else 0
+            if inter:
+                r.u(1); r.ue()
+                prev = sets[idx - 1] if idx - 1 < len(sets) else 0
+                for j in range(prev + 1):
+                    if not r.u(1): r.u(1)
+                sets.append(prev)
+            else:
+                neg = r.ue(); pos = r.ue()
+                for _ in range(neg): r.ue(); r.u(1)
+                for _ in range(pos): r.ue(); r.u(1)
+                sets.append(neg + pos)
+        if r.u(1): return None   # long_term_ref présent -> on s'abstient
+        r.u(1); r.u(1)
+        if not r.u(1): return None   # pas de VUI
+        if r.u(1):
+            idc = r.u(8)
+            if idc == 255: r.u(16); r.u(16)
+        if r.u(1): r.u(1)
+        if r.u(1):
+            r.u(3); r.u(1)
+            if r.u(1):
+                return r.p
+        return None
+    except Exception:
+        return None
+
+def _sdr_read_moov(path):
+    """Lit UNIQUEMENT la box 'moov' (quelques Ko) sans charger les Go d'image. Renvoie (moov_abs, moov_bytes, filesize)."""
+    import struct
+    fs = os.path.getsize(path)
+    with open(path, "rb") as f:
+        i = 0
+        while i + 8 <= fs:
+            f.seek(i); hb = f.read(16)
+            if len(hb) < 8: break
+            sz = struct.unpack(">I", hb[:4])[0]; typ = hb[4:8]; hdr = 8
+            if sz == 1:
+                sz = struct.unpack(">Q", hb[8:16])[0]; hdr = 16
+            if sz == 0: sz = fs - i
+            if typ == b"moov":
+                f.seek(i); return i, f.read(sz), fs
+            if sz <= 0: break
+            i += sz
+    return None, None, fs
+
+def _sdr_patch_plan(path):
+    """Construit la liste [(offset_absolu, octets)] qui transforme l'étiquette HDR en SDR (BT.709),
+    neutralise Dolby Vision (dvvC/dvcC) et les métadonnées HDR (amve/clli/mdcv). Ne lit que le 'moov'.
+    Renvoie (patches, filesize) ou (None, filesize) si le fichier ne s'y prête pas."""
+    import struct
+    moov_abs, moov, fs = _sdr_read_moov(path)
+    if not moov:
+        return None, fs
+    def iter_boxes(buf, start, end):
+        i = start
+        while i + 8 <= end:
+            sz = struct.unpack(">I", buf[i:i + 4])[0]; typ = bytes(buf[i + 4:i + 8]); hdr = 8
+            if sz == 1: sz = struct.unpack(">Q", buf[i + 8:i + 16])[0]; hdr = 16
+            if sz == 0: sz = end - i
+            yield i, sz, hdr, typ
+            if sz <= 0: break
+            i += sz
+    def find(pathlist):
+        res = [None]
+        def rec(s, e, p):
+            for off, sz, hdr, typ in iter_boxes(moov, s, e):
+                if typ == p[0]:
+                    if len(p) == 1: res[0] = (off, sz, hdr); return True
+                    cs = off + hdr
+                    if typ == b"stsd": cs = off + hdr + 8
+                    if typ in (b"hvc1", b"hev1"): cs = off + hdr + 78
+                    if rec(cs, off + sz, p[1:]): return True
+            return False
+        rec(0, len(moov), pathlist)
+        return res[0]
+    patches = []
+    base = [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"]
+    # 1) colr (nclc/nclx) -> 1/1/1 (BT.709)
+    for entry in (b"hvc1", b"hev1"):
+        r = find(base + [entry, b"colr"])
+        if r:
+            off, sz, hdr = r; p = off + hdr
+            if bytes(moov[p:p + 4]) in (b"nclc", b"nclx"):
+                patches.append((moov_abs + p + 4, b"\x00\x01\x00\x01\x00\x01"))
+            break
+    # 2) Dolby Vision + métadonnées HDR -> 'free' (ignorées par Chromium)
+    for entry in (b"hvc1", b"hev1"):
+        for name in (b"dvvC", b"dvcC", b"amve", b"clli", b"mdcv"):
+            r = find(base + [entry, name])
+            if r:
+                off, sz, hdr = r; patches.append((moov_abs + off + 4, b"free"))
+    # 3) SPS VUI (bitstream) -> BT.709, en gardant la longueur identique (sinon on s'abstient)
+    sps_done = False
+    for entry in (b"hvc1", b"hev1"):
+        r = find(base + [entry, b"hvcC"])
+        if not r: continue
+        off, sz, hdr = r; hv = moov[off + hdr:off + sz]
+        try:
+            idx = 22; na = hv[idx]; idx += 1; spspos = None; spslen = None
+            j = idx
+            for _ in range(na):
+                nt = hv[j] & 0x3f; j += 1; cnt = struct.unpack(">H", hv[j:j + 2])[0]; j += 2
+                for _c in range(cnt):
+                    ln = struct.unpack(">H", hv[j:j + 2])[0]; j += 2
+                    if nt == 33: spspos = j; spslen = ln
+                    j += ln
+            if spspos is not None:
+                sps = bytes(hv[spspos:spspos + spslen])
+                rbsp = bytearray(_sdr_unescape(sps[2:]))
+                cb = _sdr_find_color_bit(rbsp)
+                if cb is not None:
+                    def setb(ba, bp, val, n):
+                        for k in range(n):
+                            bit = (val >> (n - 1 - k)) & 1
+                            bp2 = bp + k; by = bp2 >> 3; o = 7 - (bp2 & 7)
+                            if bit: ba[by] |= (1 << o)
+                            else:   ba[by] &= ~(1 << o)
+                    setb(rbsp, cb, 1, 8); setb(rbsp, cb + 8, 1, 8); setb(rbsp, cb + 16, 1, 8)
+                    new = sps[:2] + _sdr_escape(bytes(rbsp))
+                    if len(new) == spslen:   # même longueur -> patch propre en place
+                        patches.append((moov_abs + (off + hdr) + spspos, new))
+                        sps_done = True
+        except Exception:
+            pass
+        break
+    if not patches:
+        return None, fs
+    return patches, fs
+
+def _sdr_register(path):
+    """Prépare (ou réutilise) la conversion instantanée. Renvoie un token, ou None si non applicable."""
+    tok = _sdr_token_for(path)
+    m = _SDR_MAP.get(tok)
+    try:
+        st = os.stat(path)
+    except Exception:
+        return None
+    if m and m.get("size") == st.st_size and m.get("mtime") == int(st.st_mtime):
+        return tok
+    patches, fs = _sdr_patch_plan(path)
+    if not patches:
+        return None
+    _SDR_MAP[tok] = {"src": os.path.abspath(path), "size": st.st_size,
+                     "mtime": int(st.st_mtime), "patches": patches}
+    # Mémo disque (survie au redémarrage du moteur) : quelques octets.
+    try:
+        import json as _json
+        meta = {"src": os.path.abspath(path), "size": st.st_size, "mtime": int(st.st_mtime),
+                "patches": [[o, b.hex()] for (o, b) in patches]}
+        (CONV / ("sdr_" + tok + ".json")).write_text(_json.dumps(meta))
+    except Exception:
+        pass
+    return tok
+
+def _sdr_entry(tok):
+    """Récupère le plan d'un token (mémoire, sinon mémo disque), en vérifiant que le fichier n'a pas changé."""
+    m = _SDR_MAP.get(tok)
+    if m:
+        return m
+    try:
+        import json as _json
+        meta = _json.loads((CONV / ("sdr_" + tok + ".json")).read_text())
+        src = meta["src"]; st = os.stat(src)
+        if st.st_size != meta["size"] or int(st.st_mtime) != meta["mtime"]:
+            return None
+        m = {"src": src, "size": meta["size"], "mtime": meta["mtime"],
+             "patches": [(o, bytes.fromhex(h)) for (o, h) in meta["patches"]]}
+        _SDR_MAP[tok] = m
+        return m
+    except Exception:
+        return None
+
+from fastapi import Request as _FRequest
+
+@app.get("/sdr/{token}")
+def sdr_get(token: str, request: _FRequest):
+    """Sert la vidéo iPhone d'origine (HEVC) en réécrivant à la volée son étiquette couleur en SDR.
+    Gère les requêtes Range (seek fluide). Zéro recopie, l'original n'est jamais modifié."""
+    tok = re.sub(r"[^a-f0-9]", "", (token or ""))
+    m = _sdr_entry(tok)
+    if not m or not os.path.exists(m["src"]):
+        return JSONResponse({"error": "introuvable"}, status_code=404)
+    return _sdr_stream(m, request.headers.get("range", "") or request.headers.get("Range", ""))
+
+def _sdr_apply(buf, start, patches):
+    """Superpose les octets patchés sur 'buf' qui représente le fichier à partir de l'offset 'start'."""
+    end = start + len(buf)
+    ba = None
+    for (off, data) in patches:
+        a = off; b = off + len(data)
+        if b <= start or a >= end:
+            continue
+        if ba is None: ba = bytearray(buf)
+        lo = max(a, start); hi = min(b, end)
+        ba[lo - start:hi - start] = data[lo - a:hi - a]
+    return bytes(ba) if ba is not None else buf
+
+def _sdr_stream(m, range_hdr):
+    from starlette.responses import StreamingResponse, Response
+    size = m["size"]; src = m["src"]; patches = m["patches"]
+    start = 0; end = size - 1; status = 200
+    if range_hdr:
+        mt = re.match(r"bytes=(\d*)-(\d*)", range_hdr.strip())
+        if mt:
+            g1, g2 = mt.group(1), mt.group(2)
+            if g1 == "":   # suffixe
+                n = int(g2); start = max(0, size - n); end = size - 1
+            else:
+                start = int(g1); end = int(g2) if g2 else size - 1
+            end = min(end, size - 1); status = 206
+    if start > end or start >= size:
+        return Response(status_code=416, headers={"Content-Range": "bytes */%d" % size})
+    length = end - start + 1
+    CHUNK = 1024 * 1024
+    def gen():
+        with open(src, "rb") as f:
+            f.seek(start); pos = start; remaining = length
+            while remaining > 0:
+                n = min(CHUNK, remaining); data = f.read(n)
+                if not data: break
+                yield _sdr_apply(data, pos, patches)
+                pos += len(data); remaining -= len(data)
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(length),
+               "Cache-Control": "no-store", "Content-Type": "video/quicktime"}
+    if status == 206:
+        headers["Content-Range"] = "bytes %d-%d/%d" % (start, end, size)
+    return StreamingResponse(gen(), status_code=status, headers=headers, media_type="video/quicktime")
 
 @app.post("/import_check")
 async def import_check(path: str = Form(...)):
@@ -2372,13 +2770,47 @@ async def import_check(path: str = Form(...)):
 
 @app.post("/import_convert")
 async def import_convert(path: str = Form(...), pid: str = Form("")):
-    """Transcode la vidéo en H.264 lisible (cache). Progression via /calib_progress?pid=…"""
+    """Rend la vidéo AFFICHABLE. 1) Voie INSTANTANÉE (iPhone HEVC/HDR) : patch couleur à la volée, 0 recopie.
+    2) Repli : transcodage H.264 en cache. Progression via /calib_progress?pid=…"""
     if not path or not os.path.exists(path):
         return JSONResponse({"ok": False, "error": "introuvable"}, status_code=404)
+    # --- Voie instantanée : on ne réécrit que l'étiquette HDR->SDR dans le 'moov' (quelques Ko) ---
+    try:
+        tok = await asyncio.to_thread(_sdr_register, path)
+    except Exception:
+        tok = None
+    if tok:
+        _cp(pid, 100, "prête")
+        return {"ok": True, "url": "/sdr/" + tok, "instant": True}
+    # --- Repli (codecs exotiques, scaling list, etc.) : transcodage classique ---
     out = await asyncio.to_thread(_convert_to_h264, path, pid)
     if not out:
         return JSONResponse({"ok": False, "error": "conversion impossible"}, status_code=500)
     return {"ok": True, "url": "/conv/" + os.path.basename(out), "path": out}
+
+@app.post("/import_convert_cancel")
+async def import_convert_cancel(pid: str = Form(...)):
+    """Arrête une conversion en cours (quand l'utilisateur quitte la page ou clique « Arrêter »)."""
+    if pid:
+        _CONV_CANCEL.add(pid)
+        p = _CONV_PROC.get(pid)
+        if p:
+            try: p.kill()
+            except Exception: pass
+    return {"ok": True}
+
+@app.get("/conv_diag")
+def conv_diag():
+    """Diagnostic : quels outils d'accélération le moteur a-t-il sous la main ?"""
+    import sys as _sys, subprocess
+    d = {"platform": _sys.platform, "avconvert": os.path.exists("/usr/bin/avconvert"),
+         "ffmpeg": (_ffmpeg_bins() or [""])[0], "videotoolbox": False}
+    try:
+        out = subprocess.run([d["ffmpeg"], "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=30).stdout
+        d["videotoolbox"] = "h264_videotoolbox" in out
+    except Exception as e:
+        d["err"] = str(e)
+    return d
 
 @app.get("/conv/{name}")
 def conv_get(name: str):
@@ -4767,9 +5199,51 @@ def _warmup_models():
             print("warmup global:", e)
     threading.Thread(target=_w, daemon=True).start()
 
+def _free_port_8000():
+    """Tue tout ANCIEN moteur resté sur le port 8000 (sauf soi-même) : sinon on se rebranche sur
+    un moteur au code périmé et les correctifs ne s'appliquent jamais. Robuste (lsof macOS/Linux)."""
+    import subprocess, os as _os, time as _t, signal as _sig
+    me = _os.getpid()
+    for lsof in ("lsof", "/usr/sbin/lsof", "/usr/bin/lsof"):
+        try:
+            pids = subprocess.run([lsof, "-ti", "tcp:8000"], capture_output=True, text=True, timeout=8).stdout.split()
+        except Exception:
+            continue
+        killed = False
+        for x in pids:
+            try:
+                xp = int(x)
+                if xp and xp != me:
+                    _os.kill(xp, _sig.SIGKILL); killed = True
+                    print("  (ancien moteur %d arrêté pour libérer le port 8000)" % xp, flush=True)
+            except Exception:
+                pass
+        if killed:
+            _t.sleep(1.2)
+        break
+    # Repli SANS lsof : tue tout autre python qui exécute server.py (hors soi).
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=8).stdout
+        hit = False
+        for ln in out.splitlines():
+            if "server.py" in ln and "grep" not in ln and "/ps " not in ln:
+                try:
+                    xp = int(ln.split()[0])
+                    if xp and xp != me and xp != _os.getppid():
+                        _os.kill(xp, _sig.SIGKILL); hit = True
+                        print("  (moteur résiduel %d arrêté)" % xp, flush=True)
+                except Exception:
+                    pass
+        if hit:
+            _t.sleep(1.0)
+    except Exception:
+        pass
+
 if __name__ == "__main__":
     import uvicorn, sys
     sys.path.insert(0, str(BASE))
+    try: _free_port_8000()
+    except Exception: pass
     print("\n  Foot Session  —  ouvre  http://localhost:8000  dans ton navigateur")
     print("  (app complète avec suivi IA intégré ; outil tracking seul sur /studio)")
     print("  Rechargement auto du code actif : les mises à jour s'appliquent sans relancer.\n")
