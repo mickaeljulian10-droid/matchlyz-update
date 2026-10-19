@@ -2307,43 +2307,53 @@ def _convert_to_h264(vpath, pid="", target_h=1080):
     vf_tonemap = (scale + ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                   "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
     vf_simple  = scale + ",format=yuv420p"
-    filters = ([vf_tonemap] if hdr else []) + [vf_simple]
-    encs = [["-c:v", "h264_videotoolbox", "-b:v", "8M"],
-            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]]
-    tail = ["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-f", "mp4"]
+    bt709 = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+    tail  = ["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-f", "mp4"]
+    VT    = ["-c:v", "h264_videotoolbox", "-b:v", "8M"]
+    X264  = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"]
+    # Essais du PLUS RAPIDE au plus lent. Décoder du 4K HEVC en logiciel est TRÈS lent -> on privilégie
+    # l'accélération matérielle Apple (VideoToolbox) pour DÉCODER (-hwaccel) ET ENCODER (h264_videotoolbox).
+    # Chaque essai : (args_hwaccel, filtre vidéo, encodeur, forcer_tags_SDR_BT709).
+    attempts = [
+        (["-hwaccel", "videotoolbox"], vf_simple, VT, True),   # le plus rapide (couleurs un poil plates si HDR)
+        ([],                           vf_simple, VT, True),
+    ]
+    if hdr:   # couleurs HDR->SDR propres (zscale) : plus joli mais plus lent
+        attempts += [(["-hwaccel", "videotoolbox"], vf_tonemap, VT, False),
+                     ([],                           vf_tonemap, VT, False)]
+    attempts += [(["-hwaccel", "videotoolbox"], vf_simple, X264, True),   # repli logiciel (lent)
+                 ([],                           vf_simple, X264, True)]
     for ff in _ffmpeg_bins():
-        for vf in filters:
-            # si on n'a PAS tonemappé un HDR, on force des tags SDR BT.709 (sinon affichage délavé)
-            force_sdr = [] if (hdr and vf == vf_tonemap) else ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
-            for enc in encs:
-                try:
-                    if os.path.exists(part): os.remove(part)
-                except Exception: pass
-                cmd = [ff, "-y", "-i", vpath, "-vf", vf] + enc + force_sdr + tail + [part]
-                try:
-                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                except Exception:
-                    continue
-                try:
-                    for line in p.stdout:
-                        if pid and dur > 0 and line.startswith("out_time_us="):
-                            try:
-                                us = int(line.strip().split("=")[1]); pct = min(99, int(100 * (us / 1e6) / dur))
-                                _cp(pid, pct, "conversion de la vidéo… %d%%" % pct)
-                            except Exception: pass
-                    p.wait()
-                except Exception:
-                    try: p.kill()
-                    except Exception: pass
-                if os.path.exists(part) and os.path.getsize(part) > 0 and _mp4_ok(part):
-                    try: os.replace(part, out)
-                    except Exception: pass
-                    if out.exists():
-                        print("  -> conversion H.264 prête :", os.path.basename(ff), enc[1], flush=True)
-                        _cp(pid, 100, "conversion terminée")
-                        try: _prune_video_cache()
+        for (hw, vf, enc, fsdr) in attempts:
+            fs = bt709 if fsdr else []
+            try:
+                if os.path.exists(part): os.remove(part)
+            except Exception: pass
+            cmd = [ff, "-y"] + hw + ["-i", vpath, "-vf", vf] + enc + fs + tail + [part]
+            try:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            except Exception:
+                continue
+            try:
+                for line in p.stdout:
+                    if pid and dur > 0 and line.startswith("out_time_us="):
+                        try:
+                            us = int(line.strip().split("=")[1]); pct = min(99, int(100 * (us / 1e6) / dur))
+                            _cp(pid, pct, "conversion de la vidéo… %d%%" % pct)
                         except Exception: pass
-                        return str(out)
+                p.wait()
+            except Exception:
+                try: p.kill()
+                except Exception: pass
+            if os.path.exists(part) and os.path.getsize(part) > 0 and _mp4_ok(part):
+                try: os.replace(part, out)
+                except Exception: pass
+                if out.exists():
+                    print("  -> conversion H.264 prête :", os.path.basename(ff), enc[1], ("hwaccel" if hw else "sw-decode"), flush=True)
+                    _cp(pid, 100, "conversion terminée")
+                    try: _prune_video_cache()
+                    except Exception: pass
+                    return str(out)
     try:
         if os.path.exists(part): os.remove(part)
     except Exception: pass
