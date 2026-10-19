@@ -4509,6 +4509,7 @@ async function loadVideoFile(f){ if(!f)return;
   if(projectMode()==='live'){ alert('⛔ Ce dossier a été réalisé en DIRECT.\n\nPour analyser une vidéo importée, crée un NOUVEAU dossier (＋ Analyse). Un dossier ne peut pas mélanger direct et fichier importé.'); return; }
   try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
   setProjectMode('file');
+  project.videoConverted=false; project.videoUrl='';   // nouvelle vidéo -> on oublie l'éventuelle conversion de l'ancienne
   vid.src=URL.createObjectURL(f); project.videoName=f.name; project.videoSize=f.size;   // taille mémorisée -> vkey calculable même sans relire le fichier
   const id=project.videoBlobId||('vid_'+uid()); project.videoBlobId=id;
   try{ await dbPut('blobs',{id,blob:f}); }catch(e){ alert('La vidéo est trop volumineuse pour être mémorisée ('+e.message+'). Elle marche pour cette session mais devra être re-sélectionnée à la réouverture.'); project.videoBlobId=null; }
@@ -4540,6 +4541,7 @@ async function loadVideoHandle(h,f){ if(!h||!f)return;
   if(projectMode()==='live'){ alert('⛔ Ce dossier a été réalisé en DIRECT.\n\nCrée un NOUVEAU dossier (＋ Analyse) pour analyser une vidéo importée.'); return; }
   try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
   setProjectMode('file');
+  project.videoConverted=false; project.videoUrl='';   // nouvelle vidéo -> on oublie l'éventuelle conversion de l'ancienne
   vid.src=URL.createObjectURL(f); project.videoName=f.name; project.videoSize=f.size;
   try{ const _p=_filePath(f); if(_p)project.videoPath=_p; }catch(e){}   // chemin absolu -> lecture directe moteur (aucun envoi)
   // On supprime l'éventuelle copie précédente (libère l'espace) puis on mémorise seulement le lien.
@@ -4625,7 +4627,10 @@ async function tryAutoVideo(){
   if(project.videoHandleId){ $('loadVid').textContent='🎬 Recharger «'+(project.videoName||'')+'»'; }
 }
 $('loadVid').onclick=async()=>{
-  const _isReload=!!(project&&project.videoRef&&project.videoHandleId);
+  // Une vidéo est DÉJÀ affichée -> le clic sert à EN CHANGER (on ouvre le sélecteur).
+  // Sinon (après redémarrage, rien de chargé) -> on ré-ouvre la vidéo référencée SANS re-sélection.
+  const _loaded=!!(vid&&vid.currentSrc);
+  const _isReload=!_loaded && !!(project&&project.videoRef&&project.videoHandleId);
   // D'ABORD : si c'est une vidéo déjà référencée, on la ré-ouvre depuis le lien mémorisé SANS re-sélection.
   // On ne rouvre le sélecteur de fichier QUE si le fichier a réellement bougé/disparu.
   if(_isReload){ const r=await reconnectMainVideoHandle(true);
