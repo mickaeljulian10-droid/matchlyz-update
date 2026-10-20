@@ -4641,25 +4641,25 @@ function _mlzFrameIsBlank(){
 // FILET : si la vidéo chargée a une DURÉE mais AUCUNE image (codec non décodable, ou iPhone HEVC/HDR qui
 // décode mais s'affiche NOIR), on déclenche la conversion (ou on propose de relier le fichier).
 try{ if(vid && !vid._mlzDecCheck){ vid._mlzDecCheck=true;
-  // Cache la bannière « relier/iPhone » dès qu'une VRAIE image s'affiche (plus de bandeau collé).
-  const _mlzHideIfVisible=()=>{ try{ if(window._mlzRelinkShown && vid.videoWidth>0 && !_mlzFrameIsBlank()){ try{aiBarHide();}catch(e){} window._mlzRelinkShown=false; } }catch(e){} };
-  const _recheck=()=>{ try{
+  // Cache la bannière « relier/iPhone » dès qu'une image existe (plus de bandeau collé).
+  const _mlzHideIfVisible=()=>{ try{ if(window._mlzRelinkShown && vid.videoWidth>0){ try{aiBarHide();}catch(e){} window._mlzRelinkShown=false; } }catch(e){} };
+  // Décision UNE SEULE FOIS, au chargement (JAMAIS pendant la lecture -> plus de fausse conversion qui
+  // coupait l'image sur une image sombre). On attend ~900 ms puis on agit SEULEMENT si l'image est TOUJOURS
+  // absente/noire : soit la vidéo ne se décode pas (videoWidth===0), soit elle décode mais s'affiche NOIRE
+  // (cas iPhone HEVC/HDR). Dans ce cas -> conversion /sdr si on a le chemin, sinon bouton « Relier ».
+  let _mlzDecDone=false;
+  vid.addEventListener('loadeddata',()=>{ try{
+    if(_mlzDecDone) return;   // une seule évaluation par chargement
     if(!(vid.duration>0) || !project || project.videoConverted || window._mlzConvBusy) return;
-    // Image déjà VISIBLE -> rien à faire (et on retire une éventuelle bannière restée affichée).
-    if(vid.videoWidth>0 && !_mlzFrameIsBlank()){ _mlzHideIfVisible(); return; }
-    // Image absente/noire : on NE conclut PAS tout de suite (la 1re image d'un fichier normal est souvent
-    // noire). On re-teste après un court délai ; on n'agit que si c'est TOUJOURS noir.
     setTimeout(()=>{ try{
-      if(project.videoConverted || window._mlzConvBusy) return;
-      if(vid.videoWidth>0 && !_mlzFrameIsBlank()){ _mlzHideIfVisible(); return; }   // finalement visible -> rien
-      window._mlzConvBusy=true;
+      if(_mlzDecDone || project.videoConverted || window._mlzConvBusy) return;
+      // image bien là ET non noire -> rien à faire (on retire une éventuelle bannière restée affichée)
+      if(vid.videoWidth>0 && !_mlzFrameIsBlank()){ _mlzHideIfVisible(); return; }
+      _mlzDecDone=true; window._mlzConvBusy=true; const done=()=>{ window._mlzConvBusy=false; };
       const p=(project&&project.videoPath)||'';
-      const done=()=>{ window._mlzConvBusy=false; };
       if(p){ mlzConvertPath(p).then(done,done); } else { try{ mlzShowRelinkBanner(); window._mlzRelinkShown=true; }catch(e){} done(); }
-    }catch(e){} }, 700);
-  }catch(e){} };
-  vid.addEventListener('loadeddata',_recheck);
-  vid.addEventListener('seeked',_recheck);
+    }catch(e){} }, 900);
+  }catch(e){} });
   vid.addEventListener('timeupdate',_mlzHideIfVisible);
 } }catch(e){}
 // Recharge la vidéo RÉFÉRENCÉE (disque externe) depuis le lien mémorisé, SANS re-sélectionner le fichier.
