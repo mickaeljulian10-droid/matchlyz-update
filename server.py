@@ -1929,7 +1929,7 @@ def _ensure_intra(vpath):
         low = (vpath or "").lower()
         # _seekI2 : nouvelle génération (sortie SDR/BT.709). On change le suffixe pour NE PAS réutiliser
         # d'anciens _seekI.mp4 encodés en HDR (qui s'affichaient noirs au montage).
-        out = os.path.splitext(vpath)[0] + "_seekI2.mp4"
+        out = os.path.splitext(vpath)[0] + "_seekI3.mp4"
         if out.lower() == low:
             return vpath
         if os.path.exists(out) and os.path.getsize(out) > 0:
@@ -1949,31 +1949,42 @@ def _ensure_intra(vpath):
         except Exception:
             _info = {}
         _hdr = (_info.get("color_transfer") or "").lower() in _HDR_TRC
-        intra = ["-g", "1", "-keyint_min", "1", "-x264-params", "scenecut=0:keyint=1:min-keyint=1"]
         common = ["-r", "30", "-vsync", "cfr", "-an", "-movflags", "+faststart", "-f", "mp4"]
         bt709 = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
-        vf_tm = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+        # LEVIER 2 — APERÇU DE RENDU LÉGER (ne convertit PAS la source, qui reste 4K et s'affiche en instantané
+        # via /sdr). On fabrique juste un proxy accéléré GPU, PLAFONNÉ À 1080p : ~4x plus petit sur le disque,
+        # bien plus rapide à construire ET à parcourir image par image -> génération du montage/clip rapide.
+        # scale AVANT le tonemap = le tonemap travaille sur 1080p (beaucoup moins de calcul CPU).
+        scale_pre = "scale=-2:'min(1080,ih)'"
+        vf_tm = (scale_pre + ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                  "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
-        vf_plain = "format=yuv420p"
-        X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"] + intra
-        VT   = ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-g", "1"]   # all-intra matériel (repli si pas de libx264)
-        # Essais, du meilleur rendu au plus robuste : (filtre vidéo, encodeur). Pour l'HDR on tente d'abord
-        # le tonemap (couleurs correctes) ; en repli on force juste l'étiquette SDR (image un peu plate mais VISIBLE).
+        vf_plain = scale_pre + ",format=yuv420p"
+        # Encodeur matériel (GPU) EN PRIORITÉ = rapide. GOP court (g=12) au lieu de tout-image-clé 4K :
+        # en 1080p le seek reste quasi instantané et le fichier est petit. libx264 = repli logiciel.
+        VT   = ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-g", "12", "-allow_sw", "1"]
+        X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-g", "12", "-keyint_min", "12"]
+        # Essais : (filtre, encodeur, décodage GPU ?). On tente d'abord le GPU (VideoToolbox) qui est rapide,
+        # puis le logiciel en repli. hwaccel seulement sur le chemin sans tonemap (compat filtres CPU).
         attempts = []
         if _hdr:
-            attempts += [(vf_tm, X264), (vf_tm, VT), (vf_plain, X264), (vf_plain, VT)]
+            attempts += [(vf_tm, VT, False), (vf_tm, X264, False),
+                         (vf_plain, VT, True), (vf_plain, X264, False)]
         else:
-            attempts += [(vf_plain, X264), (vf_plain, VT)]
-        print("Export : création MP4 all-intra (seek instantané)%s :" % (" [HDR->SDR]" if _hdr else ""),
+            attempts += [(vf_plain, VT, True), (vf_plain, VT, False), (vf_plain, X264, False)]
+        print("Export : création aperçu léger 1080p (GPU)%s :" % (" [HDR->SDR]" if _hdr else ""),
               os.path.basename(vpath), flush=True)
         last = b""
         for ff in _ffmpeg_bins():
-            for (vf, enc) in attempts:
+            for (vf, enc, hw) in attempts:
                 try:
                     if os.path.exists(part): os.remove(part)
                 except Exception:
                     pass
-                cmd = ([ff, "-y", "-fflags", "+genpts", "-i", vpath, "-vf", vf]
+                pre = [ff, "-y", "-fflags", "+genpts"]
+                if hw:
+                    pre += ["-hwaccel", "videotoolbox"]
+                cmd = (pre + ["-i", vpath, "-vf", vf]
                        + enc + ["-pix_fmt", "yuv420p"] + bt709 + common + [part])
                 try:
                     r = subprocess.run(cmd, capture_output=True, timeout=14400)
@@ -1986,7 +1997,7 @@ def _ensure_intra(vpath):
                     except Exception:
                         pass
                     if os.path.exists(out):
-                        print("  -> OK all-intra (%s, %s) :" % (os.path.basename(ff), enc[1]), os.path.basename(out), flush=True)
+                        print("  -> OK aperçu léger (%s, %s, hw=%s) :" % (os.path.basename(ff), enc[1], hw), os.path.basename(out), flush=True)
                         return out
         try:
             if os.path.exists(part):
@@ -2044,7 +2055,7 @@ def _fast_source_for(p):
 
 def _intra_existing(p):
     base = os.path.splitext(p or "")[0]
-    for cand in (base + "_seekI2.mp4", base + "_seekc_seekI2.mp4"):
+    for cand in (base + "_seekI3.mp4", base + "_seekc_seekI3.mp4"):
         if os.path.exists(cand) and os.path.getsize(cand) > 0:
             if _mp4_ok(cand):
                 return cand
@@ -2983,6 +2994,46 @@ async def montage_encode(file: UploadFile = File(...), fmt: str = Form("mp4")):
 # ===== RENDU CÔTÉ SERVEUR (méthode LiveTag) : images JPEG + audio -> ffmpeg =====
 RENDER = WORK / "_render"; RENDER.mkdir(exist_ok=True)
 
+# ===== ARRÊT RÉEL DE LA GÉNÉRATION (bouton Stop) =====
+# Problème corrigé : quand l'utilisateur cliquait « Stop », le navigateur arrêtait ses boucles mais le
+# ffmpeg LANCÉ PAR LE MOTEUR continuait (d'où l'obligation de fermer l'app). On tient un drapeau d'arrêt
+# global + la liste des processus ffmpeg en cours -> Stop les TUE immédiatement.
+_STOP_ALL = False
+_ALL_PROCS = []
+def _run_cancelable(cmd, timeout=36000):
+    """Lance ffmpeg de façon INTERRUPTIBLE : le processus est enregistré pour pouvoir être tué par Stop."""
+    import subprocess as _sp
+    if _STOP_ALL:
+        class _R: returncode = 255; stderr = b"stop"; stdout = b""
+        return _R()
+    p = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.PIPE)
+    try: _ALL_PROCS.append(p)
+    except Exception: pass
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except Exception:
+        try: p.kill()
+        except Exception: pass
+        try: out, err = p.communicate(timeout=5)
+        except Exception: out, err = b"", b"timeout"
+    try: _ALL_PROCS.remove(p)
+    except Exception: pass
+    class _R: pass
+    r = _R(); r.returncode = p.returncode; r.stdout = out or b""; r.stderr = err or b""
+    return r
+def _render_stop_all():
+    """Tue tous les ffmpeg de rendu en cours et bloque les suivants (jusqu'au prochain /render_start)."""
+    global _STOP_ALL
+    _STOP_ALL = True
+    for p in list(_ALL_PROCS):
+        try: p.kill()
+        except Exception: pass
+    try: _ALL_PROCS.clear()
+    except Exception: pass
+def _render_reset_stop():
+    global _STOP_ALL
+    _STOP_ALL = False
+
 def _sid_dir(sid):
     safe = re.sub(r"[^a-f0-9]", "", sid or "")
     if not safe:
@@ -2991,11 +3042,25 @@ def _sid_dir(sid):
 
 @app.post("/render_start")
 async def render_start():
+    _render_reset_stop()            # nouveau rendu -> on lève un éventuel « Stop » précédent
     try: _prune_video_cache(20.0)   # plafond du cache (façon LiveTag) : nettoie les vieilles copies avant de rendre
     except Exception: pass
     sid = uuid.uuid4().hex
     (RENDER / sid).mkdir(parents=True, exist_ok=True)
     return {"ok": True, "sid": sid}
+
+@app.post("/render_cancel")
+async def render_cancel(sid: str = Form("")):
+    """STOP réel : tue immédiatement le ffmpeg du moteur en cours, et efface les images temporaires
+    de ce rendu (sinon elles s'accumulent et remplissent le disque)."""
+    _render_stop_all()
+    try:
+        safe, d = _sid_dir(sid)
+        if d and d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+    return {"ok": True}
 
 @app.post("/render_frame")
 async def render_frame(sid: str = Form(...), idx: int = Form(...), file: UploadFile = File(...)):
@@ -3722,7 +3787,7 @@ def cut_clip(vkey: str = Form(...), t0: float = Form(...), t1: float = Form(...)
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"] + bt709 + [
                "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out]
     try:
-        pr = subprocess.run(cmd, capture_output=True, timeout=36000)
+        pr = _run_cancelable(cmd, timeout=36000)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     finally:
@@ -3756,6 +3821,8 @@ def render_match(sid: str = Form(...), vkey: str = Form(...),
     shorts = []
     last_err = ""
     for seg in segments:
+        if _STOP_ALL:   # Stop pressé -> on arrête net l'extraction
+            return JSONResponse({"ok": False, "cancelled": True, "made": made}, status_code=200)
         try:
             i0 = int(seg["i0"]); count = int(seg["count"])
             want += count
@@ -3771,9 +3838,19 @@ def render_match(sid: str = Form(...), vkey: str = Form(...),
             # Fenêtre bornée par le TEMPS (pas par un nombre d'images) : plus robuste sur les zones à
             # timing irrégulier des WebM du direct. -ss AVANT -i (ffmpeg 6) = rapide ET précis.
             seg_dur = (count / rate) + 0.20 if rate > 0 else 1.0
-            cmd = [ff, "-y", "-fflags", "+genpts", "-ss", ("%.4f" % max(0.0, ts0)), "-i", src,
-                   "-t", ("%.4f" % seg_dur), "-vf", vf, "-q:v", "2", tmp]
-            pr = subprocess.run(cmd, capture_output=True, timeout=36000)
+            # DÉCODAGE GPU (VideoToolbox) : accélère fortement le HEVC 4K iPhone. Repli AUTOMATIQUE sans
+            # hwaccel si l'accélération matérielle échoue (certains conteneurs) -> on ne perd jamais le rendu.
+            base_out = ["-t", ("%.4f" % seg_dur), "-vf", vf, "-q:v", "2", tmp]
+            cmd_hw = [ff, "-y", "-hwaccel", "videotoolbox", "-fflags", "+genpts",
+                      "-ss", ("%.4f" % max(0.0, ts0)), "-i", src] + base_out
+            cmd_sw = [ff, "-y", "-fflags", "+genpts",
+                      "-ss", ("%.4f" % max(0.0, ts0)), "-i", src] + base_out
+            pr = _run_cancelable(cmd_hw)
+            # si le GPU n'a rien produit (et qu'on n'a pas été stoppé), on retente en CPU
+            if (pr.returncode != 0) and (not _STOP_ALL):
+                _probe = d / ("m_%d_000001.jpg" % i0)
+                if not _probe.exists():
+                    pr = _run_cancelable(cmd_sw)
             if pr.returncode != 0 and pr.stderr:
                 last_err = pr.stderr.decode("utf-8", "ignore")[-500:]
             got = 0

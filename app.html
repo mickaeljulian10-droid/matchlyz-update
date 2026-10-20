@@ -33,7 +33,10 @@
   .btn.danger{border-color:#ff5252;color:#ff7676;}
   .btn.sm{padding:5px 9px;font-size:12px;}
 
-  #home{height:calc(100vh - var(--barH));overflow:auto;display:flex;align-items:center;justify-content:center;padding:30px 20px;background:transparent;position:relative;}
+  /* align-items:flex-start (et PAS center) : avec beaucoup de dossiers, le bloc devient plus haut que l'écran ;
+     centré verticalement, son HAUT (titre + boutons) passait au-dessus de la zone visible et devenait impossible
+     à atteindre en remontant. Ancré en haut -> le titre reste visible et le défilement remonte jusqu'en haut. */
+  #home{height:calc(100vh - var(--barH));overflow:auto;display:flex;align-items:flex-start;justify-content:center;padding:30px 20px;background:transparent;position:relative;}
   #homeFx{position:fixed;left:0;top:0;right:0;bottom:var(--barH);z-index:0;pointer-events:none;display:none;}
   .welcome{width:1060px;max-width:100%;background:#141417cc;border:1px solid var(--line);border-radius:16px;padding:26px;box-shadow:0 24px 70px #000a;position:relative;z-index:1;}
   .hcols{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-top:16px;align-items:start;}
@@ -4575,6 +4578,7 @@ async function mlzAutoConvert(f){
 // Bannière « Relier » : affichée UNIQUEMENT quand l'image est noire et qu'on n'a pas le chemin disque
 // (vidéo iPhone HEVC sélectionnée via le sélecteur moderne, qui ne donne pas le chemin au moteur).
 function mlzShowRelinkBanner(){
+  window._mlzRelinkShown=true;   // permet l'auto-masquage dès qu'une vraie image s'affiche
   if(window.matchlyzVideoRef){
     aiBar('🎬 Vidéo iPhone (HEVC) : pour afficher l\'image, je dois lire le fichier en direct. <button id="mlzRelink" style="margin-left:8px;padding:5px 11px;border-radius:8px;border:0;background:#1bd47a;color:#042;font-weight:800;cursor:pointer">🔗 Relier pour afficher</button>');
     try{ const btn=document.getElementById('mlzRelink'); if(btn)btn.onclick=async()=>{ let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){} if(r&&r.path){ project.videoPath=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; try{save();}catch(e){} await mlzConvertPath(r.path); } }; }catch(e){}
@@ -4636,15 +4640,28 @@ function _mlzFrameIsBlank(){
 }
 // FILET : si la vidéo chargée a une DURÉE mais AUCUNE image (codec non décodable, ou iPhone HEVC/HDR qui
 // décode mais s'affiche NOIR), on déclenche la conversion (ou on propose de relier le fichier).
-try{ if(vid && !vid._mlzDecCheck){ vid._mlzDecCheck=true; vid.addEventListener('loadeddata',()=>{ try{
-  if(vid.duration>0 && project && !project.videoConverted && !window._mlzConvBusy && (vid.videoWidth===0 || _mlzFrameIsBlank())){
-    window._mlzConvBusy=true;
-    const p=(project&&project.videoPath)||'';
-    const done=()=>{ window._mlzConvBusy=false; };
-    // Image réellement absente (écran noir) : si on a le chemin -> conversion ; sinon -> bannière « Relier ».
-    if(p){ mlzConvertPath(p).then(done,done); } else { try{ mlzShowRelinkBanner(); }catch(e){} done(); }
-  }
-}catch(e){} }); } }catch(e){}
+try{ if(vid && !vid._mlzDecCheck){ vid._mlzDecCheck=true;
+  // Cache la bannière « relier/iPhone » dès qu'une VRAIE image s'affiche (plus de bandeau collé).
+  const _mlzHideIfVisible=()=>{ try{ if(window._mlzRelinkShown && vid.videoWidth>0 && !_mlzFrameIsBlank()){ try{aiBarHide();}catch(e){} window._mlzRelinkShown=false; } }catch(e){} };
+  const _recheck=()=>{ try{
+    if(!(vid.duration>0) || !project || project.videoConverted || window._mlzConvBusy) return;
+    // Image déjà VISIBLE -> rien à faire (et on retire une éventuelle bannière restée affichée).
+    if(vid.videoWidth>0 && !_mlzFrameIsBlank()){ _mlzHideIfVisible(); return; }
+    // Image absente/noire : on NE conclut PAS tout de suite (la 1re image d'un fichier normal est souvent
+    // noire). On re-teste après un court délai ; on n'agit que si c'est TOUJOURS noir.
+    setTimeout(()=>{ try{
+      if(project.videoConverted || window._mlzConvBusy) return;
+      if(vid.videoWidth>0 && !_mlzFrameIsBlank()){ _mlzHideIfVisible(); return; }   // finalement visible -> rien
+      window._mlzConvBusy=true;
+      const p=(project&&project.videoPath)||'';
+      const done=()=>{ window._mlzConvBusy=false; };
+      if(p){ mlzConvertPath(p).then(done,done); } else { try{ mlzShowRelinkBanner(); window._mlzRelinkShown=true; }catch(e){} done(); }
+    }catch(e){} }, 700);
+  }catch(e){} };
+  vid.addEventListener('loadeddata',_recheck);
+  vid.addEventListener('seeked',_recheck);
+  vid.addEventListener('timeupdate',_mlzHideIfVisible);
+} }catch(e){}
 // Recharge la vidéo RÉFÉRENCÉE (disque externe) depuis le lien mémorisé, SANS re-sélectionner le fichier.
 // Retour : true (chargée) · 'moved' (fichier introuvable/déplacé) · 'denied' (accès refusé) · 'prompt' (à re-tenter sur un clic) · 'nohandle'.
 // Chemin ABSOLU d'un fichier (Electron) : f.path (ancienne API) ou webUtils.getPathForFile (nouvelle). Sinon ''.
@@ -9951,6 +9968,7 @@ async function boardRender(fmt,mode){ const a=aiwin.action; if(!a)return; fmt=(f
     aiBar('🎬 Rendu du tableau tactique ('+fmt.toUpperCase()+') — ne ferme pas la fenêtre…');
     let sid=null; try{ const r=await fetch(AI_BASE+'/render_start',{method:'POST'}); const j=await r.json(); sid=j&&j.sid; }catch(e){}
     if(!sid){ alert('Moteur local injoignable. Lance le serveur (DEMARRER.command) puis réessaie.'); return; }
+    window._curRenderSid=sid;   // mémorisé pour que « Stop » puisse annuler ce rendu côté moteur
     const nFrames=Math.max(1,Math.ceil(total*FPS)); const _upQ=[]; const _MAXQ=16;
     for(let i=0;i<nFrames;i++){ if(window._srvStop)break; const T=Math.min(total-1e-3, i/FPS);
       try{ boardDrawTo(c,W,H,T); }catch(e){}
@@ -12227,7 +12245,7 @@ async function ensureFastSrc(){
   }catch(e){ return null; }
 }
 async function exportMontageServer(){
-  if(window._srvBusy){ window._srvStop=true; return; }
+  if(window._srvBusy){ _srvCancelNow(); return; }
   const clips=project.timeline.clips;
   if(!clips.length){ alert('Ajoute des éléments à la timeline (clips d\'analyse ou médias).'); return; }
   const needsVid=clips.some(c=>(c.kind==='analytic'||c.kind==='raw') && !c.mediaId); if(needsVid){ if(!(await _montEnsureVidOrWarn(clips)))return; }
@@ -12242,6 +12260,7 @@ async function exportMontageServer(){
     // 1) session
     let sid=null; try{ const r=await fetch(AI_BASE+'/render_start',{method:'POST'}); const j=await r.json(); sid=j&&j.sid; }catch(e){}
     if(!sid){ alert('Moteur local injoignable. Lance le serveur (DEMARRER.command) puis réessaie.'); return; }
+    window._curRenderSid=sid;   // mémorisé pour que « Stop » puisse annuler ce rendu côté moteur
     // 2) audio (rendu hors-ligne, fiable)
     mstat('Rendu de l\'audio…'); const wav=await _renderAudioWav(clips,total);
     if(wav){ try{ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); }catch(e){} }
@@ -12403,8 +12422,15 @@ async function exportMontageTurbo(sid,clips,total,nFrames,FPS,RW,RH,vkey,mediaVk
   mstat('✅ Vidéo générée ('+outExt.toUpperCase()+') — fichier prêt.');
   return true;
 }
+// STOP RÉEL : coupe les boucles du navigateur ET demande au moteur de tuer le ffmpeg en cours
+// (sinon la génération continuait côté serveur et il fallait fermer l'app).
+function _srvCancelNow(){
+  window._srvStop=true; try{ mStop=true; }catch(e){}
+  try{ mstat('⏹ Arrêt en cours…'); }catch(e){}
+  try{ const sid=window._curRenderSid; if(sid){ const fd=new FormData(); fd.append('sid',sid); fetch(AI_BASE+'/render_cancel',{method:'POST',body:fd}).catch(()=>{}); } }catch(e){}
+}
 async function exportMontageNative(){
-  if(window._srvBusy){ window._srvStop=true; return; }
+  if(window._srvBusy){ _srvCancelNow(); return; }
   const clips=project.timeline.clips;
   if(!clips.length){ alert('Ajoute des éléments à la timeline (clips d\'analyse ou médias).'); return; }
   // La vidéo du MATCH n'est requise que s'il existe un clip analytique/brut SANS source propre (= source = match).
@@ -12429,6 +12455,7 @@ async function exportMontageNative(){
     const nFrames=Math.max(1,Math.ceil(total*FPS));
     let sid=null; try{ const r=await fetch(AI_BASE+'/render_start',{method:'POST'}); const j=await r.json(); sid=j&&j.sid; }catch(e){}
     if(!sid){ alert('Moteur local injoignable. Lance le serveur (DEMARRER.command) puis réessaie.'); return; }
+    window._curRenderSid=sid;   // mémorisé pour que « Stop » puisse annuler ce rendu côté moteur
     mstat('Rendu de l\'audio…'); try{ const wav=await _renderAudioWav(clips,total); if(wav){ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); } }catch(e){}
     const hasText=clips.some(c=>c.kind==='text');
     const mcvCtx=$('mcv').getContext('2d');
