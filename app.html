@@ -6398,8 +6398,8 @@ function openRenderPanel(a){
     +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px"><b style="color:var(--accent);font-size:16px">🎬 Options de rendu</b><button id="rpX" class="btn sm" style="margin-left:auto">✕</button></div>'
     +'<div style="font-size:12px;color:var(--mut);margin-bottom:5px">Format vidéo</div>'
     +'<div style="display:flex;gap:8px;margin-bottom:16px">'
-      +'<label style="flex:1;display:flex;align-items:center;justify-content:center;gap:7px;background:#1d1d22;border:1px solid var(--line);border-radius:8px;padding:9px;cursor:pointer"><input type="radio" name="rpFmt" value="mov" checked style="accent-color:var(--accent)"> MOV</label>'
-      +'<label style="flex:1;display:flex;align-items:center;justify-content:center;gap:7px;background:#1d1d22;border:1px solid var(--line);border-radius:8px;padding:9px;cursor:pointer"><input type="radio" name="rpFmt" value="mp4" style="accent-color:var(--accent)"> MP4</label>'
+      +'<label style="flex:1;display:flex;align-items:center;justify-content:center;gap:7px;background:#1d1d22;border:1px solid var(--line);border-radius:8px;padding:9px;cursor:pointer"><input type="radio" name="rpFmt" value="mp4" checked style="accent-color:var(--accent)"> MP4</label>'
+      +'<label style="flex:1;display:flex;align-items:center;justify-content:center;gap:7px;background:#1d1d22;border:1px solid var(--line);border-radius:8px;padding:9px;cursor:pointer"><input type="radio" name="rpFmt" value="mov" style="accent-color:var(--accent)"> MOV</label>'
     +'</div>'
     +'<div style="font-size:12px;color:var(--mut);margin-bottom:5px">Audio / voix</div>'
     +(hasVoice
@@ -6485,7 +6485,7 @@ async function downloadClipVideo(a,opts){
     // Aperçu : on affiche AUSSI la carte de résultat (comme pour un clip avec arrêt sur image) -> l'utilisateur
     // voit sa vidéo tout de suite. La vidéo est en H.264 (lisible par le petit lecteur). La carte libère l'URL
     // à sa fermeture. (Avant : rien ne s'affichait pour un clip sans arrêt sur image.)
-    try{ showRenderResult(url, fname, fmt, true); }catch(e){ setTimeout(()=>URL.revokeObjectURL(url), 30000); }
+    try{ showRenderResult(url, fname, fmt, true, blob); }catch(e){ setTimeout(()=>URL.revokeObjectURL(url), 30000); }
   }catch(e){
     try{ if(typeof toast==='function')toast('❌ '+((e&&e.message)||'échec')); }catch(_){}
     alert('Rendu impossible : '+((e&&e.message)||e));
@@ -10857,13 +10857,37 @@ function renderProgUpdate(s){ const montVis=(()=>{ try{ const m=document.getElem
 }
 function renderProgHide(){ const b=document.getElementById('renderProg'); if(b)b.remove(); }
 // Carte de RÉSULTAT flottante (aperçu du clip rendu) — visible partout, pas seulement dans le Montage.
-function showRenderResult(url,fname,ext,saved){ document.querySelectorAll('#renderRes').forEach(x=>x.remove());
-  const box=document.createElement('div'); box.id='renderRes'; box.style.cssText='position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:100002;background:#12181c;border:1px solid #2b3640;border-radius:14px;padding:16px;width:min(520px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.7);font-family:Montserrat,Arial,sans-serif';
-  box.innerHTML='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><b style="color:var(--accent);font-size:15px">✅ '+(saved?'Vidéo enregistrée':'Vidéo prête')+'</b><span style="flex:1"></span><button id="rrX" class="btn sm">✕ Fermer</button></div>'
-    +'<video src="'+url+'" controls autoplay style="width:100%;max-height:52vh;border-radius:10px;background:#000;display:block"></video>'
+function showRenderResult(url,fname,ext,saved,blob){ document.querySelectorAll('#renderRes').forEach(x=>x.remove());
+  // APERÇU PAR CANVAS : dans Electron, un <video> dans une fenêtre peut s'afficher NOIR (la vidéo part sur une
+  // couche GPU invisible dans la page, mais visible en plein écran). On contourne en DESSINANT les images de la
+  // vidéo sur un <canvas> (rendu 2D, jamais noir). La vidéo joue en sourdine en coulisse ; clic = lecture/pause.
+  let _pv=url; try{ if(blob){ _pv=URL.createObjectURL(new Blob([blob],{type:'video/mp4'})); } }catch(e){}
+  const box=document.createElement('div'); box.id='renderRes'; box.style.cssText='position:fixed;inset:0;z-index:100002;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);font-family:Montserrat,Arial,sans-serif';
+  box.innerHTML='<div style="background:#12181c;border:1px solid #2b3640;border-radius:14px;padding:16px;width:min(520px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.7)">'
+    +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><b style="color:var(--accent);font-size:15px">✅ '+(saved?'Vidéo enregistrée':'Vidéo prête')+'</b><span style="flex:1"></span><button id="rrX" class="btn sm">✕ Fermer</button></div>'
+    +'<div style="position:relative;line-height:0"><canvas id="rrCv" style="width:100%;max-height:52vh;border-radius:10px;background:#000;display:block;cursor:pointer"></canvas>'
+    +'<div id="rrPlay" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none"><div style="width:62px;height:62px;border-radius:50%;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;font-size:26px;color:#fff">▶</div></div></div>'
+    +'<div id="rrTime" style="color:#9fb0bb;font-size:12px;margin-top:6px;text-align:center"></div>'
     +'<div style="display:flex;gap:8px;margin-top:10px"><a href="'+url+'" download="'+esc(fname)+'" class="btn acc" style="flex:1;text-align:center;text-decoration:none">⬇ '+(saved?'Re-télécharger':'Télécharger')+'</a></div>'
-    +(saved?'':'<div style="color:#9fb0bb;font-size:11px;margin-top:8px;text-align:center">Enregistrée dans ton dossier Téléchargements.</div>');
-  document.body.appendChild(box); box.querySelector('#rrX').onclick=()=>{ box.remove(); try{URL.revokeObjectURL(url);}catch(e){} }; }
+    +(saved?'':'<div style="color:#9fb0bb;font-size:11px;margin-top:8px;text-align:center">Enregistrée dans ton dossier Téléchargements.</div>')
+    +'</div>';
+  document.body.appendChild(box);
+  const cv=box.querySelector('#rrCv'); const cx=cv.getContext('2d'); const playBtn=box.querySelector('#rrPlay'); const timeEl=box.querySelector('#rrTime');
+  const vd=document.createElement('video'); vd.src=_pv; vd.muted=true; vd.playsInline=true; vd.preload='auto';
+  const _ft=s=>{ s=Math.max(0,s||0); const m=Math.floor(s/60), r=Math.floor(s%60); return m+':'+String(r).padStart(2,'0'); };
+  let raf=0;
+  const draw=()=>{ try{ if(vd.videoWidth){ if(cv.width!==vd.videoWidth){ cv.width=vd.videoWidth; cv.height=vd.videoHeight; } cx.drawImage(vd,0,0,cv.width,cv.height); } }catch(e){}
+    try{ timeEl.textContent=_ft(vd.currentTime)+' / '+_ft(vd.duration||0); }catch(e){}
+    raf=requestAnimationFrame(draw); };
+  vd.addEventListener('loadeddata',()=>{ try{ if(cv.width!==vd.videoWidth){ cv.width=vd.videoWidth; cv.height=vd.videoHeight; } cx.drawImage(vd,0,0,cv.width,cv.height); }catch(e){} });
+  const toggle=()=>{ if(vd.paused){ vd.play().catch(()=>{}); playBtn.style.display='none'; } else { vd.pause(); playBtn.style.display='flex'; } };
+  cv.addEventListener('click',toggle);
+  vd.addEventListener('ended',()=>{ playBtn.style.display='flex'; });
+  raf=requestAnimationFrame(draw);
+  vd.play().then(()=>{ playBtn.style.display='none'; }).catch(()=>{ playBtn.style.display='flex'; });
+  const close=()=>{ try{ cancelAnimationFrame(raf); }catch(e){} try{ vd.pause(); vd.removeAttribute('src'); vd.load(); }catch(e){} box.remove(); try{URL.revokeObjectURL(url);}catch(e){} try{ if(_pv!==url)URL.revokeObjectURL(_pv); }catch(e){} };
+  box.querySelector('#rrX').onclick=close;
+  box.addEventListener('click',e=>{ if(e.target===box)close(); }); }
 const actionById=id=>(project.actions||[]).find(a=>a.id===id)||(project.mClipActions||[]).find(a=>a.id===id);
 // MONTAGE — ISOLATION DES CLIPS COPIÉS :
 // Un clip d'analyse (issu d'un tag) pointe vers l'ACTION partagée (project.actions). Si on copie le clip
@@ -12066,7 +12090,7 @@ async function offerDownload(blob,ext){
     }
     const url=URL.createObjectURL(blob);
     if(!saved){ const dl=document.createElement('a'); dl.href=url; dl.download=fname; document.body.appendChild(dl); dl.click(); dl.remove(); }
-    try{ showRenderResult(url,fname,ext,saved); }catch(e){}
+    try{ showRenderResult(url,fname,ext,saved,blob); }catch(e){}
     return;
   }
   // MONTAGE : on demande TOUJOURS où enregistrer (même comportement à 720p / 1080p / 4K), pour que tu retrouves
