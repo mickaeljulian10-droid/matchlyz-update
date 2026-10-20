@@ -1927,7 +1927,9 @@ def _ensure_intra(vpath):
     depuis une image-clé lointaine). Utilisée UNIQUEMENT pour l'export rapide du montage."""
     try:
         low = (vpath or "").lower()
-        out = os.path.splitext(vpath)[0] + "_seekI.mp4"
+        # _seekI2 : nouvelle génération (sortie SDR/BT.709). On change le suffixe pour NE PAS réutiliser
+        # d'anciens _seekI.mp4 encodés en HDR (qui s'affichaient noirs au montage).
+        out = os.path.splitext(vpath)[0] + "_seekI2.mp4"
         if out.lower() == low:
             return vpath
         if os.path.exists(out) and os.path.getsize(out) > 0:
@@ -1937,34 +1939,61 @@ def _ensure_intra(vpath):
                 os.remove(out)  # partiel/corrompu -> reconstruction
             except Exception:
                 pass
-        try:
-            import imageio_ffmpeg
-            ff = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            ff = "ffmpeg"
         import subprocess
         part = out + ".part"
-        cmd = [ff, "-y", "-fflags", "+genpts", "-i", vpath,
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-               "-r", "30", "-vsync", "cfr",
-               "-g", "1", "-keyint_min", "1", "-x264-params", "scenecut=0:keyint=1:min-keyint=1",
-               "-an", "-movflags", "+faststart", part]
-        print("Export : création MP4 all-intra (seek instantané) :", os.path.basename(vpath), flush=True)
-        r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0 and _mp4_ok(part):
-            try:
-                os.replace(part, out)
-            except Exception:
-                pass
-            if os.path.exists(out):
-                print("  -> OK all-intra :", os.path.basename(out), flush=True)
-                return out
+        # DÉTECTION HDR : une source iPhone 4K HDR (HLG/HDR10) ré-encodée SANS retirer l'étiquette HDR
+        # ressort NOIRE dans le navigateur (même cause qu'à l'import). On force donc une sortie SDR (BT.709),
+        # avec conversion de couleurs (tonemap) si la source est HDR. Sinon l'image du montage est noire.
+        try:
+            _info = _probe_vinfo(vpath)
+        except Exception:
+            _info = {}
+        _hdr = (_info.get("color_transfer") or "").lower() in _HDR_TRC
+        intra = ["-g", "1", "-keyint_min", "1", "-x264-params", "scenecut=0:keyint=1:min-keyint=1"]
+        common = ["-r", "30", "-vsync", "cfr", "-an", "-movflags", "+faststart", "-f", "mp4"]
+        bt709 = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+        vf_tm = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                 "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+        vf_plain = "format=yuv420p"
+        X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"] + intra
+        VT   = ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-g", "1"]   # all-intra matériel (repli si pas de libx264)
+        # Essais, du meilleur rendu au plus robuste : (filtre vidéo, encodeur). Pour l'HDR on tente d'abord
+        # le tonemap (couleurs correctes) ; en repli on force juste l'étiquette SDR (image un peu plate mais VISIBLE).
+        attempts = []
+        if _hdr:
+            attempts += [(vf_tm, X264), (vf_tm, VT), (vf_plain, X264), (vf_plain, VT)]
+        else:
+            attempts += [(vf_plain, X264), (vf_plain, VT)]
+        print("Export : création MP4 all-intra (seek instantané)%s :" % (" [HDR->SDR]" if _hdr else ""),
+              os.path.basename(vpath), flush=True)
+        last = b""
+        for ff in _ffmpeg_bins():
+            for (vf, enc) in attempts:
+                try:
+                    if os.path.exists(part): os.remove(part)
+                except Exception:
+                    pass
+                cmd = ([ff, "-y", "-fflags", "+genpts", "-i", vpath, "-vf", vf]
+                       + enc + ["-pix_fmt", "yuv420p"] + bt709 + common + [part])
+                try:
+                    r = subprocess.run(cmd, capture_output=True, timeout=14400)
+                    last = r.stderr or b""
+                except Exception as e:
+                    last = str(e).encode(); continue
+                if os.path.exists(part) and os.path.getsize(part) > 0 and _mp4_ok(part):
+                    try:
+                        os.replace(part, out)
+                    except Exception:
+                        pass
+                    if os.path.exists(out):
+                        print("  -> OK all-intra (%s, %s) :" % (os.path.basename(ff), enc[1]), os.path.basename(out), flush=True)
+                        return out
         try:
             if os.path.exists(part):
                 os.remove(part)
         except Exception:
             pass
-        print("  -> échec all-intra (on garde la source) :", (r.stderr[-300:] if r.stderr else b""), flush=True)
+        print("  -> échec all-intra (on garde la source) :", (last[-300:] if last else b""), flush=True)
     except Exception as e:
         print("ensure_intra err:", e, flush=True)
     return vpath
@@ -2015,7 +2044,7 @@ def _fast_source_for(p):
 
 def _intra_existing(p):
     base = os.path.splitext(p or "")[0]
-    for cand in (base + "_seekI.mp4", base + "_seekc_seekI.mp4"):
+    for cand in (base + "_seekI2.mp4", base + "_seekc_seekI2.mp4"):
         if os.path.exists(cand) and os.path.getsize(cand) > 0:
             if _mp4_ok(cand):
                 return cand

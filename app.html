@@ -4510,7 +4510,8 @@ async function loadVideoFile(f){ if(!f)return;
   try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
   setProjectMode('file');
   project.videoConverted=false; project.videoUrl='';   // nouvelle vidéo -> on oublie l'éventuelle conversion de l'ancienne
-  vid.src=URL.createObjectURL(f); project.videoName=f.name; project.videoSize=f.size;   // taille mémorisée -> vkey calculable même sans relire le fichier
+  vid.src=URL.createObjectURL(f); try{ vid.load(); }catch(e){}   // load() -> l'image s'affiche DÈS le 1er chargement (sinon il fallait re-sélectionner)
+  project.videoName=f.name; project.videoSize=f.size;   // taille mémorisée -> vkey calculable même sans relire le fichier
   const id=project.videoBlobId||('vid_'+uid()); project.videoBlobId=id;
   try{ await dbPut('blobs',{id,blob:f}); }catch(e){ alert('La vidéo est trop volumineuse pour être mémorisée ('+e.message+'). Elle marche pour cette session mais devra être re-sélectionnée à la réouverture.'); project.videoBlobId=null; }
   _seekOnce=project.lastTime||0; save(); refreshVidBtn();
@@ -4542,7 +4543,8 @@ async function loadVideoHandle(h,f){ if(!h||!f)return;
   try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
   setProjectMode('file');
   project.videoConverted=false; project.videoUrl='';   // nouvelle vidéo -> on oublie l'éventuelle conversion de l'ancienne
-  vid.src=URL.createObjectURL(f); project.videoName=f.name; project.videoSize=f.size;
+  vid.src=URL.createObjectURL(f); try{ vid.load(); }catch(e){}   // load() -> l'image s'affiche DÈS le 1er chargement (sinon il fallait re-sélectionner)
+  project.videoName=f.name; project.videoSize=f.size;
   try{ const _p=_filePath(f); if(_p)project.videoPath=_p; }catch(e){}   // chemin absolu -> lecture directe moteur (aucun envoi)
   // On supprime l'éventuelle copie précédente (libère l'espace) puis on mémorise seulement le lien.
   if(project.videoBlobId){ try{ await dbDel('blobs',project.videoBlobId); }catch(e){} project.videoBlobId=null; }
@@ -4560,16 +4562,21 @@ async function mlzAutoConvert(f){
     let path=''; try{ path=_filePath(f)||''; }catch(e){}
     if(!path && project && project.videoPath) path=project.videoPath;   // chemin déjà connu (lecture directe)
     if(path) return await mlzConvertPath(path);
-    // Pas de chemin : le sélecteur moderne (et le navigateur) ne donnent pas le chemin disque au moteur.
-    // Dans l'app on propose de RELIER le fichier (sélecteur natif -> vrai chemin) pour pouvoir convertir.
-    if(window.matchlyzVideoRef){
-      const b=aiBar('🎬 Vidéo iPhone (HEVC) : pour afficher l\'image, je dois lire le fichier en direct. <button id="mlzRelink" style="margin-left:8px;padding:5px 11px;border-radius:8px;border:0;background:#1bd47a;color:#042;font-weight:800;cursor:pointer">🔗 Relier pour afficher</button>');
-      try{ const btn=document.getElementById('mlzRelink'); if(btn)btn.onclick=async()=>{ let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){} if(r&&r.path){ project.videoPath=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; try{save();}catch(e){} await mlzConvertPath(r.path); } }; }catch(e){}
-    } else {
-      aiBar('ℹ️ Cette vidéo iPhone (HEVC) ne s\'affiche que dans l\'app MatchLyz (le navigateur ne donne pas le chemin du fichier).'); setTimeout(aiBarHide,8000);
-    }
+    // PAS DE CHEMIN : on ne montre AUCUNE bannière ici. Si la vidéo s'affiche normalement (cas général,
+    // ex. un MP4), il ne faut rien afficher. La bannière « Relier » n'apparaît QUE si l'image est réellement
+    // absente (écran noir) -> c'est le détecteur plus bas (videoWidth===0) qui la déclenche alors.
     return false;
   }catch(e){ try{aiBarHide();}catch(_){} return false; }
+}
+// Bannière « Relier » : affichée UNIQUEMENT quand l'image est noire et qu'on n'a pas le chemin disque
+// (vidéo iPhone HEVC sélectionnée via le sélecteur moderne, qui ne donne pas le chemin au moteur).
+function mlzShowRelinkBanner(){
+  if(window.matchlyzVideoRef){
+    aiBar('🎬 Vidéo iPhone (HEVC) : pour afficher l\'image, je dois lire le fichier en direct. <button id="mlzRelink" style="margin-left:8px;padding:5px 11px;border-radius:8px;border:0;background:#1bd47a;color:#042;font-weight:800;cursor:pointer">🔗 Relier pour afficher</button>');
+    try{ const btn=document.getElementById('mlzRelink'); if(btn)btn.onclick=async()=>{ let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){} if(r&&r.path){ project.videoPath=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; try{save();}catch(e){} await mlzConvertPath(r.path); } }; }catch(e){}
+  } else {
+    aiBar('ℹ️ Cette vidéo iPhone (HEVC) ne s\'affiche que dans l\'app MatchLyz (le navigateur ne donne pas le chemin du fichier).'); setTimeout(aiBarHide,8000);
+  }
 }
 // Convertit la vidéo au CHEMIN donné (HEVC/HDR -> H.264 lisible) avec barre de progression, puis bascule l'affichage.
 async function mlzConvertPath(path){
@@ -4610,14 +4617,28 @@ function mlzCancelConv(){
   if(pid){ try{ const d=new FormData(); d.append('pid',pid); fetch(AI_BASE+'/import_convert_cancel',{method:'POST',body:d}).catch(()=>{}); }catch(e){} }
   try{ aiBar('⏹ Conversion arrêtée.'); setTimeout(aiBarHide,2000); }catch(e){}
 }
-// FILET : si la vidéo chargée a une DURÉE mais AUCUNE image (codec non décodable : iPhone HEVC/HDR…),
-// on déclenche la conversion (ou on propose de relier le fichier) — même à l'ouverture d'un match.
+// Teste si l'image affichée est VRAIMENT noire (écran noir) : on échantillonne la frame dans un petit
+// canvas. Vrai si quasiment tous les pixels sont ~0 (cas HEVC/HDR non rendu). Une scène simplement sombre
+// garde de la variation -> considérée visible (pas de fausse alerte). Robuste même si videoWidth>0.
+function _mlzFrameIsBlank(){
+  try{
+    if(!vid||!vid.videoWidth||!vid.videoHeight) return true;   // pas de dimensions -> pas d'image
+    const cw=32, ch=18; let cv=window.__mlzBlankCv; if(!cv){ cv=window.__mlzBlankCv=document.createElement('canvas'); }
+    cv.width=cw; cv.height=ch; const cx=cv.getContext('2d',{willReadFrequently:true});
+    cx.drawImage(vid,0,0,cw,ch); const d=cx.getImageData(0,0,cw,ch).data; let mx=0;
+    for(let i=0;i<d.length;i+=4){ const m=Math.max(d[i],d[i+1],d[i+2]); if(m>mx)mx=m; }
+    return mx<8;   // aucun pixel au-dessus de 8/255 -> écran noir
+  }catch(e){ return false; }   // canvas « tainted » / erreur -> on ne conclut pas au noir (pas de fausse bannière)
+}
+// FILET : si la vidéo chargée a une DURÉE mais AUCUNE image (codec non décodable, ou iPhone HEVC/HDR qui
+// décode mais s'affiche NOIR), on déclenche la conversion (ou on propose de relier le fichier).
 try{ if(vid && !vid._mlzDecCheck){ vid._mlzDecCheck=true; vid.addEventListener('loadeddata',()=>{ try{
-  if(vid.videoWidth===0 && vid.duration>0 && project && !project.videoConverted && !window._mlzConvBusy){
+  if(vid.duration>0 && project && !project.videoConverted && !window._mlzConvBusy && (vid.videoWidth===0 || _mlzFrameIsBlank())){
     window._mlzConvBusy=true;
     const p=(project&&project.videoPath)||'';
     const done=()=>{ window._mlzConvBusy=false; };
-    if(p){ mlzConvertPath(p).then(done,done); } else { mlzAutoConvert({}).then(done,done); }
+    // Image réellement absente (écran noir) : si on a le chemin -> conversion ; sinon -> bannière « Relier ».
+    if(p){ mlzConvertPath(p).then(done,done); } else { try{ mlzShowRelinkBanner(); }catch(e){} done(); }
   }
 }catch(e){} }); } }catch(e){}
 // Recharge la vidéo RÉFÉRENCÉE (disque externe) depuis le lien mémorisé, SANS re-sélectionner le fichier.
