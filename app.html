@@ -6481,8 +6481,11 @@ async function downloadClipVideo(a,opts){
     }
     const url=URL.createObjectURL(blob);
     const dl=document.createElement('a'); dl.href=url; dl.download=fname; document.body.appendChild(dl); dl.click(); dl.remove();
-    setTimeout(()=>URL.revokeObjectURL(url), 30000);
     try{ if(typeof toast==='function')toast('✅ Vidéo téléchargée'); }catch(e){}
+    // Aperçu : on affiche AUSSI la carte de résultat (comme pour un clip avec arrêt sur image) -> l'utilisateur
+    // voit sa vidéo tout de suite. La vidéo est en H.264 (lisible par le petit lecteur). La carte libère l'URL
+    // à sa fermeture. (Avant : rien ne s'affichait pour un clip sans arrêt sur image.)
+    try{ showRenderResult(url, fname, fmt, true); }catch(e){ setTimeout(()=>URL.revokeObjectURL(url), 30000); }
   }catch(e){
     try{ if(typeof toast==='function')toast('❌ '+((e&&e.message)||'échec')); }catch(_){}
     alert('Rendu impossible : '+((e&&e.message)||e));

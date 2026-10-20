@@ -3703,16 +3703,23 @@ def cut_clip(vkey: str = Form(...), t0: float = Form(...), t1: float = Form(...)
                     _vf.write(data)
         except Exception:
             vpath = None
+    # SEEK « grossier puis précis » pour ÉVITER le début noir : on saute vite à ~1 s AVANT t0 (-ss avant -i,
+    # sur une image-clé), puis on avance précisément jusqu'à t0 (-ss après -i). Le décodeur est alors « chaud »
+    # dès la 1re image -> plus d'image noire au départ, et la coupe reste calée à l'image près.
+    _t0 = max(0.0, float(t0))
+    _pre = max(0.0, _t0 - 1.0)        # point d'entrée rapide (image-clé la plus proche avant)
+    _fine = _t0 - _pre                # ajustement précis restant
+    bt709 = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     if vpath:
         # Vidéo (sans son original) + voix (à partir de 0 = début du clip), bornée à la durée du clip.
-        cmd = [ff, "-y", "-ss", ("%.4f" % max(0.0, float(t0))), "-i", src, "-i", vpath,
-               "-t", ("%.4f" % dur), "-map", "0:v:0", "-map", "1:a:0",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        cmd = [ff, "-y", "-ss", ("%.4f" % _pre), "-i", src, "-i", vpath,
+               "-ss", ("%.4f" % _fine), "-t", ("%.4f" % dur), "-map", "0:v:0", "-map", "1:a:0",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"] + bt709 + [
                "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out]
     else:
-        cmd = [ff, "-y", "-ss", ("%.4f" % max(0.0, float(t0))), "-i", src,
-               "-t", ("%.4f" % dur),
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        cmd = [ff, "-y", "-ss", ("%.4f" % _pre), "-i", src,
+               "-ss", ("%.4f" % _fine), "-t", ("%.4f" % dur),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"] + bt709 + [
                "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out]
     try:
         pr = subprocess.run(cmd, capture_output=True, timeout=36000)
