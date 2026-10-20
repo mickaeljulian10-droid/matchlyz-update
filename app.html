@@ -2554,6 +2554,10 @@ let project=null, sel=null, pxPerSec=10, tlH=30, closedCats=new Set();
 let micStream=null,mediaRecorder=null,chunks=[],MIME='',recAction=null,prevStop=null;
 let micRecStream=null,_micAC=null;
 const vid=document.getElementById('vid');
+// crossOrigin='anonymous' + CORS moteur -> dessiner la vidéo convertie (/sdr, /vid) dans un canvas ne le rend
+// PLUS « tainted », même si l'origine diffère (127.0.0.1 vs localhost). Sans ça : arrêt sur image / Suivi IA
+// échouent (« Impossible de capturer la frame ») sur les vidéos iPhone. À poser AVANT toute affectation de src.
+try{ vid.crossOrigin='anonymous'; }catch(e){}
 const $=id=>document.getElementById(id);
 function fmt(s){s=Math.max(0,s||0);const m=Math.floor(s/60),r=(s%60).toFixed(1).padStart(4,'0');return `${String(m).padStart(2,'0')}:${r}`;}
 let liveMode=false, liveReview=false, liveReviewUrl=null, _fixing=false, _reviewSeek=null;
@@ -6722,7 +6726,14 @@ function applyImportedTracks(d){ if(!sel){ alert('Sélectionne une action d\'abo
   alert(sel.tracks.length+' joueurs importés ✅'+rg+'\\nLance ▶ la lecture du clip pour voir le suivi sous tes dessins.\\nAstuce : sélectionne un joueur dans la barre 🎯 Suivi pour changer couleur/style/taille.');
 }
 // ===== SUIVI IA INTÉGRÉ (serveur local) — tag → clip → analyse → choix joueurs → dessin =====
-let AI_BASE=(function(){ try{ return (localStorage.getItem('mlz_engine')||'').trim()||'http://localhost:8000'; }catch(e){ return 'http://localhost:8000'; } })();
+let AI_BASE=(function(){ try{ const s=(localStorage.getItem('mlz_engine')||'').trim(); if(s)return s;
+  // IMPORTANT : l'app est chargée depuis http://127.0.0.1:8000 (Electron) ou http://localhost:8000 (navigateur).
+  // On prend l'ORIGINE RÉELLE de la page comme base du moteur -> les vidéos converties (/sdr, /vid) sont servies
+  // sur la MÊME origine. Sinon (ex. app sur 127.0.0.1 mais vidéos sur localhost) le canvas devient « tainted »
+  // et l'arrêt sur image / Suivi IA échouent (« Impossible de capturer la frame ») sur les vidéos iPhone.
+  if(location&&(location.protocol==='http:'||location.protocol==='https:')&&location.origin&&/(:8000)$/.test(location.origin)) return location.origin;
+  if(location&&(location.protocol==='http:'||location.protocol==='https:')&&location.host) return location.origin;
+  return 'http://localhost:8000'; }catch(e){ return 'http://localhost:8000'; } })();
 let aiDyn={active:false, action:null, tool:'player', size:1, pendingLine:null, cands:[], raf:0};
 let aiCacheMap={};   // action.id -> liste des pistes (analyse faite une seule fois)
 let aiPfMap={};      // action.id -> détections image par image (tous les joueurs de chaque frame)
@@ -11919,7 +11930,7 @@ async function prepareAssets(clips){ clips=clips||project.timeline.clips; const 
       if(project&&project.videoConverted&&project.videoUrl&&c.srcHandleId&&c.srcHandleId===project.videoHandleId){ durl=project.videoUrl; }
       else if(c.srcBlobId){ const r=await dbGet('blobs',c.srcBlobId); blob=r&&r.blob||null; } else if(c.srcHandleId){ blob=await _handleToBlob(c.srcHandleId); }
       const vsrc=durl||(blob?URL.createObjectURL(blob):null);
-      if(vsrc){ const v=document.createElement('video'); v.muted=true; v.preload='auto'; v.src=vsrc; await new Promise(res=>{ v.oncanplay=res; v.onloadeddata=res; v.onerror=res; setTimeout(res,4000); }); A.vids[key]=v; } }catch(e){} } } }
+      if(vsrc){ const v=document.createElement('video'); try{ v.crossOrigin='anonymous'; }catch(e){} v.muted=true; v.preload='auto'; v.src=vsrc; await new Promise(res=>{ v.oncanplay=res; v.onloadeddata=res; v.onerror=res; setTimeout(res,4000); }); A.vids[key]=v; } }catch(e){} } } }
     if(c.kind==='analytic'){ const a=actionById(c.actionId); if(!a){ try{ console.error('MTG: action INTROUVABLE pour clip '+c.id+' (actionId='+c.actionId+')'); }catch(e){} continue; }
       try{ console.error('MTG clip='+c.id+' act='+c.actionId+' in='+a.in+' out='+a.out+' freezes='+((a.freezes||[]).length)+' aiFreezes='+((a.aiFreezes||[]).length)+' aiAnnos='+((a.aiAnnos||[]).length)+' fzTimes='+JSON.stringify((a.freezes||[]).map(f=>+(f.time||0).toFixed(1)))); }catch(e){}
       A.plans[c.id]=planAnalytic(a,c.voiceDur||0);
@@ -12179,7 +12190,7 @@ async function ensureFastSrc(){
     // déjà prêt -> aucune attente : la génération part tout de suite (rapide au prochain export).
     let ready=false; try{ const r=await fetch(AI_BASE+'/vid_status/'+encodeURIComponent(vkey)+'?build=1'); const j=await r.json(); ready=!!(j&&j.ready); }catch(e){}
     if(!ready) return null;
-    const v=document.createElement('video'); v.muted=true; v.preload='auto'; v.playsInline=true;
+    const v=document.createElement('video'); try{ v.crossOrigin='anonymous'; }catch(e){} v.muted=true; v.preload='auto'; v.playsInline=true;
     v.src=AI_BASE+'/vid/'+encodeURIComponent(vkey);
     const ok=await new Promise(res=>{ let d=false; const fin=(x)=>{ if(d)return; d=true; res(x); };
       v.addEventListener('loadeddata',()=>fin(true)); v.addEventListener('canplay',()=>fin(true));
