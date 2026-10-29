@@ -4611,7 +4611,10 @@ async function mlzConvertPath(path){
     if(window._mlzConvCancelled){ return false; }   // arrêté par l'utilisateur -> message déjà affiché
     if(res&&res.ok&&res.url){
       try{ vid.src=AI_BASE+res.url; vid.load(); }catch(e){}
-      project.videoUrl=AI_BASE+res.url; if(res.path)project.videoPath=res.path; project.videoConverted=true;
+      // IMPORTANT : le proxy (/conv) sert UNIQUEMENT à l'AFFICHAGE (videoUrl). On NE remplace PAS videoPath,
+      // qui doit rester le fichier D'ORIGINE pleine résolution -> l'IA de calibrage/suivi lit toujours le 4K
+      // d'origine (sinon elle lisait le proxy 1080p et la calibration se dégradait/figeait sur les HEVC).
+      project.videoUrl=AI_BASE+res.url; if(res.path)project.videoConvPath=res.path; project.videoConverted=true;
       try{ save(); }catch(e){}
       aiBar('✅ Vidéo convertie — l\'image s\'affiche.'); setTimeout(aiBarHide,2600); return true;
     }
@@ -4640,27 +4643,22 @@ function _mlzFrameIsBlank(){
 }
 // FILET : si la vidéo chargée a une DURÉE mais AUCUNE image (codec non décodable, ou iPhone HEVC/HDR qui
 // décode mais s'affiche NOIR), on déclenche la conversion (ou on propose de relier le fichier).
-try{ if(vid && !vid._mlzDecCheck){ vid._mlzDecCheck=true;
-  // Cache la bannière « relier/iPhone » dès qu'une image existe (plus de bandeau collé).
-  const _mlzHideIfVisible=()=>{ try{ if(window._mlzRelinkShown && vid.videoWidth>0){ try{aiBarHide();}catch(e){} window._mlzRelinkShown=false; } }catch(e){} };
-  // Décision UNE SEULE FOIS, au chargement (JAMAIS pendant la lecture -> plus de fausse conversion qui
-  // coupait l'image sur une image sombre). On attend ~900 ms puis on agit SEULEMENT si l'image est TOUJOURS
-  // absente/noire : soit la vidéo ne se décode pas (videoWidth===0), soit elle décode mais s'affiche NOIRE
-  // (cas iPhone HEVC/HDR). Dans ce cas -> conversion /sdr si on a le chemin, sinon bouton « Relier ».
-  let _mlzDecDone=false;
-  vid.addEventListener('loadeddata',()=>{ try{
-    if(_mlzDecDone) return;   // une seule évaluation par chargement
-    if(!(vid.duration>0) || !project || project.videoConverted || window._mlzConvBusy) return;
-    setTimeout(()=>{ try{
-      if(_mlzDecDone || project.videoConverted || window._mlzConvBusy) return;
-      // image bien là ET non noire -> rien à faire (on retire une éventuelle bannière restée affichée)
-      if(vid.videoWidth>0 && !_mlzFrameIsBlank()){ _mlzHideIfVisible(); return; }
-      _mlzDecDone=true; window._mlzConvBusy=true; const done=()=>{ window._mlzConvBusy=false; };
-      const p=(project&&project.videoPath)||'';
-      if(p){ mlzConvertPath(p).then(done,done); } else { try{ mlzShowRelinkBanner(); window._mlzRelinkShown=true; }catch(e){} done(); }
-    }catch(e){} }, 900);
-  }catch(e){} });
-  vid.addEventListener('timeupdate',_mlzHideIfVisible);
+try{ if(vid && !vid._mlzDecCheck){ vid._mlzDecCheck=true; vid.addEventListener('loadeddata',()=>{ try{
+  if(vid.duration>0 && project && !project.videoConverted && !window._mlzConvBusy && (vid.videoWidth===0 || _mlzFrameIsBlank())){
+    window._mlzConvBusy=true;
+    const p=(project&&project.videoPath)||'';
+    const done=()=>{ window._mlzConvBusy=false; };
+    // Image réellement absente (écran noir) : si on a le chemin -> conversion ; sinon -> bannière « Relier ».
+    if(p){ mlzConvertPath(p).then(done,done); } else { try{ mlzShowRelinkBanner(); }catch(e){} done(); }
+  }
+}catch(e){} });
+  // MASQUAGE AUTO du bandeau « Relier » : dès qu'une VRAIE image s'affiche (non noire), on le retire.
+  // -> pour un fichier qui s'affiche bien (ex. Veo), le bandeau déclenché sur une 1re image noire DISPARAÎT
+  //    tout seul au lieu de rester collé sur la timeline. S'il reste vraiment noir (iPhone sans chemin), il reste.
+  const _mlzHideRelinkIfVisible=()=>{ try{ if(window._mlzRelinkShown && vid.videoWidth>0 && !_mlzFrameIsBlank()){ try{aiBarHide();}catch(e){} window._mlzRelinkShown=false; } }catch(e){} };
+  vid.addEventListener('timeupdate',_mlzHideRelinkIfVisible);
+  vid.addEventListener('playing',_mlzHideRelinkIfVisible);
+  vid.addEventListener('seeked',_mlzHideRelinkIfVisible);
 } }catch(e){}
 // Recharge la vidéo RÉFÉRENCÉE (disque externe) depuis le lien mémorisé, SANS re-sélectionner le fichier.
 // Retour : true (chargée) · 'moved' (fichier introuvable/déplacé) · 'denied' (accès refusé) · 'prompt' (à re-tenter sur un clic) · 'nohandle'.
@@ -6799,7 +6797,9 @@ function aiBarHide(){ const b=document.getElementById('aibar'); if(b)b.classList
 function smoothTrack(pts){ if(!pts||pts.length<3)return pts; const o=pts.map(p=>({...p})); for(let i=1;i<pts.length-1;i++){ const a=pts[i-1],b=pts[i],c=pts[i+1]; o[i].x=(a.x+2*b.x+c.x)/4; o[i].y=(a.y+2*b.y+c.y)/4; if(a.w!=null&&c.w!=null){ o[i].w=(a.w+2*b.w+c.w)/4; o[i].h=(a.h+2*b.h+c.h)/4; } } return o; }
 function smoothMedian(pts){ if(!pts||pts.length<5)return pts; const med=arr=>arr.slice().sort((a,b)=>a-b)[2]; const o=pts.map(p=>({...p})); for(let i=2;i<pts.length-2;i++){ o[i].x=med([pts[i-2].x,pts[i-1].x,pts[i].x,pts[i+1].x,pts[i+2].x]); o[i].y=med([pts[i-2].y,pts[i-1].y,pts[i].y,pts[i+1].y,pts[i+2].y]); } return o; }
 function smoothTrk(pts){ return smoothTrack(smoothMedian(pts)); }
-async function ensureDetBoxes(){ const a=aiwin.action; if(!a)return; const blob=await getVideoBlob(); if(!blob)return; const vkey=_aiSrcVkey(blob);
+async function ensureDetBoxes(){ const a=aiwin.action; if(!a)return; if(aiwin._detRunning)return; aiwin._detRunning=true;
+  try{ return await _ensureDetBoxesInner(a); } finally{ aiwin._detRunning=false; } }
+async function _ensureDetBoxesInner(a){ const blob=await getVideoBlob(); if(!blob)return; const vkey=_aiSrcVkey(blob);
   const _call=async()=>{ const fd=new FormData(); fd.append('vkey',vkey); fd.append('t',vid.currentTime); fd.append('model','yolo11s.pt'); fd.append('imgsz','960'); { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); } try{ return await fetch(AI_BASE+'/detect',{method:'POST',body:fd}).then(r=>r.json()); }catch(e){ return null; } };
   let r=await _call();
   // Suivi IA lancé DEPUIS LE MONTAGE : la vidéo du match n'a pas encore été envoyée au moteur -> /detect répond
@@ -7445,7 +7445,7 @@ function setAiwTab(tab){ if(!aiwin.open)return; aiwin.tab=tab; aiwin._navV=null;
   aiwin._fixMode=(tab==='fix'); if(tab!=='fix'){ try{ if(typeof dropStubManAnno==='function')dropStubManAnno(); }catch(e){} aiwin._manMap=false; aiwin._manAnno=null; aiwin.manTrk=null; aiwin._manDrag=null; }
   if(tab==='fix'){ aiwin.tool='correct'; aiwin._showDet=true; try{ ensureDetBoxes(); }catch(e){}
     { const _cv=document.getElementById('aiwcv'); if(_cv)_cv.style.cursor='crosshair'; }
-    aiBar('🩹 Correction IA — DESSIN (par défaut) : clique-glisse n\'importe où pour créer un rectangle sur un joueur non détecté. Bouton 🖱 SÉLECTION : les rectangles s\'affichent, clique DANS un rectangle pour corriger ce joueur (recalcul de cet instant jusqu\'à la fin).'); setTimeout(aiBarHide,7000); }
+    aiBar('🩹 Correction IA — tous les rectangles (auto + tes corrections) sont affichés. DESSIN : clique-glisse sur le joueur pour (re)lancer un suivi depuis ta boîte (aucune accroche). 🖱 SÉLECTION : attrape le rectangle d\'un joueur et dépose-le où tu veux.'); setTimeout(aiBarHide,7000); }
   else if(aiwin.tool==='correct'){ aiwin.tool='select'; aiwin._showDet=false; aiwin._detBoxes=null; const _cv=document.getElementById('aiwcv'); if(_cv)_cv.style.cursor='default'; }
   ['timeline','track','map','fix'].forEach(k=>{ const b=document.getElementById('aiwTab_'+k); if(b)b.classList.toggle('on',k===tab); });
   aiwinParams(); renderAiTimeline();
@@ -7606,11 +7606,14 @@ async function putVideoRobust(blob, vkey, name, onProg){
 async function aiEnsureUploaded(){
   // LECTURE DIRECTE : si on n'a pas encore le chemin mais un LIEN disque (projet ou clip du montage), on lit le
   // fichier (le clic « Générer » autorise l'accès) et on récupère son chemin absolu -> aucun envoi des 443 Mo.
-  try{ if(!project.videoPath && (typeof _filePath==='function')){
+  // CALIBRAGE/SUIVI = TOUJOURS le fichier D'ORIGINE (jamais le proxy d'affichage). On RE-dérive le chemin
+  // réel depuis le lien disque à chaque fois : si videoPath avait été écrasé par un proxy (/conv, 1080p),
+  // on le remet sur l'original 4K. L'affichage iPhone (videoUrl /sdr ou /conv) n'est pas touché.
+  try{ if((typeof _filePath==='function')){
       let hid=project.videoHandleId;
       if(!hid){ try{ const _c=((project.timeline&&project.timeline.clips)||[]).find(x=>x&&(x.kind==='analytic'||x.kind==='raw')&&x.srcHandleId); if(_c)hid=_c.srcHandleId; }catch(e){} }
       if(hid){ const rec=await dbGet('blobs',hid); const h=rec&&rec.handle; if(h){ let p='prompt'; try{ p=await h.queryPermission({mode:'read'}); }catch(e){} if(p!=='granted'){ try{ p=await h.requestPermission({mode:'read'}); }catch(e){} }
-        if(p==='granted'){ const f=await h.getFile(); const _p=_filePath(f); if(_p){ project.videoPath=_p; if(!project.videoName)project.videoName=f.name; if(!project.videoSize)project.videoSize=f.size; project.videoHandleId=project.videoHandleId||hid; try{save();}catch(e){} } } } }
+        if(p==='granted'){ const f=await h.getFile(); const _p=_filePath(f); if(_p){ project.videoPath=_p; if(!project.videoName)project.videoName=f.name; project.videoSize=f.size; project.videoHandleId=project.videoHandleId||hid; try{save();}catch(e){} } } } }
   } }catch(e){}
   // TAILLE du fichier : indispensable pour que la clé (nom_taille) corresponde à la vidéo DÉJÀ présente côté moteur
   // (mise en cache lors de l'analyse) -> aucun envoi, décodage natif rapide. On la lit SILENCIEUSEMENT via le lien.
@@ -7714,7 +7717,12 @@ async function aiCalibrateClip(vkey){ const a=aiwin.action; const pid='cal_'+Mat
       r.keyframes.forEach(kf=>{ const pts=kf.pts.map(p=>({f:[+p.f[0],+p.f[1]],i:[+p.i[0],+p.i[1]]})); if(pts.length>=4)a.calibs.push({t:+kf.t,pts,Hf2i:solveHN(pts.map(p=>p.f),pts.map(p=>p.i)),Hi2f:solveHN(pts.map(p=>p.i),pts.map(p=>p.f)),w:FIELD_W,h:FIELD_H,auto:true,conf:(kf.conf!=null?kf.conf:1),ok:(kf.ok!==false),kind:kf.kind||'anchor'}); });
       const _nRecu=r.keyframes.length, _nPush=a.calibs.length, _nValid=a.calibs.filter(c=>c&&c.Hf2i).length;
       const _nAnchor=a.calibs.filter(c=>c&&c.kind==='anchor').length;
-      a.calibs.sort((x,y)=>x.t-y.t); consolidateCalibs(a,0.7); const _nKeep=a.calibs.length;
+      a.calibs.sort((x,y)=>x.t-y.t);
+      // NE PAS consolider un calibrage AUTO : ça regroupait les 24 keyframes reçues en UNE SEULE -> terrain
+      // figé à 0 s. On garde TOUTES les keyframes -> le terrain se cale sur chacune et suit la caméra entre
+      // elles (même règle que la réouverture, où ce défaut avait déjà été corrigé).
+      if(!(a.camPath&&a.camPath.length) && !a.calibs.some(c=>c&&(c.auto||c.prop||c.kind==='prop'))) consolidateCalibs(a,0.7);
+      const _nKeep=a.calibs.length;
       try{ console.log('[CAL] reçues='+_nRecu+' poussées='+_nPush+' Hf2iValides='+_nValid+' ancres='+_nAnchor+' -> gardées='+_nKeep); }catch(e){}
       if(typeof aiwin!=='undefined'&&aiwin)aiwin._hc=null; aiwin._calProgOn=false; return a.calibs.length; }
   }catch(e){ aiwin._calProgOn=false; }
@@ -9197,6 +9205,7 @@ function aiwinLoop(){ if(!aiwin.open){aiwin.raf=0;return;}
     aiwinDraw(); boardSyncPlayhead(); aiwin.raf=requestAnimationFrame(aiwinLoop); return;
   }
   // Mode Correction IA : réactualise les rectangles détectés pour l'image courante (à l'arrêt), pour cliquer le bon joueur
+  { const _plcDet=['line','mur','poly','spot','proj','num','ptext','speed','offside','vision','zoom','text','ghost','trace'].includes(aiwin.tool) && aiwin.tab!=='track' && !aiwin.calMode; if(_plcDet)aiwin._showDet=true; }
   if((aiwin._fixMode||aiwin._showDet) && !aiwinPlaying && !aiwin._detBusy){ const _ct=vid.currentTime||0; if(Math.abs(_ct-(aiwin._detT!=null?aiwin._detT:-9))>0.05){ const _n=(performance.now?performance.now():Date.now()); if(_n-(aiwin._detReqTs||0)>170){ aiwin._detReqTs=_n; aiwin._detBusy=true; try{ const _p=ensureDetBoxes(); if(_p&&_p.finally)_p.finally(()=>{aiwin._detBusy=false;}); else aiwin._detBusy=false; }catch(e){ aiwin._detBusy=false; } } } }
   aiwinDraw(); const a=aiwin.action, dur=(a.out-a.in)||1;
   if(aiwinPlaying){
@@ -9315,8 +9324,11 @@ function aiwinDraw(){ const cvt=document.getElementById('aiwcv'); if(!cvt)return
     // Les rectangles de joueurs n'apparaissent QUE en pause, et uniquement quand on POSE un dessin (outil actif),
     // qu'on CORRIGE (glisser en cours), ou en mode d'accroche. Sinon (lecture, sélection/validation) : rien.
     const _placing=['line','mur','poly','spot','proj','num','ptext','speed','offside','vision','zoom','text','ghost','trace'].includes(aiwin.tool) && aiwin.tab!=='track' && !aiwin.calMode;
-    const _showBoxes = !_bd && !aiwin._rendering && !aiwinPlaying && !aiwin._manMap && (aiwin._correcting || aiwin.tool==='correct' || (aiwin._fixMode && aiwin.tool==='select') || aiwin._follow || _placing || (aiwin._playersOn && !aiwin._board));
-    if(_showBoxes){ boxes=_mergeBoxes(_mergeBoxes((aiwin.cands||[]).map(cd=>_candBoxAt(cd,t)).filter(Boolean), _perframeBoxesAt(t)), (aiwin._detBoxes||[])); }
+    const _showBoxes = !_bd && !aiwin._rendering && !aiwinPlaying && !aiwin._manMap && (aiwin._fixMode || aiwin._correcting || aiwin.tool==='correct' || aiwin._follow || _placing || (aiwin._playersOn && !aiwin._board));
+    if(_showBoxes){ boxes=_mergeBoxes(_mergeBoxes((aiwin.cands||[]).map(cd=>_candBoxAt(cd,t)).filter(Boolean), _perframeBoxesAt(t)), (aiwin._detBoxes||[]));
+      // + les rectangles de TES pistes (corrections IA) : on les AJOUTE sans fusion (pour ne jamais les perdre)
+      // et on les marque _mine -> ils seront dessinés dans une couleur DISTINCTE (repérables au premier coup d'œil).
+      const _mine=_myTrackBoxesAt(t); if(_mine.length)boxes=(boxes||[]).concat(_mine); }
     if(boxes){ let snap=null; if(aiwin._dragPos){ let bd=0.3; boxes.forEach(b=>{ const d=Math.hypot(b.x-aiwin._dragPos[0],b.y-aiwin._dragPos[1]); if(d<bd){bd=d;snap=b;} }); } aiwin._snapBox=snap;
       // survol (outil ligne/mur/poly) : joueur visé en vert
       let hov=null; if(aiwin._mouse && ['line','mur','poly','spot','proj','num','ptext','speed','offside','vision','zoom','text','ghost','trace'].includes(aiwin.tool)){ const hb=nearestPlayerBox(aiwin._mouse[0],aiwin._mouse[1],t); if(hb)hov=hb; }
@@ -9324,7 +9336,9 @@ function aiwinDraw(){ const cvt=document.getElementById('aiwcv'); if(!cvt)return
       const isPend=b=>pendRecs.some(r=>Math.abs(b.x-r.seed[0])<0.02&&Math.abs(b.y-r.seed[1])<0.02);
       boxes.forEach(b=>{ const bw=(b.w||0.05)*dw,bh=(b.h||0.13)*dh,x=ox+b.x*dw,y=oy+b.y*dh;
         const green=(b===snap)||(hov&&Math.hypot(b.x-hov.x,b.y-hov.y)<0.001)||isPend(b);
-        c.save(); if(green){ c.lineWidth=3;c.strokeStyle='#00e08f';c.shadowColor='rgba(0,224,143,.7)';c.shadowBlur=10;c.strokeRect(x-bw/2,y-bh,bw,bh);c.shadowBlur=0;c.globalAlpha=.22;c.fillStyle='#00e08f';c.fillRect(x-bw/2,y-bh,bw,bh);} else { c.lineWidth=1;c.strokeStyle='rgba(255,255,255,.95)';c.shadowColor='rgba(0,0,0,.6)';c.shadowBlur=2;c.strokeRect(x-bw/2,y-bh,bw,bh);} c.restore(); });
+        c.save(); if(green){ c.lineWidth=3;c.strokeStyle='#00e08f';c.shadowColor='rgba(0,224,143,.7)';c.shadowBlur=10;c.strokeRect(x-bw/2,y-bh,bw,bh);c.shadowBlur=0;c.globalAlpha=.22;c.fillStyle='#00e08f';c.fillRect(x-bw/2,y-bh,bw,bh);}
+        else if(b._mine){ c.lineWidth=2.2;c.strokeStyle='#ffce3a';c.shadowColor='rgba(0,0,0,.6)';c.shadowBlur=3;c.strokeRect(x-bw/2,y-bh,bw,bh);c.shadowBlur=0;c.globalAlpha=.14;c.fillStyle='#ffce3a';c.fillRect(x-bw/2,y-bh,bw,bh);} /* TES rectangles de correction : en JAUNE, distincts de l'auto (blanc) */
+        else { c.lineWidth=1;c.strokeStyle='rgba(255,255,255,.95)';c.shadowColor='rgba(0,0,0,.6)';c.shadowBlur=2;c.strokeRect(x-bw/2,y-bh,bw,bh);} c.restore(); });
       // petits numéros de progression sur les joueurs cliqués (discrets)
       pendRecs.forEach((r,i)=>{ const X=ox+r.seed[0]*dw, Y=oy+r.seed[1]*dh, rr=Math.max(5,dw*0.008); c.save(); c.beginPath(); c.arc(X,Y,rr,0,7); c.fillStyle='#00e08f'; c.strokeStyle='#062117'; c.lineWidth=1.5; c.globalAlpha=.9; c.fill(); c.stroke(); c.globalAlpha=1; c.fillStyle='#062117'; c.font='bold '+Math.max(7,Math.round(dw*0.010))+'px Arial'; c.textAlign='center'; c.textBaseline='middle'; c.fillText(String(i+1),X,Y); c.restore(); }); } }
   c.save(); c.translate(ox,oy); const _calHf=Hf2iAt(aiwin.action,t);
@@ -9356,7 +9370,7 @@ function aiwinDraw(){ const cvt=document.getElementById('aiwcv'); if(!cvt)return
     if(aiwin._fixNew){ const b=aiwin._fixNew; const X0=Math.min(b.x0,b.x1)*dw,Y0=Math.min(b.y0,b.y1)*dh,X1=Math.max(b.x0,b.x1)*dw,Y1=Math.max(b.y0,b.y1)*dh; c.save(); c.setLineDash([6,4]); c.lineWidth=2; c.strokeStyle='#00e676'; c.strokeRect(X0,Y0,X1-X0,Y1-Y0); c.setLineDash([]); c.restore(); }
     // VISEUR (mode DESSIN) : fines lignes verticale + horizontale qui suivent le curseur.
     if(aiwin.tool==='correct' && aiwin._mouse && !aiwin._fixNew){ const mx=aiwin._mouse[0]*dw, my=aiwin._mouse[1]*dh; if(mx>=0&&mx<=dw&&my>=0&&my<=dh){ c.save(); c.strokeStyle='rgba(0,230,126,.8)'; c.lineWidth=1; c.beginPath(); c.moveTo(mx,0); c.lineTo(mx,dh); c.moveTo(0,my); c.lineTo(dw,my); c.stroke(); c.restore(); } }
-  } else (aiwin.action.aiAnnos||[]).forEach(an=>{ if(!annoVis2(aiwin.action,an,t,_phV))return; if(_bd&&an.type==='shade')return; const _dr=()=>{ if(ANALYSE_TYPES.includes(an.type))drawAnalyse(c,dw,dh,an,t); else if(an.space==='field')drawFieldAnno(c,dw,dh,an,_calHf,null,(_bd?(aiwin._boardT||0):t)); else followShape(c,dw,dh,an,t); }; if(_bd&&BOARD_ARROW_TYPES.includes(an.type)){ if(!(aiwin._boardPlaying&&boardDrawDeployArrow(c,dw,dh,an)))_dr(); } else _dr(); if(an===aiwin.sel&&!aiwin._rendering&&!_bd&&!ANALYSE_TYPES.includes(an.type)){ const pos=annoAnchor(an,t); if(pos){ c.save(); c.strokeStyle='#ffce3a'; c.lineWidth=2; c.setLineDash([4,3]); c.beginPath(); c.arc(pos.x*dw,pos.y*dh,Math.max(10,dw*0.02),0,7); c.stroke(); c.restore(); } } });
+  } else (aiwin.action.aiAnnos||[]).forEach(an=>{ if(!annoVis2(aiwin.action,an,t,_phV))return; if(_bd&&an.type==='shade')return; if(an.trackOnly)return; /* piste de suivi seule (correction) : AUCUN dessin visible (pas d'anneau) — elle ne sert que de trajectoire */ const _dr=()=>{ if(ANALYSE_TYPES.includes(an.type))drawAnalyse(c,dw,dh,an,t); else if(an.space==='field')drawFieldAnno(c,dw,dh,an,_calHf,null,(_bd?(aiwin._boardT||0):t)); else followShape(c,dw,dh,an,t); }; if(_bd&&BOARD_ARROW_TYPES.includes(an.type)){ if(!(aiwin._boardPlaying&&boardDrawDeployArrow(c,dw,dh,an)))_dr(); } else _dr(); if(an===aiwin.sel&&!aiwin._rendering&&!_bd&&!ANALYSE_TYPES.includes(an.type)){ const pos=annoAnchor(an,t); if(pos){ c.save(); c.strokeStyle='#ffce3a'; c.lineWidth=2; c.setLineDash([4,3]); c.beginPath(); c.arc(pos.x*dw,pos.y*dh,Math.max(10,dw*0.02),0,7); c.stroke(); c.restore(); } } });
   if(_bd){ try{ boardDrawEquip(c,dw,dh); boardDrawZoomBoxes(c,dw,dh); boardDrawShades(c,dw,dh); }catch(e){} }
   if(_bd&&!aiwin._rendering){ try{ boardDrawTrace(c,dw,dh); boardDrawHandles(c,dw,dh); }catch(e){} }
   if(!aiwin._rendering&&!aiwin._fixMode&&aiwin.sel&&aiwin.sel.trk&&aiwin.sel.type!=='trace'){ const pp=correctedPos(aiwin.sel,t); if(pp&&annoVisible(aiwin.sel,t)){ const bw=(pp.w||0.05)*dw,bh=(pp.h||0.13)*dh,x=pp.x*dw,y=pp.y*dh; c.save(); c.strokeStyle='#ffce3a'; c.lineWidth=2; c.setLineDash([6,4]); c.shadowColor='rgba(0,0,0,.5)'; c.shadowBlur=5; c.strokeRect(x-bw/2,y-bh,bw,bh); c.setLineDash([]); c.restore(); } }
@@ -9484,7 +9498,7 @@ function finalizeFollowDraw(){ const pend=aiwin.pend; if(!pend||!pend.line||pend
   else { aiBar('Dessin fixe.'); setTimeout(aiBarHide,1400); } }
 function syncFollowGeom(an,t){ t=t!=null?t:vid.currentTime; const P=(an.follow||[]).map(f=> f&&f.pts?trkInterp({points:f.pts},t):(f&&f.xy?{x:f.xy[0],y:f.xy[1]}:null)).filter(Boolean); if(!P.length)return; an.pts=P.map(p=>[p.x,p.y]); an.x1=P[0].x; an.y1=P[0].y; an.x2=P[P.length-1].x; an.y2=P[P.length-1].y; }
 function convexHull(pts){ if(!pts||pts.length<3)return (pts||[]).slice(); const p=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]); const cross=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]); const lo=[]; for(const q of p){ while(lo.length>=2&&cross(lo[lo.length-2],lo[lo.length-1],q)<=0)lo.pop(); lo.push(q);} const up=[]; for(let i=p.length-1;i>=0;i--){ const q=p[i]; while(up.length>=2&&cross(up[up.length-2],up[up.length-1],q)<=0)up.pop(); up.push(q);} lo.pop(); up.pop(); return lo.concat(up); }
-function applyFollow(){ const f=aiwin._follow; if(!f||!f.got.length)return; const a=f.anno; const trks=f.got.map(cd=>({pts:cd.points.map(p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h}))}));
+function applyFollow(){ const f=aiwin._follow; if(!f||!f.got.length)return; const a=f.anno; const trks=f.got.map(cd=>({pts:_fullCandPts(cd).map(p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h}))}));
   if(a.type==='line'||a.type==='mur'||a.type==='poly'){ a.follow=trks; a.trk=null; a.trackId=null; }
   else { const cd=f.got[0], p0=trkInterp(cd,vid.currentTime); if(p0){ const anc=annoAnchor(a,vid.currentTime); if(anc)moveAnnoBy(a, p0.x-anc.x, p0.y-anc.y, aiwin.action); } a.trk=cd.points; a.t0=vid.currentTime; a.corr=[]; }
   aiwin._follow=null;
@@ -9516,6 +9530,23 @@ function stitchTrackFrom(startCand, fromT){ if(!startCand||!startCand.points)ret
     (cands||[]).forEach(c=>{ if(used.has(c)||!c||!c.points||!c.points.length)return; const f=c.points[0]; const dt=f.t-last.t; if(dt<-0.2||dt>1.5)return; const d=Math.hypot(f.x-last.x,f.y-last.y); if(d>0.07)return; const s=dt+d*3; if(s<ns){ns=s;nb=c;} });
     if(!nb)break; used.add(nb); const add=nb.points.filter(p=>p.t>last.t+1e-3).map(cp); if(!add.length)break; pts=pts.concat(add); }
   return pts; }
+// Piste COMPLÈTE d'un joueur analysé : on RECOUD tous ses morceaux (stitchTrackFrom) pour qu'un dessin
+// collé dessus suive le joueur sur TOUT le clip, pas seulement sur le fragment le plus proche du clic.
+function _fullCandPts(cd){ if(!cd||!cd.points||!cd.points.length)return (cd&&cd.points)?cd.points:[];
+  try{
+    const cands=(aiwin.cands&&aiwin.cands.length)?aiwin.cands:((aiwin.action&&typeof aiCacheMap!=='undefined'&&aiCacheMap[aiwin.action.id])||[]);
+    const cp=p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h});
+    let pts=cd.points.map(cp); const used=new Set([cd]); let g;
+    // VERS L'AVANT : on recolle les morceaux qui suivent (même joueur).
+    g=0; while(g++<80){ const last=pts[pts.length-1]; let nb=null,ns=1e9;
+      (cands||[]).forEach(c=>{ if(used.has(c)||!c||!c.points||!c.points.length)return; const f=c.points[0]; const dt=f.t-last.t; if(dt<-0.3||dt>2.0)return; const d=Math.hypot(f.x-last.x,f.y-last.y); if(d>0.09)return; const s=Math.abs(dt)+d*3; if(s<ns){ns=s;nb=c;} });
+      if(!nb)break; used.add(nb); const add=nb.points.filter(p=>p.t>last.t+1e-3).map(cp); if(!add.length)break; pts=pts.concat(add); }
+    // VERS L'ARRIÈRE : on recolle les morceaux qui PRÉCÈDENT -> le dessin couvre AUSSI le début du clip.
+    g=0; while(g++<80){ const first=pts[0]; let nb=null,ns=1e9;
+      (cands||[]).forEach(c=>{ if(used.has(c)||!c||!c.points||!c.points.length)return; const l=c.points[c.points.length-1]; const dt=first.t-l.t; if(dt<-0.3||dt>2.0)return; const d=Math.hypot(l.x-first.x,l.y-first.y); if(d>0.09)return; const s=Math.abs(dt)+d*3; if(s<ns){ns=s;nb=c;} });
+      if(!nb)break; used.add(nb); const add=nb.points.filter(p=>p.t<first.t-1e-3).map(cp); if(!add.length)break; pts=add.concat(pts); }
+    pts.sort((a,b)=>a.t-b.t); return (pts.length>=cd.points.length)?pts:cd.points;
+  }catch(e){ return cd.points; } }
 // CORRECTION « pur re-rattachement » (CAS A — joueur DÉTECTÉ) : sans relancer aucun moteur, on garde la
 // trajectoire AVANT le curseur et, À PARTIR du curseur, on rattache TOUS les dessins de CE joueur (_pid) à la
 // piste robuste du joueur cliqué. Renvoie false s'il n'y a aucune piste robuste sous le point (-> l'appelant
@@ -9641,18 +9672,15 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
     }  // clic dans le vide (hors rectangle) en Sélection = rien
     if(_hit){   // --- déplacer CE joueur (piste .trk OU joueur d'un dessin) — cliquer-déposer ---
       aiwin._fixSel=null; aiwin.sel=_hit.an; aiwin.selMulti=[_hit.an]; aiwinParams(); renderAiTimeline();
-      let lx=nx,ly=ny,moved=false,curTgt=null; aiwin._fixDrag={anno:_hit.an,slot:_hit.slot,x:nx,y:ny,onTarget:false,tgt:null};
-      // Cible = la détection SUR LAQUELLE on est posé (curseur DANS sa boîte) — priorité absolue (gardien inclus).
-      const pickDet=(px,py)=>{ const dbx=(aiwin._detBoxes||[]); let hit=null;
-        for(const b of dbx){ const bw=(b.w||0.05),bh=(b.h||0.13); if(px>=b.x-bw/2&&px<=b.x+bw/2&&py>=b.y-bh&&py<=b.y+bh*0.10){ if(!hit||Math.hypot(b.x-px,b.y-py)<Math.hypot(hit.x-px,hit.y-py))hit=b; } }
-        return hit; };
-      const mv=e=>{ const n2=toN(e.clientX,e.clientY); if(Math.hypot(n2[0]-nx,n2[1]-ny)>0.005)moved=true; lx=n2[0]; ly=n2[1]; curTgt=pickDet(lx,ly);
-        aiwin._fixDrag={anno:_hit.an,slot:_hit.slot,x:(curTgt?curTgt.x:lx),y:(curTgt?curTgt.y:ly),onTarget:!!curTgt,tgt:curTgt||null}; };
+      let lx=nx,ly=ny,moved=false; aiwin._fixDrag={anno:_hit.an,slot:_hit.slot,x:nx,y:ny,onTarget:false,tgt:null};
+      // La boîte suit EXACTEMENT le curseur (aucune aimantation sur une détection voisine).
+      const mv=e=>{ const n2=toN(e.clientX,e.clientY); if(Math.hypot(n2[0]-nx,n2[1]-ny)>0.005)moved=true; lx=n2[0]; ly=n2[1];
+        aiwin._fixDrag={anno:_hit.an,slot:_hit.slot,x:lx,y:ly,onTarget:false,tgt:null}; };
       const up=()=>{ document.removeEventListener('mousemove',mv); document.removeEventListener('mouseup',up); aiwin._fixDrag=null;
-        if(moved){ let bw=_hit.w, bh=_hit.h, sxr=lx, syr=ly; const _nowMs=(performance.now?performance.now():Date.now())+1600;
-          if(curTgt){ sxr=curTgt.x; syr=curTgt.y; if(curTgt.w)bw=curTgt.w; if(curTgt.h)bh=curTgt.h; }
-          if(correctPlayerFrom(_hit.an,+t.toFixed(3),sxr,syr)){ /* CAS A : joueur détecté -> re-rattachement robuste, avant conservé */ }
-          else if(_hit.slot<0){ _hit.an._fixok=_nowMs; aiRecompute(_hit.an,+t.toFixed(3),sxr,syr,bw,bh); }
+        if(moved){ const bw=_hit.w, bh=_hit.h, sxr=lx, syr=ly; const _nowMs=(performance.now?performance.now():Date.now())+1600;
+          // RECALCUL depuis EXACTEMENT le point déposé : on relance le suivi mono-joueur sur CE que tu montres,
+          // SANS re-rattachement automatique (qui pouvait sauter sur un autre joueur à l'autre bout du terrain).
+          if(_hit.slot<0){ _hit.an._fixok=_nowMs; aiRecompute(_hit.an,+t.toFixed(3),sxr,syr,bw,bh); }
           else { if(_hit.fk)_hit.fk._fixok=_nowMs; aiRecomputeFollow(_hit.an,_hit.slot,+t.toFixed(3),sxr,syr); } }
         else { save(); aiwinParams(); } };
       document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up); ev.preventDefault(); return;
@@ -9777,7 +9805,12 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
         // CAS A (joueur détecté sous le curseur) : re-rattachement à la piste robuste À PARTIR du curseur
         // (avant conservé), appliqué à TOUS les dessins du joueur. CAS B (introuvable) : suivi seedé en dernier recours.
         if(isFollow&&moved&&fSlot>=0){ if(correctPlayerFrom(best,CT,sx,sy)){} else { if(!best._jobs)best._jobs=[]; startFollowTrack(best,fSlot,sx,sy,CT); } }
-        else if(isPlayer&&moved){ ['x','y','x1','y1','x2','y2'].forEach(k=>{ if(orig[k]!=null)best[k]=orig[k]; else delete best[k]; }); best.pts=orig.pts; if(correctPlayerFrom(best,CT,sx,sy)){} else aiRecompute(best,CT,sx,sy); }
+        else if(isPlayer&&moved){ ['x','y','x1','y1','x2','y2'].forEach(k=>{ if(orig[k]!=null)best[k]=orig[k]; else delete best[k]; }); best.pts=orig.pts;
+          // LIVETAG : on relance TOUJOURS un vrai re-suivi depuis EXACTEMENT là où tu reposes la boîte
+          // (lx,ly), SANS aimantation sur un rectangle existant -> ça re-traque CE que tu montres, même si
+          // tu poses par-dessus un autre rectangle. Taille de boîte reprise si connue (sinon défaut joueur).
+          const _bw=(_tgt&&_tgt.w)||0, _bh=(_tgt&&_tgt.h)||0;
+          aiRecompute(best,CT,lx,ly,_bw,_bh); }
         else { const near=nearestPlayerBox(lx,ly,vid.currentTime); if(moved&&near&&best.space!=='field'&&best.type!=='trace'){ best.t0=CT; placeStatic(best,near); aiRecompute(best,best.t0,lx,ly); }
           else save();
         } };
@@ -9792,7 +9825,7 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
     // (le rectangle cliqué). -> 3 s gardées + 7 s recalculées, id conservé jusqu'à la fin.
     aiRecompute(an,+t.toFixed(3),sxr,syr); return; }
   if(['num','ptext','speed','offside'].includes(aiwin.tool)){   // ANALYSE : suit UN joueur (1 clic)
-    const _exp=fixExistingTrackPts(nx,ny,t,null); const cd=_exp?null:nearestCandAt(nx,ny,t,null); const box1=(_exp||cd)?null:detBoxAt(nx,ny); const an=mkAnno(aiwin.tool); an.space='player'; an.follow=[ _exp?{pts:_exp,_ref:true}:(cd?{pts:cd.points}:{xy:[box1?box1.x:nx, box1?box1.y:ny]}) ]; an._jobs=[]; an.tin=a.in; an.tout=a.out;
+    const _exp=fixExistingTrackPts(nx,ny,t,null); const cd=_exp?null:nearestCandAt(nx,ny,t,null); const box1=(_exp||cd)?null:detBoxAt(nx,ny); const an=mkAnno(aiwin.tool); an.space='player'; an.follow=[ _exp?{pts:_exp,_ref:true}:(cd?{pts:_fullCandPts(cd)}:{xy:[box1?box1.x:nx, box1?box1.y:ny]}) ]; an._jobs=[]; an.tin=a.in; an.tout=a.out;
     if(aiwin.tool==='num'){ an.num=((a.aiAnnos||[]).filter(x=>x.type==='num').length)+1; an.color='#0a1512'; an.color2='#ffd23a'; }
     if(aiwin.tool==='ptext'){ an.text=(prompt('Nom / texte du joueur :','Joueur')||'Joueur'); an.color='#ffffff'; an.color2='#14202b'; }
     if(aiwin.tool==='speed'){ an.color='#ffffff'; an.color2='#12406b'; }
@@ -9820,7 +9853,7 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
     const usedTrk=new Set((an.follow||[]).map(f=>f&&f.pts).filter(Boolean));
     const _exp=fixExistingTrackPts(nx,ny,t,an); const cd=_exp?null:nearestCandAt(nx,ny,t,usedTrk); const box2=(_exp||cd)?null:detBoxAt(nx,ny);
     if(_exp){ an.follow.push({pts:_exp,_ref:true}); aiBar('✅ Joueur '+(slot+1)+' rattaché à son suivi existant.'); }
-    else if(cd){ an.follow.push({pts:cd.points}); aiBar('✅ Joueur '+(slot+1)+' (suivi analysé). Clique un autre joueur, ou change d\'outil.'); }
+    else if(cd){ an.follow.push({pts:_fullCandPts(cd)}); aiBar('✅ Joueur '+(slot+1)+' (suivi analysé). Clique un autre joueur, ou change d\'outil.'); }
     else if(box2){ an.follow.push({xy:[box2.x,box2.y]}); if(!an._jobs)an._jobs=[]; startFollowTrack(an,slot,box2.x,box2.y); aiBar('✅ Joueur '+(slot+1)+' — suivi lancé. Clique un autre joueur, ou change d\'outil.'); }
     else { an.follow.push({xy:seed.slice()}); aiBar('✏️ Point '+(slot+1)+' posé (zone vide). Coche les « Suivi joueur n° » à droite pour attacher.'); }
     syncFollowGeom(an,t);
@@ -10238,7 +10271,7 @@ function aiwinParams(){ const pr=document.getElementById('aiwPr'); if(!pr)return
   B('awPtext','oninput',e=>{a.text=e.target.value;save();}); B('awNum','oninput',e=>{a.num=+e.target.value;save();});
   B('awDel','onclick',()=>{ a._deleted=true; _followQ=_followQ.filter(j=>j.an!==a); if(a._jobs&&a._jobs.length){ cancelAiJobs(a._jobs); aiwin._activeJobs=(aiwin._activeJobs||[]).filter(j=>a._jobs.indexOf(j)<0); } if(aiwin._building===a)aiwin._building=null; const i=aiwin.action.aiAnnos.indexOf(a); if(i>=0)aiwin.action.aiAnnos.splice(i,1); aiwin.sel=null; save(); aiwinParams(); renderAiTimeline(); });
 }
-function closeAiWin(){ try{ aiCancelAutoCal(); }catch(e){} aiwin._trackTok=(aiwin._trackTok||0)+1; cancelAiJobs(aiwin._activeJobs); aiwin._activeJobs=[]; aiwin._follow=null; _followQ=[]; _followBusy=false; _trackJobs=[]; try{tjRender();}catch(e){} if(aiwin._voiceAud){try{aiwin._voiceAud.pause();}catch(e){}} aiwin._voiceAud=null; aiwin.open=false; if(aiwin.raf)cancelAnimationFrame(aiwin.raf); aiwin.raf=0; aiwinPlaying=false; try{vid.pause();}catch(e){} const w=document.getElementById('aiwin'); if(w)w.classList.add('hidden'); try{ var _ls=document.getElementById('langSel'); if(_ls)_ls.style.display=''; }catch(e){} window.removeEventListener('resize',aiwinResize); window.removeEventListener('keydown',aiwinKey); hideAiCtx(); aiBarHide();
+function closeAiWin(){ try{ aiCancelAutoCal(); }catch(e){} aiwin._trackTok=(aiwin._trackTok||0)+1; cancelAiJobs(aiwin._activeJobs); aiwin._activeJobs=[]; aiwin._follow=null; _followQ=[]; _followBusy=false; _trackJobs=[]; try{tjRender();}catch(e){} if(aiwin._voiceAud){try{aiwin._voiceAud.pause();}catch(e){}} aiwin._voiceAud=null; aiwin.open=false; if(aiwin.raf)cancelAnimationFrame(aiwin.raf); aiwin.raf=0; aiwinPlaying=false; try{vid.pause();}catch(e){} const w=document.getElementById('aiwin'); if(w)w.classList.add('hidden'); try{ var _ls=document.getElementById('langSel'); if(_ls){ var _hm=document.getElementById('home'); _ls.style.display=(_hm&&!_hm.classList.contains('hidden'))?'block':'none'; } }catch(e){} window.removeEventListener('resize',aiwinResize); window.removeEventListener('keydown',aiwinKey); hideAiCtx(); aiBarHide();
   // RETOUR AU MONTAGE : si le Suivi IA a été lancé depuis un clip du montage, on met à jour ce clip.
   var _fm=aiwin._fromMont; aiwin._fromMont=null; var _media=aiwin._mediaMode; aiwin._mediaMode=false; var _imp=aiwin._impOverride; aiwin._impOverride=false; if(_media||_imp){ window._aiBlobOverride=null; window._aiSrcMedia=null; }
   // TABLEAU TACTIQUE : en fermant, on revient sur la GALERIE des tableaux (accueil tableau tactique), pas sur une page vierge.
@@ -10354,9 +10387,17 @@ function annoDefVWin(an){ const a=aiwin.action; if(!a)return [0,1]; const span=(
   const f=fzAnnoOf(an); if(f){ const vfz=aiRealToVirt(a,f.t),d=(f.dur||3); return [vfz, vfz+d]; }
   // Par défaut, un dessin couvre TOUT le clip depuis 0 (comme LiveTag) — l'utilisateur règle ensuite ses bords.
   return [0, span]; }
-function nearestPlayerBox(nx,ny,t){ let boxes=[]; if(aiwin._detBoxes&&aiwin._detBoxes.length)boxes=aiwin._detBoxes.slice(); const cb=(aiwin.cands||[]).map(cd=>_candBoxAt(cd,t)).filter(Boolean); boxes=boxes.concat(cb); boxes=boxes.concat(_perframeBoxesAt(t));
-  let bb=null; for(const b of boxes){ const bw=(b.w||0.05),bh=(b.h||0.13); if(nx>=b.x-bw*0.85&&nx<=b.x+bw*0.85&&ny>=b.y-bh*1.2&&ny<=b.y+bh*0.35){ bb=b; break; } }
-  if(!bb){ let bd=0.11; boxes.forEach(b=>{ const dx=b.x-nx, dy=(b.y-(b.h||0.13)*0.5)-ny; const d=Math.hypot(dx,dy); if(d<bd){bd=d;bb=b;} }); }
+// Rectangles des pistes que TU as créées/corrigées en Correction IA (trackOnly) à l'instant t -> on les affiche
+// et on peut y accrocher un dessin, au même titre que les rectangles du suivi automatique.
+function _myTrackBoxesAt(t){ const a=aiwin.action; if(!a)return []; const out=[];
+  (a.aiAnnos||[]).forEach(an=>{ if(!an.trackOnly||!an.trk||!an.trk.length||an.space==='field'||an.type==='trace')return;
+    const p=trkInterp({points:an.trk},t); if(p&&p.x!=null&&p.y!=null)out.push({x:p.x,y:p.y,w:p.w||0.04,h:p.h||0.1,_mine:true,_an:an}); });
+  return out; }
+function nearestPlayerBox(nx,ny,t){ let boxes=[]; if(aiwin._detBoxes&&aiwin._detBoxes.length)boxes=aiwin._detBoxes.slice(); const cb=(aiwin.cands||[]).map(cd=>_candBoxAt(cd,t)).filter(Boolean); boxes=boxes.concat(cb); boxes=boxes.concat(_perframeBoxesAt(t)); boxes=boxes.concat(_myTrackBoxesAt(t));
+  // PRÉCISION : on prend d'abord les boîtes qui CONTIENNENT vraiment le curseur (zone = le rectangle réel,
+  // pas élargie) ; si plusieurs se chevauchent, celle dont le CENTRE est le plus proche -> le BON joueur.
+  let bb=null,bd=1e9; for(const b of boxes){ const w=(b.w||0.05),h=(b.h||0.13); if(nx>=b.x-w*0.52&&nx<=b.x+w*0.52&&ny>=b.y-h*1.04&&ny<=b.y+h*0.05){ const d=Math.hypot(b.x-nx,(b.y-h*0.5)-ny); if(d<bd){bd=d;bb=b;} } }
+  if(!bb){ bd=0.045; boxes.forEach(b=>{ const dx=b.x-nx, dy=(b.y-(b.h||0.13)*0.5)-ny; const d=Math.hypot(dx,dy); if(d<bd){bd=d;bb=b;} }); }
   return bb; }
 function cancelAiJobs(list){ (list||[]).forEach(j=>{ try{ fetch(AI_BASE+'/cancel/'+j,{method:'POST'}); }catch(e){} }); }
 // Trouve le joueur ANALYSÉ (cand) sous le clic : test d'appartenance au rectangle (corps), pas seulement les pieds.
@@ -10366,7 +10407,7 @@ function fixExistingTrackPts(nx,ny,t,exclude){ const a=aiwin.action; if(!a)retur
   // ACCROCHE = clic N'IMPORTE OÙ DANS le rectangle du joueur (corps, tête, pieds). On ne gate plus sur la
   // distance aux PIEDS (qui obligeait à viser le bas « à côté ») : containment d'abord, puis on départage
   // au CENTRE de la boîte pour choisir le bon joueur quand deux rectangles se chevauchent.
-  const _t=(pts,pid)=>{ if(!pts||!pts.length)return; if(typeof trkCovers==='function'&&!trkCovers(pts,t))return; const p=trkInterp({points:pts},t); if(!p)return; const bw=(p.w||0.05),bh=(p.h||0.13); if(nx>=p.x-bw*0.6&&nx<=p.x+bw*0.6&&ny>=p.y-bh*1.05&&ny<=p.y+bh*0.12){ const d=Math.hypot(p.x-nx,(p.y-bh/2)-ny); if(d<bd){bd=d;best=pts;bestPid=(pid!=null?pid:null);} } };
+  const _t=(pts,pid)=>{ if(!pts||!pts.length)return; if(typeof trkCovers==='function'&&!trkCovers(pts,t))return; const p=trkInterp({points:pts},t); if(!p)return; const bw=(p.w||0.05),bh=(p.h||0.13); if(nx>=p.x-bw*0.52&&nx<=p.x+bw*0.52&&ny>=p.y-bh*1.04&&ny<=p.y+bh*0.08){ const d=Math.hypot(p.x-nx,(p.y-bh/2)-ny); if(d<bd){bd=d;best=pts;bestPid=(pid!=null?pid:null);} } };
   (a.aiAnnos||[]).forEach(o=>{ if(o===exclude||o.type==='trace'||o.space==='field')return; if(o.trk)_t(o.trk,o._pid); if(o.follow)o.follow.forEach(fk=>{ if(fk&&fk.pts)_t(fk.pts,o._pid); }); });
   // AUSSI les rectangles blancs du Suivi (a.tracks) : un dessin posé dessus réutilise LEUR trajectoire
   // EXACTE -> le dessin et le rectangle blanc partagent la même piste, et hérite de l'IDENTITÉ du joueur (id).
@@ -10385,7 +10426,13 @@ function nearestCandAt(nx,ny,t,excl){ let best=null,bs=0.13;
   // Sources de pistes ROBUSTES, dans l'ordre : cands courants -> cache du clip (au cas où cands vidé) -> a.tracks.
   const _cands=(aiwin.cands&&aiwin.cands.length)?aiwin.cands:((typeof aiCacheMap!=='undefined'&&aiwin.action&&aiCacheMap[aiwin.action.id])||[]);
   const all=_cands.concat((aiwin.action&&aiwin.action.tracks)||[]);
-  all.forEach(c=>{ if(!c||!c.points)return; if(excl&&excl.has(c.points))return; const p=trkInterp(c,t); if(!p)return; const bw=(p.w||0.05),bh=(p.h||0.13); const inside=(nx>=p.x-bw*0.85&&nx<=p.x+bw*0.85&&ny>=p.y-bh*1.2&&ny<=p.y+bh*0.3); const d=inside?0:Math.hypot(p.x-nx,(p.y-bh*0.5)-ny); if(d<bs){bs=d;best=c;} }); return best; }
+  // PRÉCISION : le joueur dont le rectangle CONTIENT le curseur (centre le plus proche si chevauchement).
+  // Sinon seulement, un joueur très proche (petit rayon) -> plus d'accrochage sur un voisin.
+  let bestIn=null,bdIn=1e9, bestNear=null,bdNear=0.045;
+  all.forEach(c=>{ if(!c||!c.points)return; if(excl&&excl.has(c.points))return; const p=trkInterp(c,t); if(!p)return; const w=(p.w||0.05),h=(p.h||0.13); const d=Math.hypot(p.x-nx,(p.y-h*0.5)-ny);
+    const inside=(nx>=p.x-w*0.52&&nx<=p.x+w*0.52&&ny>=p.y-h*1.04&&ny<=p.y+h*0.08);
+    if(inside){ if(d<bdIn){bdIn=d;bestIn=c;} } else if(d<bdNear){bdNear=d;bestNear=c;} });
+  return bestIn||bestNear; }
 // ===== Barre de progression + PANNEAU DE SUIVI PAR JOUEUR =====
 function pctBar(p,color){ p=Math.max(0,Math.min(100,Math.round(p||0))); color=color||'#00e08f';
   return '<span style="display:inline-block;vertical-align:middle;width:110px;height:8px;background:#1e2a24;border-radius:5px;overflow:hidden;margin:0 8px"><span style="display:block;height:100%;width:'+p+'%;background:'+color+';transition:width .25s"></span></span><b>'+p+'%</b>'; }
@@ -10447,15 +10494,18 @@ async function aiRecompute(an,fromT,seedX,seedY,seedBw,seedBh){ if(an&&(an.manua
   // MOTEUR MONO-JOUEUR seedé (/track1) : suit EN AVANT depuis ton point de clic jusqu'à la fin (ou coupure).
   // AUCUN calcul avant le clic (impossible de deviner le bon joueur avant) -> exactement le même moteur
   // qu'un suivi lancé depuis le début, mais démarré à l'instant que TU choisis.
-  const fd=new FormData(); fd.append('vkey',vkey); fd.append('t0',fromT); fd.append('t1',endT); fd.append('x',seedX); fd.append('y',seedY); fd.append('model','yolo11s.pt'); fd.append('conf','0.28'); fd.append('imgsz','960'); fd.append('tracker',(window.aiTracker||'csrt')); if(seedBw)fd.append('bw',seedBw); if(seedBh)fd.append('bh',seedBh); { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); }
+  const fd=new FormData(); fd.append('vkey',vkey); fd.append('t0',fromT); fd.append('t1',endT); fd.append('x',seedX); fd.append('y',seedY); fd.append('model','yolo11s.pt'); fd.append('conf','0.28'); fd.append('imgsz','960'); fd.append('tracker',(window.aiTracker||'csrt')); fd.append('light','1'); if(seedBw)fd.append('bw',seedBw); if(seedBh)fd.append('bh',seedBh); { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); }
   let r0; try{ r0=await fetch(AI_BASE+'/track1',{method:'POST',body:fd}).then(r=>r.json()); }catch(e){ aiBar('❌ Moteur IA indisponible (lance DEMARRER.command).'); setTimeout(aiBarHide,2600); return; }
   if(r0&&r0.need_file){ aiBar('❌ Relance d\'abord une analyse complète du clip.'); setTimeout(aiBarHide,2600); return; }
   const job=r0&&r0.job; if(!job){ aiBar('❌ Recalcul non démarré.'); setTimeout(aiBarHide,2200); return; }
   if(an._deleted||(a.aiAnnos||[]).indexOf(an)<0){ cancelAiJobs([job]); aiBarHide(); return; }
   if(!an._jobs)an._jobs=[]; an._jobs.push(job); aiwin._activeJobs=(aiwin._activeJobs||[]).concat([job]);
   const _unreg=()=>{ aiwin._activeJobs=(aiwin._activeJobs||[]).filter(j=>j!==job); an._jobs=(an._jobs||[]).filter(j=>j!==job); };
+  let _pollFails=0;
   const poll=async()=>{ if(!aiwin.open||an._deleted||(aiwin.action.aiAnnos||[]).indexOf(an)<0){ cancelAiJobs([job]); _unreg(); aiBarHide(); return; }
-    let s; try{ s=await fetch(AI_BASE+'/status/'+job).then(r=>r.json()); }catch(e){ aiBar('❌ Connexion perdue.'); setTimeout(aiBarHide,2000); _unreg(); return; }
+    let s; try{ s=await fetch(AI_BASE+'/status/'+job).then(r=>r.json()); _pollFails=0; }catch(e){ _pollFails++;
+      if(_pollFails<8){ aiBar('🔄 Suivi en cours… (moteur occupé)'); setTimeout(poll,900); return; }
+      aiBar('❌ Connexion au moteur perdue.'); setTimeout(aiBarHide,2500); _unreg(); return; }
     aiBar('🔄 '+(s.msg||'Recalcul…'));
     if(s.state==='done'){ _unreg(); if(an._deleted||(aiwin.action.aiAnnos||[]).indexOf(an)<0){ aiBarHide(); return; } try{ const d=await fetch(AI_BASE+'/tracks/'+job).then(r=>r.json()); applyRecompute(an,d,fromT,endT,{x:seedX,y:seedY},fromT); }catch(e){ aiBar('❌ Lecture résultat impossible.'); setTimeout(aiBarHide,2000);} return; }
     if(s.state==='error'||s.state==='cancelled'){ _unreg(); if(s.state==='error'){ aiBar('❌ '+(s.msg||'Erreur')); setTimeout(aiBarHide,2600); } else aiBarHide(); return; }
@@ -10498,8 +10548,11 @@ async function aiRecomputeFollow(an,slot,fromT,seedX,seedY){ if(an&&(an.manualLo
   if(an._deleted||(a.aiAnnos||[]).indexOf(an)<0){ cancelAiJobs([job]); aiBarHide(); return; }
   if(!an._jobs)an._jobs=[]; an._jobs.push(job); aiwin._activeJobs=(aiwin._activeJobs||[]).concat([job]);
   const _unreg=()=>{ aiwin._activeJobs=(aiwin._activeJobs||[]).filter(j=>j!==job); an._jobs=(an._jobs||[]).filter(j=>j!==job); };
+  let _pollFails=0;
   const poll=async()=>{ if(!aiwin.open||an._deleted||(aiwin.action.aiAnnos||[]).indexOf(an)<0){ cancelAiJobs([job]); _unreg(); aiBarHide(); return; }
-    let s; try{ s=await fetch(AI_BASE+'/status/'+job).then(r=>r.json()); }catch(e){ aiBar('❌ Connexion perdue.'); setTimeout(aiBarHide,2000); _unreg(); return; }
+    let s; try{ s=await fetch(AI_BASE+'/status/'+job).then(r=>r.json()); _pollFails=0; }catch(e){ _pollFails++;
+      if(_pollFails<8){ aiBar('🔄 Suivi en cours… (moteur occupé)'); setTimeout(poll,900); return; }
+      aiBar('❌ Connexion au moteur perdue.'); setTimeout(aiBarHide,2500); _unreg(); return; }
     aiBar('🔄 '+(s.msg||'Recalcul…'));
     if(s.state==='done'){ _unreg(); if(an._deleted||!an.follow||!an.follow[slot]){ aiBarHide(); return; }
       try{ const d=await fetch(AI_BASE+'/tracks/'+job).then(r=>r.json()); const list=(d&&d.tracks)||[]; if(!list.length){ aiBar('Aucun joueur détecté à cet endroit — clique bien sur le joueur.'); setTimeout(aiBarHide,2600); return; }
@@ -10618,7 +10671,8 @@ function renderAiTimeline(){ const tl=document.getElementById('aiwTL'); if(!tl||
   } else {
     const annos=a.aiAnnos||[]; const fz=[],su=[],ob=[],tx=[];
     (a.aiFreezes||[]).forEach((f,i)=>{ const l=aiRealToVirt(a,f.t)/span*100, w=Math.max(1.5,(f.dur||3)/span*100); fz.push({l:l,w:w,html:'<div class="seg'+(aiwin._selFz===i?' sel':'')+'" data-fz="'+i+'" style="left:'+l+'%;width:'+w+'%;background:rgba(255,255,255,.92);color:#0a1512"><span class="hdl" data-fz="'+i+'" data-edge="l" style="left:0"></span>📸 '+(f.dur||3).toFixed(1)+'s<span class="hdl" data-fz="'+i+'" data-edge="r" style="right:0"></span></div>'}); });
-    annos.forEach((an,i)=>{ if(an.trackOnly)return; if(an.type==='text')tx.push(segOf(an,i)); else if(an.trackId||(an.trk&&an.space!=='field'))su.push(segOf(an,i)); else ob.push(segOf(an,i)); });
+    annos.forEach((an,i)=>{ if(an.trackOnly)return; /* pistes de suivi (auto + corrections) = JAMAIS sur la timeline : seuls les DESSINS y figurent */
+      if(an.type==='text')tx.push(segOf(an,i)); else if(an.trackId||(an.trk&&an.space!=='field'))su.push(segOf(an,i)); else ob.push(segOf(an,i)); });
     packLanes('Vidéo',fz,{mute:'video',muted:!!(typeof vid!=='undefined'&&vid.muted)});
     packLanes('Suivi joueur',su,{});
     packLanes('Objets',ob,{});
@@ -10940,6 +10994,20 @@ function openMontage(){ if(!project){alert('Ouvre un espace de travail.');return
   try{ if(project.videoBlobId)(project.timeline.clips||[]).forEach(c=>{ if((c.kind==='analytic'||c.kind==='raw')&&!c.srcBlobId){ c.srcBlobId=project.videoBlobId; c.srcName=project.videoName||''; } }); }catch(e){}
   // Vidéo RÉFÉRENCÉE (disque externe) : pas de blob copié -> on grave le lien (handle) sur les clips pour qu'ils retrouvent leur source.
   try{ if(project.videoHandleId)(project.timeline.clips||[]).forEach(c=>{ if((c.kind==='analytic'||c.kind==='raw')&&!c.srcBlobId&&!c.srcHandleId){ c.srcHandleId=project.videoHandleId; c.srcName=project.videoName||''; } }); }catch(e){}
+  // PRÉ-DÉCODAGE AUDIO EN ARRIÈRE-PLAN : le décodage du son (surtout l'audio du match) est la partie la plus
+  // longue de la génération. On le déclenche dès l'ouverture du montage -> au moment de générer, c'est déjà
+  // en cache, donc quasi instantané. Non bloquant.
+  try{ setTimeout(function(){ try{
+    const _seen={}; const _warm=function(id){ if(id!=null && !_seen[id]){ _seen[id]=1; try{ decodeAudioCached(id); }catch(e){} } };
+    (project.timeline.clips||[]).forEach(function(c){
+      try{
+        if(c.kind==='analytic'){ const a=actionById(c.actionId); if(a&&a.audioId)_warm(a.audioId); }
+        else if(c.kind==='audio'){ const m=mediaById(c.mediaId); if(m)_warm(m.blobId); }
+        else if(c.kind==='raw')_warm(project.videoBlobId);
+        else if(c.kind==='video'){ const m=mediaById(c.mediaId); if(m)_warm(m.blobId); }
+      }catch(e){}
+    });
+  }catch(e){} }, 400); }catch(e){}
   // ROBUSTESSE RÉOUVERTURE : un clip importé passé en analytique porte SES dessins/gels/calibrage sur lui-même.
   // Si son action a disparu (redémarrage de MatchLyz, montage rechargé sans les actions) on la RECONSTRUIT depuis
   // le clip -> le plan existe de nouveau, la vidéo se charge, la lecture n'est plus noire.
@@ -10991,7 +11059,9 @@ async function montReconnectVideos(){ const ids=montReferencedIds(); if(!ids.len
   let ok=0,ko=0;
   for(const id of ids){ try{ const r=await dbGet('blobs',id); const h=r&&r.handle; if(!h){ ko++; continue; } let p=await h.queryPermission({mode:'read'}); if(p!=='granted'){ try{ p=await h.requestPermission({mode:'read'}); }catch(e){} } if(p==='granted')ok++; else ko++; }catch(e){ ko++; } }
   try{ mAssetsDirty=true; mAssets=null; }catch(e){}
-  try{ if(project&&project.videoHandleId){ const rr=await dbGet('blobs',project.videoHandleId); const hh=rr&&rr.handle; if(hh){ const pp=await hh.queryPermission({mode:'read'}); if(pp==='granted'){ const f=await hh.getFile(); if(!vid.src)vid.src=URL.createObjectURL(f); try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; save(); } }catch(e){} } } } }catch(e){}
+  try{ if(project&&project.videoHandleId){ const rr=await dbGet('blobs',project.videoHandleId); const hh=rr&&rr.handle; if(hh){ const pp=await hh.queryPermission({mode:'read'}); if(pp==='granted'){ const f=await hh.getFile(); try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; save(); } }catch(e){}
+    // version corrigée /sdr en priorité (fichier brut HEVC = noir) ; sinon le fichier direct
+    if(project.videoConverted&&project.videoUrl){ try{ vid.src=project.videoUrl; }catch(e){} } else if(!vid.src){ vid.src=URL.createObjectURL(f); } } } } }catch(e){}
   try{ renderMediaLib(); renderClipsLib(); renderMTL(); drawStaticAt(mPlayT); }catch(e){}
   try{ await montUpdateReconnectBtn(); }catch(e){}
   if(ko&&!ok){ mstat('Reconnexion impossible — vérifie que le disque est branché.'); }
@@ -11003,7 +11073,10 @@ async function montReconnectVideos(){ const ids=montReferencedIds(); if(!ids.len
 function _vidReadyOnce(ms){ return new Promise(res=>{ let d=false; const f=()=>{ if(d)return; d=true; try{vid.removeEventListener('loadeddata',f);vid.removeEventListener('canplay',f);vid.removeEventListener('error',f);}catch(e){} res(); }; try{ vid.addEventListener('loadeddata',f); vid.addEventListener('canplay',f); vid.addEventListener('error',f); }catch(e){} setTimeout(f,ms||6000); }); }
 async function _setMainVidFromBlob(blob,name){ try{ vid.src=URL.createObjectURL(blob); if(name&&!project.videoName)project.videoName=name; await _vidReadyOnce(); try{refreshVidBtn();}catch(e){} return !!vid.videoWidth; }catch(e){ return false; } }
 async function ensureMontageMatchVideo(){
-  try{ if(vid&&vid.videoWidth)return true; }catch(e){}
+  try{ if(vid&&vid.videoWidth && !(project&&project.videoConverted&&project.videoUrl&&vid.src.indexOf(project.videoUrl)<0))return true; }catch(e){}
+  // 0) VERSION CORRIGÉE (/sdr ou /conv) EN PRIORITÉ : pour un iPhone/HEVC, c'est la SEULE source qui
+  // s'affiche (le fichier brut sort noir). Sinon l'aperçu du montage restait noir alors que Tag marchait.
+  try{ if(project&&project.videoConverted&&project.videoUrl){ vid.src=project.videoUrl; await _vidReadyOnce(); if(vid.videoWidth)return true; } }catch(e){}
   // 1) blob copié du projet
   try{ if(project&&project.videoBlobId){ const r=await dbGet('blobs',project.videoBlobId); if(r&&r.blob&&await _setMainVidFromBlob(r.blob,project.videoName))return true; } }catch(e){}
   // 2) lien disque du projet (si l'autorisation est encore accordée — aucun geste requis)
@@ -11865,10 +11938,33 @@ function seekAndDraw(el,target,c){ return new Promise(res=>{ const _draw=()=>{ t
     // Déjà sur la bonne frame -> dessin direct (petit gain sûr sur ralentis/arrêts/images répétées).
     try{ if(el && el.readyState>=2 && Math.abs((el.currentTime||0)-target) < 0.021){ _draw(); return res(); } }catch(e){}
     let did=false; let tm; const fin=()=>{ if(did)return; did=true; el.removeEventListener('seeked',fin); clearTimeout(tm); _draw(); res(); }; el.addEventListener('seeked',fin); tm=setTimeout(fin,500); try{el.currentTime=Math.max(0,target);}catch(e){fin();} }); }
+// APERÇU MONTAGE HEVC : récupère (et met en cache 0,25 s) l'image du match à l'instant srcTime via le serveur.
+// Un canvas ne sait pas dessiner du HEVC -> on lui donne une image déjà décodée. Instantané, aucun proxy.
+async function _mBaseFrame(srcTime){
+  try{
+    const key=Math.round((srcTime||0)*4)/4;
+    let C=window._mFrCache||(window._mFrCache={});
+    if(C.key===key && C.img) return C.img;
+    if(window._mFrFetch===key) return C.img||null;
+    window._mFrFetch=key;
+    let vkey=null; try{ vkey=await aiEnsureUploaded(); }catch(e){}
+    if(!vkey){ window._mFrFetch=null; return C.img||null; }
+    const url=AI_BASE+'/preview_frame?vkey='+encodeURIComponent(vkey)+'&t='+key+'&w='+(RW||1280)+'&h='+(RH||720);
+    const img=new Image(); try{img.crossOrigin='anonymous';}catch(e){}
+    const ok=await new Promise(res=>{ img.onload=()=>res(true); img.onerror=()=>res(false); img.src=url; });
+    window._mFrFetch=null;
+    if(ok && img.naturalWidth){ window._mFrCache={key,img}; try{ if(!mPlaying)drawStaticAt(mPlayT); }catch(e){} return img; }
+    return C.img||null;
+  }catch(e){ window._mFrFetch=null; return (window._mFrCache&&window._mFrCache.img)||null; }
+}
 async function drawStaticAt(t){ try{$('mcv').style.cursor=(mtlSel&&(mtlSel.zoom>1||mtlSel.kind==='text'))?'move':'default';}catch(e){} if(mPlaying)return; if(!project.timeline.clips.length)return;
   setRenderDims(); const cvEl=$('mcv'); if(cvEl.width!==RW||cvEl.height!==RH){cvEl.width=RW;cvEl.height=RH;layoutMStage();} rctx=cvEl.getContext('2d');
   if(mAssetsDirty||!mAssets){ if(!_mAssetsBuild){ mAssetsDirty=false; _mAssetsBuild=prepareAssets(project.timeline.clips).then(_a=>{mAssets=_a;}).catch(()=>{}).finally(()=>{_mAssetsBuild=null;}); } try{ await _mAssetsBuild; }catch(e){} if(!mAssets){ return; } }
   engineClips=project.timeline.clips;
+  // APERÇU MONTAGE + HEVC : un canvas ne sait PAS dessiner une vidéo HEVC (/sdr) -> noir (seul le plein écran
+  // marche). Pour le match HEVC, on dessine donc UNE IMAGE extraite à la volée du serveur (instantané, GPU),
+  // au lieu de la vidéo. Aucun proxy lourd à construire, et ça ne touche NI la calibration NI la génération.
+  window._mHevcMode = !!(project && project.videoConverted && /\/sdr\//.test(project.videoUrl||''));
   const CLR=()=>{ rctx.fillStyle='#000'; rctx.fillRect(0,0,RW,RH); };
   // Pendant l'export : on prend les pixels du match depuis le MP4 seekable servi par le serveur
   // (seek quasi instantané) au lieu du WebM du direct (seek très lent). Repli sur vid si absent.
@@ -11881,7 +11977,7 @@ async function drawStaticAt(t){ try{$('mcv').style.cursor=(mtlSel&&(mtlSel.zoom>
   else if(c.kind==='video'){ const v=mAssets.vids[c.mediaId]||mAssets.vids[c.id]; if(v){ const s=vidClipSample(c,t-c.start); const fc=s.frozen&&mAssets.fzc?(mAssets.fzc[s.fz.id+':'+(s.stateIdx||0)]||mAssets.fzc[s.fz.id]):null; if(fc){ CLR(); drawClip(fc,fc.width,fc.height,_fzXform(s.fz,c)); } else await seekAndDraw(v,s.t,c);
       // Dessins/suivis IA posés sur ce clip importé (faisceau, anneau, flèche…) : sinon ils disparaissent au rendu.
       if(c.aiAnnos&&c.aiAnnos.length){ try{ overlayActionDrawings({aiAnnos:c.aiAnnos,calibs:c.calibs||[],corr:c.corr||[],in:c.srcIn||0,out:(c.srcIn||0)+((c.dur||5)*(c.speed||1))}, s.t, c, v.videoWidth, v.videoHeight); }catch(e){} } } }
-  else if(c.kind==='raw'){ const s=vidClipSample(c,t-c.start); const fc=s.frozen&&mAssets.fzc?(mAssets.fzc[s.fz.id+':'+(s.stateIdx||0)]||mAssets.fzc[s.fz.id]):null; if(fc){ CLR(); drawClip(fc,fc.width,fc.height,_fzXform(s.fz,c)); } else await seekAndDraw(VSRC,s.t,c);
+  else if(c.kind==='raw'){ const s=vidClipSample(c,t-c.start); const fc=s.frozen&&mAssets.fzc?(mAssets.fzc[s.fz.id+':'+(s.stateIdx||0)]||mAssets.fzc[s.fz.id]):null; if(fc){ CLR(); drawClip(fc,fc.width,fc.height,_fzXform(s.fz,c)); } else if(window._mHevcMode && !_clipSrcId(c)){ const _im=await _mBaseFrame(s.t); CLR(); if(_im)drawClip(_im,_im.naturalWidth,_im.naturalHeight,c); } else await seekAndDraw(VSRC,s.t,c);
       if(c.aiAnnos&&c.aiAnnos.length){ try{ overlayActionDrawings({aiAnnos:c.aiAnnos,calibs:c.calibs||[],corr:c.corr||[],in:c.srcIn||0,out:(c.srcIn||0)+((c.dur||5)*(c.speed||1))}, s.t, c, (VSRC&&VSRC.videoWidth)||0, (VSRC&&VSRC.videoHeight)||0); }catch(e){} } }
   else if(c.kind==='analytic'){ const _aa=actionById(c.actionId);
     // === DIAGNOSTIC MONTAGE (une fois par clip) : dit si le montage retrouve l'action et ses dessins. ===
@@ -11889,7 +11985,7 @@ async function drawStaticAt(t){ try{$('mcv').style.cursor=(mtlSel&&(mtlSel.zoom>
       const _plok=!!mAssets.plans[c.id]; const na=(_aa&&_aa.aiAnnos||[]).length, naf=(_aa&&_aa.aiFreezes||[]).length, nf=(_aa&&_aa.freezes||[]).length;
       mstat('🔎 MONTAGE clip '+c.id+' → action '+(_aa?('OK ('+_aa.id+')'):'INTROUVABLE actionId='+c.actionId)+' | plan '+(_plok?'OK':'ABSENT')+' | dessins='+na+' gelsIA='+naf+' gels='+nf); } }catch(e){}
     const plan=mAssets.plans[c.id]; if(!plan){ CLR(); drawTextOverlays(t); return; } const lt=(c.trimStart||0)+(t-c.start)*(c.speed||1); const r=phaseAt(plan,lt);
-    if(r.phase.type==='play'){ const _src=r.phase.srcStart+(lt-r.local); await seekAndDraw(VSRC,_src,c); let _phv=(_src-((_aa&&_aa.in)||0)); if(_aa&&_aa.aiFreezes)_aa.aiFreezes.forEach(f=>{ if(f.t<=r.phase.srcStart+0.02)_phv+=(f.dur||3); }); overlayActionDrawings(_aa,_src,c,null,null,_phv); }
+    if(r.phase.type==='play'){ const _src=r.phase.srcStart+(lt-r.local); if(window._mHevcMode && !_clipSrcId(c)){ const _im=await _mBaseFrame(_src); CLR(); if(_im)drawClip(_im,_im.naturalWidth,_im.naturalHeight,c); } else await seekAndDraw(VSRC,_src,c); let _phv=(_src-((_aa&&_aa.in)||0)); if(_aa&&_aa.aiFreezes)_aa.aiFreezes.forEach(f=>{ if(f.t<=r.phase.srcStart+0.02)_phv+=(f.dur||3); }); overlayActionDrawings(_aa,_src,c,null,null,_phv); }
     else if(r.phase.type==='hold' && r.phase.aiFz){ const fzt=r.phase.srcAt; CLR(); const _cap=mAssets.aifz&&mAssets.aifz['aifz:'+(_clipSrcId(c)||'main')+':'+(+fzt).toFixed(3)]; if(_cap){ drawClip(_cap,_cap.width,_cap.height,c); } else { await seekAndDraw(VSRC,fzt,c); } window._mFzHold={a:_aa,fz:r.phase.aiFz,el:Math.max(0,Math.min((r.phase.dur||3),lt-r.local))}; try{ overlayActionDrawings(_aa,fzt,c); }catch(e){} window._mFzHold=null; }
     else if(r.phase.type==='hold'){ const _si=(r.phase.stateIdx||0); const fc=mAssets.fz[r.phase.fzId+':'+_si]; const _f=_aa&&(_aa.freezes||[]).find(f=>f.id===r.phase.fzId); const _ft=_f?_f.time:(r.phase.srcStart!=null?r.phase.srcStart:(_aa?_aa.in:0));
       if(_f && _fzHasDiff(_f,_si) && _fzImgCache[_f.imgId]){ const _el=Math.max(0,lt-r.local); CLR(); drawFreezeDiff(_f,_si,_el,c); }
@@ -11972,7 +12068,7 @@ async function prepareAssets(clips){ clips=clips||project.timeline.clips; const 
     // Vidéo source PROPRE au clip (analyse/brut d'un autre dossier) : chargée dans son propre élément vidéo.
     if((c.kind==='analytic'||c.kind==='raw') && _clipSrcId(c)){ const key=_clipSrcKey(c); if(!A.vids[key]){ if(_prevVids[key]){ A.vids[key]=_prevVids[key]; } else { try{ let blob=null, durl=null;
       // Source iPhone HEVC/HDR convertie en H.264 : on lit la version lisible (sinon image noire au montage/export).
-      if(project&&project.videoConverted&&project.videoUrl&&c.srcHandleId&&c.srcHandleId===project.videoHandleId){ durl=project.videoUrl; }
+      if(project&&project.videoConverted&&project.videoUrl&&((c.srcHandleId&&c.srcHandleId===project.videoHandleId)||(c.srcBlobId&&c.srcBlobId===project.videoBlobId))){ durl=project.videoUrl; }
       else if(c.srcBlobId){ const r=await dbGet('blobs',c.srcBlobId); blob=r&&r.blob||null; } else if(c.srcHandleId){ blob=await _handleToBlob(c.srcHandleId); }
       const vsrc=durl||(blob?URL.createObjectURL(blob):null);
       if(vsrc){ const v=document.createElement('video'); try{ v.crossOrigin='anonymous'; }catch(e){} v.muted=true; v.preload='auto'; v.src=vsrc; await new Promise(res=>{ v.oncanplay=res; v.onloadeddata=res; v.onerror=res; setTimeout(res,4000); }); A.vids[key]=v; } }catch(e){} } } }
@@ -12029,13 +12125,13 @@ function drawFrame(t,A){ rctx.fillStyle='#000'; rctx.fillRect(0,0,RW,RH); const 
         drawClip(v,v.videoWidth,v.videoHeight,c); }
       // Dessins/suivis du Suivi IA faits sur ce clip importé (stockés sur le clip) :
       if(c.aiAnnos&&c.aiAnnos.length){ try{ overlayActionDrawings({aiAnnos:c.aiAnnos,calibs:c.calibs||[],corr:c.corr||[],in:c.srcIn||0,out:(c.srcIn||0)+((c.dur||5)*(c.speed||1))}, v.currentTime, c, v.videoWidth, v.videoHeight); }catch(e){} } } }
-  else if(c.kind==='raw'){ const V=_clipSrcVid(c,A); if(!V||!V.videoWidth){ montDrawUnavail(c); renderState.key='rawNA:'+c.id; }
+  else if(c.kind==='raw'){ const V=((!_clipSrcId(c)&&window._mFast&&window._mFast.videoWidth)?window._mFast:_clipSrcVid(c,A)); if(!V||!V.videoWidth){ montDrawUnavail(c); renderState.key='rawNA:'+c.id; }
       else { const sp=c.speed||1; const s=vidClipSample(c,t-c.start);
       if(s.frozen){ if(!V.paused)V.pause(); if(Math.abs(V.currentTime-s.t)>0.03){ try{V.currentTime=Math.max(0,s.t);}catch(e){} } const fc=A.fzc&&(A.fzc[s.fz.id+':'+(s.stateIdx||0)]||A.fzc[s.fz.id]); if(fc){ renderState.key='rawfz:'+c.id+':'+s.fz.id; drawClip(fc,fc.width,fc.height,_fzXform(s.fz,c)); } else { renderState.key='rawfz:'+c.id; drawClip(V,V.videoWidth,V.videoHeight,c); } }
       else { const rk='raw:'+c.id; if(renderState.key!==rk){ renderState.key=rk; try{V.playbackRate=sp;}catch(e){} if(Math.abs(V.currentTime-s.t)>0.08){ try{V.currentTime=Math.max(0,s.t);}catch(e){} } V.play().catch(()=>{}); }
         else { if(V.paused)V.play().catch(()=>{}); if(Math.abs(V.currentTime-s.t)>0.25){ try{V.currentTime=s.t;}catch(e){} } }
         drawClip(V,V.videoWidth,V.videoHeight,c); } } }
-  else if(c.kind==='analytic'){ const plan=A.plans[c.id]; if(!plan){ pauseSources(A); return; } const V=_clipSrcVid(c,A); if(!V||!V.videoWidth){ montDrawUnavail(c); renderState.key='aNA:'+c.id; drawTextOverlays(t); return; }
+  else if(c.kind==='analytic'){ const plan=A.plans[c.id]; if(!plan){ pauseSources(A); return; } const V=((!_clipSrcId(c)&&window._mFast&&window._mFast.videoWidth)?window._mFast:_clipSrcVid(c,A)); if(!V||!V.videoWidth){ montDrawUnavail(c); renderState.key='aNA:'+c.id; drawTextOverlays(t); return; }
     const sp=c.speed||1; const lt=(c.trimStart||0)+(t-c.start)*sp; const r=phaseAt(plan,lt); const clipKey='aclip:'+c.id;
     if(renderState.key!==clipKey){ renderState.key=clipKey; try{V.playbackRate=sp;}catch(e){} const s0=(r.phase.type==='play')?(r.phase.srcStart+(lt-r.local)):(r.phase.srcStart!=null?r.phase.srcStart:((actionById(c.actionId)||{}).in||0)); try{V.currentTime=Math.max(0,s0);}catch(e){} }
     if(r.phase.type==='play'){ const expectedSrc=r.phase.srcStart+(lt-r.local); const _al=actionById(c.actionId);
@@ -12199,6 +12295,7 @@ async function decodeAudioCached(blobId){
 async function _renderAudioWav(clips,total){ try{
   const sr=44100; const off=new OfflineAudioContext(2,Math.max(1,Math.ceil(total*sr)),sr); let any=false;
   const _decodeBlob=decodeAudioCached; // cache audio persistant (partagé lecture/génération)
+  window._mAudVk=undefined;   // clé vidéo du match, résolue une seule fois par génération
   for(const c of clips){
     // 1) Voix (analytic) + clips audio importés
     let a=null;
@@ -12211,10 +12308,25 @@ async function _renderAudioWav(clips,total){ try{
     // 2) Son PROPRE des clips du match (raw) et des vidéos importées (video), piloté par le mute
     //    piste/clip. (Sauté si arrêt sur image sur le clip -> éviterait la désynchro audio/vidéo.)
     if((c.kind==='raw'||c.kind==='video') && !(c.freezes&&c.freezes.length)){
-      const bid=(c.kind==='raw')?project.videoBlobId:((mediaById(c.mediaId)||{}).blobId);
-      const buf=await _decodeBlob(bid); if(!buf||!buf.duration)continue;  // vidéo sans piste audio -> ignorée
-      const sp=c.speed||1, offs=(c.srcIn||0); if(offs>=buf.duration)continue;
       const muted=(c.mute||trackMuted(c.track));
+      const sp=c.speed||1, offs=(c.srcIn||0), segDur=Math.max(0.05,(c.dur||0)*sp);
+      // MATCH (raw) : on extrait SEULEMENT le segment audio utile depuis le moteur (rapide) au lieu de
+      // décoder toute la piste son (45 min). C'était LA partie la plus longue de la génération.
+      if(c.kind==='raw'){
+        try{ if(window._mAudVk===undefined){ try{ window._mAudVk=await aiEnsureUploaded(); }catch(e){ window._mAudVk=null; } }
+          const vk=window._mAudVk;
+          if(vk){ const rr=await fetch(AI_BASE+'/clip_audio?vkey='+encodeURIComponent(vk)+'&t0='+offs+'&dur='+segDur);
+            if(rr&&rr.ok&&rr.status===200){ const abuf=await rr.arrayBuffer();
+              if(abuf&&abuf.byteLength>1024){ const sbuf=await _getDecodeCtx().decodeAudioData(abuf);
+                if(sbuf&&sbuf.duration){ const s=off.createBufferSource(); s.buffer=sbuf; if(sp!==1)try{s.playbackRate.value=sp;}catch(e){}
+                  const g=off.createGain(); g.gain.value=muted?0:(c.volume!=null?c.volume:1); s.connect(g); g.connect(off.destination);
+                  s.start(Math.max(0,c.start), 0, segDur); any=true; continue; } } } }
+        }catch(e){}
+      }
+      // Repli (vidéo importée, ou segment indisponible) : ancien décodage du blob complet.
+      const bid=(c.kind==='raw')?project.videoBlobId:((mediaById(c.mediaId)||{}).blobId);
+      const buf=await _decodeBlob(bid); if(!buf||!buf.duration)continue;
+      if(offs>=buf.duration)continue;
       const s=off.createBufferSource(); s.buffer=buf; if(sp!==1)try{s.playbackRate.value=sp;}catch(e){}
       const g=off.createGain(); g.gain.value=muted?0:(c.volume!=null?c.volume:1); s.connect(g); g.connect(off.destination);
       s.start(Math.max(0,c.start), offs, Math.max(0.01,(c.dur||0)*sp)); any=true;
@@ -12289,7 +12401,7 @@ async function exportMontageServer(){
       if(blob&&blob.size){ offerDownload(blob,outExt); mstat('✅ '+outExt.toUpperCase()+' téléchargé — rendu serveur ('+nFrames+' images).'); }
       else { mstat('❌ '+ferr); alert('La vidéo est bien assemblée sur le serveur, mais le téléchargement a échoué ('+ferr+').\n\nElle est en sécurité ici :\n'+AI_BASE+url+'\n\nOuvre ce lien dans un onglet pour la récupérer, ou réessaie « Générer ».'); } }
     else { mstat('❌ Assemblage échoué.'); alert('L\'assemblage a échoué côté serveur :\n'+err); }
-  } finally { window._contExport=false; try{ vid.pause(); vid.playbackRate=1; }catch(e){} try{ if(window._mFast)window._mFast.pause(); }catch(e){} window._mFast=null; window._srvBusy=false; window._srvStop=false; montageMode=false; engineClips=null; mAssetsDirty=true; $('mGen').textContent='🎬 Générer la vidéo'; }
+  } finally { window._contExport=false; try{ vid.pause(); vid.playbackRate=1; }catch(e){} try{ if(window._mFast)window._mFast.pause(); }catch(e){} /* on GARDE window._mFast (proxy H.264) pour que l'APERÇU du montage continue d'afficher l'image après la génération */ window._srvBusy=false; window._srvStop=false; montageMode=false; engineClips=null; mAssetsDirty=true; $('mGen').textContent='🎬 Générer la vidéo'; }
 }
 // ===================== MOTEUR RAPIDE (façon LiveTag) : décodage NATIF côté serveur =====================
 // Le navigateur ne SEEK plus le match : il classe chaque image (segment de match vs image composée),
@@ -12419,7 +12531,7 @@ async function exportMontageTurbo(sid,clips,total,nFrames,FPS,RW,RH,vkey,mediaVk
   if(!blob||!blob.size)return false;
   offerDownload(blob,outExt);
   const dt=((performance.now()-(window._turboT0||performance.now()))/1000).toFixed(1);
-  mstat('✅ Vidéo générée ('+outExt.toUpperCase()+') — fichier prêt.');
+  mstat('✅ Vidéo générée ('+outExt.toUpperCase()+') en '+dt+' s — fichier prêt.');
   return true;
 }
 // STOP RÉEL : coupe les boucles du navigateur ET demande au moteur de tuer le ffmpeg en cours
@@ -12456,7 +12568,7 @@ async function exportMontageNative(){
     let sid=null; try{ const r=await fetch(AI_BASE+'/render_start',{method:'POST'}); const j=await r.json(); sid=j&&j.sid; }catch(e){}
     if(!sid){ alert('Moteur local injoignable. Lance le serveur (DEMARRER.command) puis réessaie.'); return; }
     window._curRenderSid=sid;   // mémorisé pour que « Stop » puisse annuler ce rendu côté moteur
-    mstat('Rendu de l\'audio…'); try{ const wav=await _renderAudioWav(clips,total); if(wav){ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); } }catch(e){}
+    mstat('Rendu de l\'audio…'); const _ta=performance.now(); try{ const wav=await _renderAudioWav(clips,total); window._perfAudio=Math.round(performance.now()-_ta); if(wav){ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); } }catch(e){ window._perfAudio=Math.round(performance.now()-_ta); }
     const hasText=clips.some(c=>c.kind==='text');
     const mcvCtx=$('mcv').getContext('2d');
     const _ovl=document.createElement('canvas'); _ovl.width=RW; _ovl.height=RH; const octx=_ovl.getContext('2d');
@@ -12637,7 +12749,7 @@ async function exportMontageNative(){
           const _upd=(window._upDiag||[]).join('  |  ')||'—';
           const _diag=('⏱ RENDU (v17) en '+dt+' s ('+(dt/60).toFixed(1)+' min).  moteur : '+(window._srvVer||'ANCIEN (non à jour !)')+' · encodeur : '+(window._encUsed||'?')+'\n\n'
             +'Images : '+(P.total||nFrames)+' — match direct='+(P.natif||0)+' · re‑dessin='+(P.repli||0)+' ('+pct+'%) · dessins='+(P.dessins||0)+'\n'
-            +'Temps : client '+(((P.ms||0)/1000).toFixed(1))+'s · décodage natif '+(((window._perfP2||0)/1000).toFixed(1))+'s · dessins(serveur) '+(((window._perfP3||0)/1000).toFixed(1))+'s · assemblage '+(((window._perfP4||0)/1000).toFixed(1))+'s\n\n'
+            +'Temps : AUDIO '+(((window._perfAudio||0)/1000).toFixed(1))+'s · client '+(((P.ms||0)/1000).toFixed(1))+'s · décodage natif '+(((window._perfP2||0)/1000).toFixed(1))+'s · dessins(serveur) '+(((window._perfP3||0)/1000).toFixed(1))+'s · assemblage '+(((window._perfP4||0)/1000).toFixed(1))+'s\n\n'
             +'CLIPS : vidéo='+_nv+' · analyse='+_na+' · brut='+_nr+' · fond/texte='+_no+'\n'
             +'Vidéos importées envoyées au moteur : '+_vk+'/'+_nv+'\n'
             +'Clips vidéo éligibles natif : '+_vbaseok+'/'+_nv+' · avec transfo (zoom/pos/rot) : '+_vtransfo+'\n'
@@ -12645,7 +12757,8 @@ async function exportMontageNative(){
             +'Vidéo match : '+_match+' · chargée dans le lecteur : '+_vidok+'\n\n'
             +'DURÉES → total montage='+(total||0).toFixed(2)+'s · nFrames='+nFrames+' · fps='+FPS+'\n'
             +(clips.filter(c=>['analytic','video','raw'].includes(c.kind)).map(c=>{ try{ const a=actionById(c.actionId); const pl=(mAssets&&mAssets.plans&&mAssets.plans[c.id]); const sv=_clipSrcVid(c,mAssets); const svd=(sv&&sv.duration&&isFinite(sv.duration))?sv.duration.toFixed(2):'?'; return '• '+c.kind+' dur='+(+(c.dur||0)).toFixed(2)+' srcIn='+(+(c.srcIn||0)).toFixed(2)+' spd='+(c.speed||1)+(a?(' act['+(+(a.in||0)).toFixed(2)+'→'+(+(a.out||0)).toFixed(2)+']'):' (pas d\'action)')+(pl?(' plan='+pl.dur.toFixed(2)+'s'):' PAS DE PLAN')+' srcVidéo='+svd+'s'; }catch(e){ return '• (err)'; } }).join('\n'))+'\n\n'
-            +'👉 Recopie‑moi TOUT ça : je saurai exactement quoi corriger.'); try{ console.log(_diag); }catch(e){} try{ mstat('✅ Vidéo générée en '+dt+' s — fichier prêt.'); }catch(e){} }catch(e){} }
+            +'👉 Recopie‑moi TOUT ça : je saurai exactement quoi corriger.'); try{ console.log(_diag); }catch(e){}
+          try{ const _P=window._perfP1||{}; mstat('✅ Généré en '+dt+' s — AUDIO '+(((window._perfAudio||0)/1000).toFixed(1))+'s · images '+(((_P.ms||0)/1000).toFixed(1))+'s · décodage '+(((window._perfP2||0)/1000).toFixed(1))+'s · assemblage '+(((window._perfP4||0)/1000).toFixed(1))+'s'); }catch(e){ try{ mstat('✅ Vidéo générée en '+dt+' s — fichier prêt.'); }catch(_){} } }catch(e){} }
       else { mstat('❌ '+ferr); alert('La vidéo est assemblée sur le serveur mais le téléchargement a échoué ('+ferr+') :\n'+AI_BASE+url); } }
     else { mstat('❌ Assemblage échoué : '+err); alert('L\'assemblage a échoué côté serveur :\n'+err); }
   }catch(e){ mstat('❌ Erreur moteur serveur : '+((e&&e.message)||e)); alert('Erreur du moteur serveur : '+((e&&e.message)||e)+'\n\nTu peux réessayer.'); }
@@ -13325,7 +13438,7 @@ try{ (function(){
 })(); }catch(e){}
 
 (function(){ var dbReady=false;
-  openDB().then(function(){dbReady=true; try{sessionStorage.removeItem('mlz_db_retry');}catch(e){}}).then(loadTags).then(loadCodeTables).then(_maybeRestoreBackup).then(renderHome).catch(function(){});
+  openDB().then(function(){dbReady=true; try{sessionStorage.removeItem('mlz_db_retry');}catch(e){}}).then(loadTags).then(loadCodeTables).then(renderHome).catch(function(){});
   // Filet: sous Electron, la 1re CRÉATION de la base peut geler. Si rien après 4 s, on recharge une fois.
   setTimeout(function(){ if(!dbReady && !DB && window.__isElectron){ try{ if(!sessionStorage.getItem('mlz_db_retry')){ sessionStorage.setItem('mlz_db_retry','1'); location.reload(); } }catch(e){ location.reload(); } } }, 4000);
 })();

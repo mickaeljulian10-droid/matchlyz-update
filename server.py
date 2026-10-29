@@ -48,6 +48,17 @@ WORK.mkdir(parents=True, exist_ok=True)
 SERVER_VERSION = "s20-nocap"
 _LAST_ENC = "?"   # dernier encodeur vidéo utilisé (h264_videotoolbox = GPU, libx264 = CPU)
 
+# JOURNAL DE DIAGNOSTIC DU SUIVI (pour voir OÙ ça casse même si le moteur tombe). Écrit + vidé (flush) à
+# chaque étape. Lisible via /track_diag ou le script DIAGNOSTIC-SUIVI.command.
+_TRACK_DIAG = BASE / "_track_diag.log"
+def _tlog(msg):
+    try:
+        with open(_TRACK_DIAG, "a", encoding="utf-8") as _f:
+            _f.write(time.strftime("%H:%M:%S") + "  " + str(msg) + "\n")
+            _f.flush()
+    except Exception:
+        pass
+
 app = FastAPI(title="Foot Session Tracker")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -297,6 +308,22 @@ def get_model(name):
 
 # ---- DETECTION JOUEURS (suivi) — SEPARE du calibrage (ne touche pas calibrate_smart/propagate) ----
 _PLAYER_MODEL = {}
+# VERROU D'INFÉRENCE GPU : le GPU Apple (Metal/MPS) n'est PAS sûr en accès simultané. Deux prédictions YOLO
+# lancées en même temps (ex. deux détections concurrentes) corrompent le tampon de commandes Metal et TUENT
+# le moteur. Ce verrou sérialise toutes les inférences -> une seule à la fois -> plus de crash GPU.
+_INFER_LOCK = threading.Lock()
+def _gpu_sync():
+    """Force le GPU Apple à TERMINER le calcul en cours avant de rendre la main. Sans ça, une prédiction peut
+    rendre la main pendant que le GPU travaille encore -> la suivante démarre dessus -> « command encoder
+    already encoding » -> moteur tué. À appeler dans le verrou, juste après chaque predict."""
+    try:
+        import torch
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+            try: torch.mps.empty_cache()   # libère la mémoire GPU accumulée -> évite la saturation au recalage
+            except Exception: pass
+    except Exception:
+        pass
 def get_player_model():
     if "m" not in _PLAYER_MODEL:
         from ultralytics import YOLO
@@ -316,9 +343,10 @@ def get_player_model():
                     print("Suivi joueur : CoreML (Neural Engine) ->", c, "@", sz, "classes joueur", pc); break
                 except Exception as e:
                     print("CoreML chargement echec (", c, "), repli :", e); mdl = None
-        # 2) repli PyTorch sur GPU (MPS) — yolov8x à 1280 si pas encore converti en CoreML.
+        # 2) repli PyTorch — modèle MODÉRÉ (yolo11m @ 960) : yolov8x @ 1280 faisait planter le GPU Metal d'un
+        #    M1 8 Go (tampon de commandes corrompu). yolo11m est ~3x plus léger et tient sur ce GPU. Replis plus légers.
         if mdl is None:
-            for p, sz in (("yolov8x.pt", 1280), ("yolov8m.pt", 1280), ("yolo11s.pt", 1280)):
+            for p, sz in (("yolo11m.pt", 960), ("yolov8m.pt", 960), ("yolo11s.pt", 640), ("yolov8n.pt", 640)):
                 try:
                     mdl = YOLO(p); mdl._coreml = False; mdl._imgsz = sz; mdl._pcls = [0]
                     print("Suivi joueur : PyTorch ->", p, "@", sz, "(", pick_device(), ")"); break
@@ -393,7 +421,8 @@ def ai_field_pts(im, conf=0.4, min_inliers=15):
         _kw = dict(conf=0.2, imgsz=getattr(m, "_imgsz", 1280), verbose=False)
         if not getattr(m, "_coreml", False):
             _kw["device"] = pick_device()
-        r = m.predict(im, **_kw)[0]
+        with _INFER_LOCK:
+            r = m.predict(im, **_kw)[0]; _gpu_sync()
         kp = getattr(r, "keypoints", None)
         if kp is None or kp.xy is None or len(kp.xy) == 0:
             return None
@@ -1137,8 +1166,13 @@ def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
         t = f.to_tensor(Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))).float().unsqueeze(0)
         if t.shape[-1] != 960: t = T.Resize((540, 960))(t)
         t = t.to(dev); _, _, h, w = t.shape
-        with torch.no_grad():
-            hm = P["m"](t); hml = P["ml"](t)
+        # VERROU + SYNCHRO GPU : ces deux passes du modèle de calibrage tournent sur le GPU Apple. Sans
+        # sérialisation + synchro, elles se chevauchaient avec une autre opération GPU -> « command encoder
+        # already encoding » -> moteur tué pendant le recalage des lignes. On force une seule à la fois, finie.
+        with _INFER_LOCK:
+            with torch.no_grad():
+                hm = P["m"](t); hml = P["ml"](t)
+            _gpu_sync()
         kp = P["c2d"](P["kpf"](hm[:, :-1, :, :]), threshold=kp_th)
         ln = P["c2d"](P["kpf_l"](hml[:, :-1, :, :]), threshold=line_th)
         # (Pas de filtrage par masque pelouse ici : il supprimait des détections valides et affaiblissait
@@ -1269,16 +1303,90 @@ def make_tracker(kind):
         return None
 
 _DET_CACHE = {}   # détections YOLO partagées entre joueurs d'un même clip : {(src, index_image): [(cx,cy,w,h),...]}
+def _extract_light_segment(src, start, dur, out):
+    """Extrait un court extrait RÉDUIT (<=720 px de large, GPU) du segment à suivre, pour NE PAS
+    décoder la vidéo 4K entière en mémoire (cause de l'OOM qui tue le moteur sur un Mac 8 Go).
+    -ss AVANT -i = seek rapide SANS tout décoder, sortie recalée à 0 = image 0 = instant 'start'.
+    GPU videotoolbox d'abord, repli CPU libx264. Renvoie True si l'extrait est créé."""
+    import subprocess
+    try:
+        if os.path.exists(out): os.remove(out)
+    except Exception: pass
+    vf = "scale='min(720,iw)':-2"
+    attempts = [
+        ["-hwaccel", "videotoolbox", "-ss", str(max(0.0, start)), "-i", src, "-t", str(max(0.1, dur)),
+         "-an", "-vf", vf, "-c:v", "h264_videotoolbox", "-b:v", "5M", "-g", "30"],
+        ["-ss", str(max(0.0, start)), "-i", src, "-t", str(max(0.1, dur)),
+         "-an", "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24"],
+    ]
+    for ff in _ffmpeg_bins():
+        for tail in attempts:
+            try:
+                r = subprocess.run([ff, "-y"] + tail + [out],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1000:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _extract_lowres_frame(src, t, out):
+    """Extrait UNE image réduite (<=720 px de large, GPU) à l'instant t, SANS décoder la 4K en mémoire
+    (évite l'OOM du moteur sur un Mac 8 Go lors de la détection des joueurs). Renvoie True si créée."""
+    import subprocess
+    try:
+        if os.path.exists(out): os.remove(out)
+    except Exception: pass
+    vf = "scale='min(720,iw)':-2"
+    attempts = [
+        ["-hwaccel", "videotoolbox", "-ss", str(max(0.0, t)), "-i", src, "-frames:v", "1", "-vf", vf],
+        ["-ss", str(max(0.0, t)), "-i", src, "-frames:v", "1", "-vf", vf],
+    ]
+    for ff in _ffmpeg_bins():
+        for tail in attempts:
+            try:
+                r = subprocess.run([ff, "-y"] + tail + [out],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 500:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
 def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, conf, poly=None, cals=None, tracker="csrt", seed_bw=0.0, seed_bh=0.0, t0min=None):
     """Suivi MONO-joueur type LiveTag : un traqueur d'objet (CSRT/Nano) VERROUILLÉ sur le
     joueur cliqué, suivi image par image, avec re-détection périodique anti-dérive."""
     job = JOBS[job_id]
+    _tlog("TRACK1 enter job=%s light=%s t0=%.2f t1=%.2f" % (job_id, bool(JOBS.get(job_id, {}).get("light")), (t0s or 0), (t1s or 0)))
     try:
         import cv2
-        c0 = cv2.VideoCapture(str(video_path)); fps = c0.get(cv2.CAP_PROP_FPS) or 25.0
-        W = int(c0.get(cv2.CAP_PROP_FRAME_WIDTH) or 0); H = int(c0.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        ntot = int(c0.get(cv2.CAP_PROP_FRAME_COUNT) or 0); c0.release()
-        dur_total = (ntot / fps) if fps else 0
+        # MÉTADONNÉES SANS DÉCODAGE (anti-OOM) : NE PAS ouvrir la 4K dans OpenCV juste pour lire fps/largeur/
+        # hauteur -> ça allouait un décodeur 4K et pouvait tuer le moteur sur un Mac 8 Go. ffprobe ne décode rien.
+        _vi = {}
+        try: _vi = _probe_vinfo(str(video_path)) or {}
+        except Exception: _vi = {}
+        try: W = int(_vi.get("width") or 0); H = int(_vi.get("height") or 0)
+        except Exception: W = 0; H = 0
+        fps = 0.0
+        try:
+            _fr = _vi.get("avg_frame_rate") or _vi.get("r_frame_rate") or ""
+            if "/" in str(_fr):
+                _n, _d = str(_fr).split("/"); fps = (float(_n) / float(_d)) if float(_d) else 0.0
+            elif _fr: fps = float(_fr)
+        except Exception: fps = 0.0
+        if not fps or fps <= 0: fps = 25.0
+        try: dur_total = _src_dur(str(video_path)) or 0.0
+        except Exception: dur_total = 0.0
+        if W <= 0 or H <= 0:   # repli rare : OpenCV en DERNIER recours
+            c0 = cv2.VideoCapture(str(video_path))
+            _f2 = c0.get(cv2.CAP_PROP_FPS) or 0.0
+            if _f2 and _f2 > 0: fps = _f2
+            W = int(c0.get(cv2.CAP_PROP_FRAME_WIDTH) or 0); H = int(c0.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            _nt = int(c0.get(cv2.CAP_PROP_FRAME_COUNT) or 0); c0.release()
+            if not dur_total and _nt and fps: dur_total = _nt / fps
+        _tlog("TRACK1 meta W=%s H=%s fps=%s dur=%.1f" % (W, H, fps, dur_total or 0))
         # VITESSE : plus de ré-encodage du segment. On lit DIRECTEMENT dans la vidéo (seek),
         # on saute à l'instant de départ et on s'arrête à t1. Mêmes images d'origine = même qualité.
         offset = max(0.0, t0s); src = str(video_path)
@@ -1286,6 +1394,203 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
         total = max(1, int(round((t1eff - offset) * fps)))   # nb d'images du segment (barre de progression)
         start_fi = int(round(offset * fps))
         device = pick_device(); job["state"] = "running"; job["msg"] = "Suivi IA…"
+
+        # ===== MODE RAPIDE (correction LiveTag) : traqueur d'objet PUR (CSRT/Nano), SANS YOLO ni ReID.
+        # Sur une correction, l'utilisateur guide lui-même -> on suit juste SA boîte, image par image, sur une
+        # image réduite (rapide). Quasi temps réel au lieu de plusieurs minutes. S'il dérive, il re-corrige. =====
+        if globals().get("_TRACK_LIGHT_FLAG") or JOBS[job_id].get("light"):
+            try:
+                import numpy as _np, time as _time
+                _tlog("LIGHT start job=%s W=%s H=%s fps=%s off=%.2f t1=%.2f seed=(%.3f,%.3f) bw=%.3f bh=%.3f src=%s" % (
+                    job_id, W, H, fps, offset, (t1eff or 0), seedx, seedy, seed_bw, seed_bh, os.path.basename(src)))
+                # LOW-MEM (anti-OOM) : au lieu d'ouvrir le décodeur 4K (qui tue le moteur quand la RAM est
+                # saturée), on extrait un petit extrait réduit du segment [offset, t1eff] et on suit DESSUS.
+                # Mémoire ~16x plus faible. On garde le MÊME repère de temps (image 0 de l'extrait = 'offset').
+                seg_path = str(job["dir"] / "_lightseg.mp4")
+                seg_dur = max(0.2, (t1eff - offset) + 0.25)
+                cap = None; _proxy_ok = False
+                try:
+                    if _extract_light_segment(src, offset, seg_dur, seg_path) and os.path.getsize(seg_path) > 1000:
+                        cap = cv2.VideoCapture(seg_path)
+                        _fps2 = cap.get(cv2.CAP_PROP_FPS) or fps; _w2 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0); _h2 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                        if _w2 > 0 and _h2 > 0:
+                            fps = _fps2 or fps; W = _w2; H = _h2; _proxy_ok = True
+                            _tlog("LIGHT proxy seg ok W=%s H=%s fps=%s" % (W, H, fps))
+                        else:
+                            cap.release(); cap = None
+                except Exception as _se:
+                    _tlog("LIGHT proxy seg fail: " + str(_se)); cap = None
+                if cap is None:
+                    # repli : ancien chemin (lecture directe dans la source, avec seek)
+                    cap = cv2.VideoCapture(src)
+                    sfi = int(round(offset * fps)) if fps else 0
+                    try: cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, sfi))
+                    except Exception: pass
+                ret, frame = cap.read()
+                _tlog("LIGHT seed-read ok=%s" % bool(ret))
+                if not ret:
+                    cap.release(); job["state"] = "error"; job["msg"] = "image de départ introuvable"; _tlog("LIGHT abort: seed introuvable"); return
+                def _clampi(v, lo, hi): return int(max(lo, min(hi, v)))
+                def _clampf(v, lo, hi): return max(lo, min(hi, v))
+                # TAILLE AFFICHÉE = EXACTEMENT ta boîte dessinée (on ne l'agrandit plus).
+                bw_px = (seed_bw * W) if (seed_bw and seed_bw > 0) else 0.045 * W
+                bh_px = (seed_bh * H) if (seed_bh and seed_bh > 0) else 0.13 * H
+                # TAILLE D'INIT du tracker : léger plancher UNIQUEMENT si ta boîte est minuscule (sinon CSRT
+                # décroche), mais ça ne change PAS la taille affichée (on garde bw_px/bh_px pour le rendu).
+                init_bw = max(bw_px, 0.022 * W, 12.0); init_bh = max(bh_px, 0.075 * H, 22.0)
+                foot_y = seedy * H; cx0 = seedx * W; cy0 = foot_y - bh_px / 2.0
+                bx = _clampf(cx0 - init_bw / 2.0, 0, W - 2); by = _clampf((foot_y - init_bh) , 0, H - 2)
+                bw0 = max(2.0, min(init_bw, W - bx)); bh0 = max(2.0, min(init_bh, H - by))
+                lpts = []
+                def lrec(t, cxf, cyf, wwf, hhf, cc):
+                    lpts.append({"t": round(t, 3), "x": round(cxf / W, 4), "y": round(min(1.0, (cyf + hhf / 2) / H), 4),
+                                 "w": round(wwf / W, 4), "h": round(hhf / H, 4), "c": round(cc, 2)})
+                lrec(offset, cx0, cy0, bw_px, bh_px, 0.95)
+                # ===== TRAQUEUR D'OBJET CSRT (robuste, type LiveTag) sur l'extrait 720p (léger -> aucun risque
+                # mémoire). Il SUIT réellement le joueur image par image. Repli = correspondance d'image. =====
+                # ÉCHAUFFEMENT (une seule fois) : la TOUTE PREMIÈRE init CSRT d'OpenCV « démarre à froid » et peut
+                # ne pas accrocher -> le 1er joueur ne suivait pas. On amorce le traqueur sur une image bidon une
+                # fois pour toutes, pour que le 1er vrai suivi soit déjà chaud.
+                if not globals().get("_CSRT_WARM"):
+                    try:
+                        _wt = make_tracker("csrt")
+                        if _wt is not None:
+                            _dum = _np.zeros((120, 120, 3), dtype="uint8"); _dum[40:90, 45:80] = 200
+                            _wt.init(_dum, (45, 40, 32, 48)); _wt.update(_dum)
+                    except Exception: pass
+                    globals()["_CSRT_WARM"] = True
+                trk = None
+                try: trk = make_tracker("csrt")
+                except Exception: trk = None
+                use_csrt = False
+                if trk is not None:
+                    try:
+                        trk.init(frame, (int(bx), int(by), int(bw0), int(bh0))); use_csrt = True
+                    except Exception as _ie:
+                        use_csrt = False; _tlog("LIGHT csrt init fail: " + str(_ie))
+                _tlog("LIGHT tracker=%s" % ("csrt" if use_csrt else "template"))
+                k = 0; nloss = 0
+                if use_csrt:
+                    while True:
+                        if JOBS.get(job_id, {}).get("cancel"): break
+                        ret, frame = cap.read()
+                        if not ret: break
+                        k += 1; t = offset + k / float(fps if fps else 25.0)
+                        if t1eff and t > t1eff + 1e-3: break
+                        ok = False; box = None
+                        try: ok, box = trk.update(frame)
+                        except Exception: ok = False
+                        if ok and box is not None and box[2] > 1 and box[3] > 1:
+                            # centre horizontal + PIED (bas) de la boîte suivie ; on réaffiche TA taille à ce pied.
+                            cxc = box[0] + box[2] / 2.0; foot_now = box[1] + box[3]
+                            disp_cy = foot_now - bh_px / 2.0
+                            lrec(t, cxc, disp_cy, bw_px, bh_px, 0.9); nloss = 0
+                        else:
+                            nloss += 1
+                            if nloss > 12: break
+                        if total: job["progress"] = min(98, int(k / float(total) * 100))
+                        job["msg"] = f"Suivi rapide… {job['progress']}%"
+                        if (k % 12) == 0: _time.sleep(0.001)
+                        if (k % 25) == 0: _tlog("LIGHT frame k=%d t=%.2f pts=%d" % (k, t, len(lpts)))
+                    # ===== 2e PASSE si la 1re est IMMOBILE : le tout 1er suivi CSRT peut rater « à froid » (boîte
+                    # figée sur la graine). On relance alors UNE fois sur un traqueur neuf — c'est exactement ce
+                    # qui se passe quand ta 2e correction marche. On le fait donc automatiquement. =====
+                    def _stat(pts):
+                        if not pts or len(pts) <= 12: return False
+                        _xs = [p["x"] for p in pts]; _ys = [p["y"] for p in pts]
+                        return (max(_xs) - min(_xs) < 0.012) and (max(_ys) - min(_ys) < 0.012)
+                    if _stat(lpts):
+                        _tlog("LIGHT 1re passe immobile -> 2e passe CSRT (traqueur chaud)")
+                        try:
+                            c2 = cv2.VideoCapture(seg_path) if (_proxy_ok and os.path.exists(seg_path)) else cv2.VideoCapture(src)
+                            if not (_proxy_ok and os.path.exists(seg_path)):
+                                try: c2.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(round(offset * fps))))
+                                except Exception: pass
+                            r2, f2 = c2.read(); t2 = make_tracker("csrt")
+                            if r2 and t2 is not None:
+                                t2.init(f2, (int(bx), int(by), int(bw0), int(bh0)))
+                                lpts2 = [lpts[0]]; k2 = 0; nl2 = 0
+                                while True:
+                                    if JOBS.get(job_id, {}).get("cancel"): break
+                                    rr, ff = c2.read()
+                                    if not rr: break
+                                    k2 += 1; tt = offset + k2 / float(fps if fps else 25.0)
+                                    if t1eff and tt > t1eff + 1e-3: break
+                                    okb = False; bb2 = None
+                                    try: okb, bb2 = t2.update(ff)
+                                    except Exception: okb = False
+                                    if okb and bb2 is not None and bb2[2] > 1 and bb2[3] > 1:
+                                        _cxc = bb2[0] + bb2[2] / 2.0; _foot = bb2[1] + bb2[3]; _dcy = _foot - bh_px / 2.0
+                                        lpts2.append({"t": round(tt, 3), "x": round(_cxc / W, 4), "y": round(min(1.0, (_dcy + bh_px / 2) / H), 4), "w": round(bw_px / W, 4), "h": round(bh_px / H, 4), "c": 0.9}); nl2 = 0
+                                    else:
+                                        nl2 += 1
+                                        if nl2 > 12: break
+                                    if (k2 % 12) == 0: _time.sleep(0.001)
+                                if (not _stat(lpts2)) and len(lpts2) > 12:
+                                    lpts = lpts2; k = k2; _tlog("LIGHT 2e passe OK pts=%d" % len(lpts))
+                            c2.release()
+                        except Exception as _re2:
+                            _tlog("LIGHT 2e passe échec: " + str(_re2))
+                else:
+                    # ---- REPLI : correspondance d'image (si CSRT indisponible sur ce build OpenCV) ----
+                    scale = 1.0
+                    if W > 640: scale = 640.0 / float(W)
+                    SW = max(2, int(round(W * scale))); SH = max(2, int(round(H * scale)))
+                    def _gray(im):
+                        g = im if (scale >= 0.999) else cv2.resize(im, (SW, SH))
+                        return cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
+                    bws = max(10, int(round(bw_px * scale))); bhs = max(12, int(round(bh_px * scale)))
+                    cxs = seedx * SW; cys = (seedy * SH) - bhs / 2.0
+                    g0 = _gray(frame)
+                    tx0 = _clampi(cxs - bws / 2.0, 0, SW - 2); ty0 = _clampi(cys - bhs / 2.0, 0, SH - 2)
+                    tx1 = _clampi(tx0 + bws, tx0 + 2, SW); ty1 = _clampi(ty0 + bhs, ty0 + 2, SH)
+                    tmpl = g0[ty0:ty1, tx0:tx1].copy(); tW = tx1 - tx0; tH = ty1 - ty0
+                    cx = (tx0 + tW / 2.0); cy = (ty0 + tH / 2.0); vx = 0.0; vy = 0.0
+                    while True:
+                        if JOBS.get(job_id, {}).get("cancel"): break
+                        ret, frame = cap.read()
+                        if not ret: break
+                        k += 1; t = offset + k / float(fps if fps else 25.0)
+                        if t1eff and t > t1eff + 1e-3: break
+                        locked = False
+                        try:
+                            g = _gray(frame); pcx = cx + vx; pcy = cy + vy
+                            mx = tW * 0.6 + abs(vx) * 1.4; my = tH * 0.6 + abs(vy) * 1.4
+                            rx0 = _clampi(pcx - tW / 2.0 - mx, 0, SW - 2); ry0 = _clampi(pcy - tH / 2.0 - my, 0, SH - 2)
+                            rx1 = _clampi(pcx - tW / 2.0 + tW + mx, rx0 + tW + 1, SW); ry1 = _clampi(pcy - tH / 2.0 + tH + my, ry0 + tH + 1, SH)
+                            region = g[ry0:ry1, rx0:rx1]
+                            if region.shape[0] >= tH + 1 and region.shape[1] >= tW + 1:
+                                res = cv2.matchTemplate(region, tmpl, cv2.TM_CCOEFF_NORMED); _, mxv, _, mxl = cv2.minMaxLoc(res)
+                                if mxv >= 0.26:
+                                    ncx = rx0 + mxl[0] + tW / 2.0; ncy = ry0 + mxl[1] + tH / 2.0
+                                    vx = 0.6 * vx + 0.4 * (ncx - cx); vy = 0.6 * vy + 0.4 * (ncy - cy)
+                                    cx = ncx; cy = ncy; nloss = 0; locked = True
+                                    lrec(t, cx / scale, cy / scale, bw_px, bh_px, min(0.99, max(0.3, mxv)))
+                        except Exception:
+                            locked = False
+                        if not locked:
+                            nloss += 1; cx = _clampf(cx + vx, 0, SW); cy = _clampf(cy + vy, 0, SH); vx *= 0.7; vy *= 0.7
+                            lrec(t, cx / scale, cy / scale, bw_px, bh_px, 0.22)
+                        if nloss > 18: break
+                        if total: job["progress"] = min(98, int(k / float(total) * 100))
+                        if (k % 12) == 0: _time.sleep(0.001)
+                        if (k % 25) == 0: _tlog("LIGHT frame k=%d t=%.2f pts=%d" % (k, t, len(lpts)))
+                cap.release()
+                # DIAGNOSTIC : si le traqueur est resté quasi IMMOBILE sur tout le segment (boîte "collée" à la
+                # graine alors qu'il devrait suivre), on le note -> si ça se reproduit, on branchera un repli.
+                if len(lpts) > 12:
+                    _xs = [p["x"] for p in lpts]; _ys = [p["y"] for p in lpts]
+                    if (max(_xs) - min(_xs) < 0.012) and (max(_ys) - min(_ys) < 0.012):
+                        _tlog("LIGHT ATTENTION: suivi quasi immobile (dx=%.3f dy=%.3f, tracker=%s)" % (max(_xs)-min(_xs), max(_ys)-min(_ys), ("csrt" if use_csrt else "template")))
+                lpts.sort(key=lambda p: p["t"])
+                out = {"fps": fps, "width": W, "height": H, "tracks": [{"id": 0, "n": len(lpts), "color": "#00e08f", "points": lpts}]}
+                (job["dir"] / "tracks.json").write_text(json.dumps(out), encoding="utf-8")
+                job["progress"] = 100; job["state"] = "done"; job["msg"] = f"Joueur suivi ✅ ({len(lpts)} positions, rapide)"
+                _tlog("LIGHT done k=%d pts=%d" % (k, len(lpts)))
+                return
+            except Exception as _le:
+                job["state"] = "error"; job["msg"] = "Erreur suivi rapide : " + str(_le); job["trace"] = traceback.format_exc(); print(job["trace"]); _tlog("LIGHT EXCEPTION: " + str(_le)); return
+
         det_model = get_player_model()
 
         def detect_boxes(im, t, absfi=None):
@@ -1299,7 +1604,8 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
                 raw = _DET_CACHE.get(ckey)
             if raw is None:
                 _cf = min(float(conf), 0.18)
-                r = det_model.predict(im, conf=_cf, classes=getattr(det_model, "_pcls", [0]), verbose=False, **_pred_kw(det_model, imgsz, device))[0]
+                with _INFER_LOCK:
+                    r = det_model.predict(im, conf=_cf, classes=getattr(det_model, "_pcls", [0]), verbose=False, **_pred_kw(det_model, imgsz, device))[0]; _gpu_sync()
                 raw = r.boxes.xywh.cpu().tolist() if (r.boxes is not None) else []
                 if ckey is not None:
                     if len(_DET_CACHE) > 8000:
@@ -1628,7 +1934,8 @@ async def track1(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Form(
                  x: float = Form(0.5), y: float = Form(0.5),
                  model: str = Form("yolo11s.pt"), imgsz: int = Form(640), conf: float = Form(0.25),
                  poly: str = Form(""), cals: str = Form(""), tracker: str = Form("csrt"),
-                 bw: float = Form(0.0), bh: float = Form(0.0), t0min: float = Form(-1.0)):
+                 bw: float = Form(0.0), bh: float = Form(0.0), t0min: float = Form(-1.0),
+                 light: int = Form(0)):
     vp = VKEYS.get(vkey)
     if not vp or not os.path.exists(vp):
         return JSONResponse({"error": "video_absente", "need_file": True}, status_code=409)
@@ -1637,7 +1944,8 @@ async def track1(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Form(
     tk = "nano" if str(tracker).lower().startswith("nano") else "csrt"
     job_id = uuid.uuid4().hex[:10]; d = WORK / job_id; d.mkdir(parents=True, exist_ok=True)
     JOBS[job_id] = {"state": "queued", "progress": 0, "msg": "En file…", "dir": d, "video": vp,
-                    "name": vkey, "fps": 0, "w": 0, "h": 0, "frames": 0, "dur": 0, "cancel": False}
+                    "name": vkey, "fps": 0, "w": 0, "h": 0, "frames": 0, "dur": 0, "cancel": False,
+                    "light": bool(int(light))}
     _t0min = None if (t0min is None or float(t0min) < 0) else float(t0min)
     threading.Thread(target=run_track1, args=(job_id, vp, float(t0), float(t1), float(x), float(y),
                      model, int(imgsz), float(conf), pg, cl, tk, float(bw), float(bh), _t0min), daemon=True).start()
@@ -1649,15 +1957,34 @@ def detect(vkey: str = Form(...), t: float = Form(0.0), model: str = Form("yolo1
     vp = VKEYS.get(vkey)
     if not vp or not os.path.exists(vp):
         return JSONResponse({"error": "video_absente", "need_file": True}, status_code=409)
+    _tlog("DETECT start t=%.2f imgsz=%s" % (t, imgsz))
     try:
         import cv2
         cl = _parse_cals(cals)
         pg = _poly_at(cl, t) if cl else _parse_poly(poly)
-        cap = cv2.VideoCapture(vp); fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(t * fps))); ret, im = cap.read(); cap.release()
-        if not ret: return {"boxes": []}
-        _pm = get_player_model(); r = _pm.predict(im, conf=conf, classes=getattr(_pm, "_pcls", [0]), verbose=False, **_pred_kw(_pm, imgsz, pick_device()))[0]
+        # LOW-MEM (anti-OOM) : on NE décode PAS la 4K dans OpenCV. On extrait une image réduite (<=720p, GPU)
+        # et on détecte DESSUS. Les coordonnées renvoyées sont normalisées -> identiques à la pleine résolution.
+        im = None; W = 0; H = 0
+        try:
+            _tmp = str(BASE / ("_detframe_%d.jpg" % (int(t * 1000) % 1000000)))
+            if _extract_lowres_frame(vp, t, _tmp):
+                im = cv2.imread(_tmp)
+                try: os.remove(_tmp)
+                except Exception: pass
+                if im is not None: H, W = int(im.shape[0]), int(im.shape[1])
+        except Exception:
+            im = None
+        if im is None:
+            cap = cv2.VideoCapture(vp); fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(t * fps))); ret, im = cap.read(); cap.release()
+            if not ret: return {"boxes": []}
+        _tlog("DETECT frame ok W=%s H=%s -> chargement modèle…" % (W, H))
+        with _INFER_LOCK:
+            _pm = get_player_model()
+            _tlog("DETECT modèle ok -> prédiction…")
+            r = _pm.predict(im, conf=conf, classes=getattr(_pm, "_pcls", [0]), verbose=False, **_pred_kw(_pm, imgsz, pick_device()))[0]; _gpu_sync()
+        _tlog("DETECT prédiction ok")
         rows = []
         if r.boxes is not None:
             xywh = r.boxes.xywh.cpu().tolist()
@@ -2277,7 +2604,7 @@ def _probe_vinfo(path):
     for probe in probes:
         try:
             out = subprocess.run([probe, "-v", "error", "-select_streams", "v:0",
-                                  "-show_entries", "stream=codec_name,pix_fmt,color_transfer,width,height",
+                                  "-show_entries", "stream=codec_name,pix_fmt,color_transfer,width,height,r_frame_rate,avg_frame_rate",
                                   "-of", "default=noprint_wrappers=1", path],
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=60).stdout
             d = {}
@@ -2318,10 +2645,13 @@ def _vinfo_needs_h264(info):
     pix   = (info.get("pix_fmt") or "").lower()
     trc   = (info.get("color_transfer") or "").lower()
     hdr   = trc in _HDR_TRC
-    # L'app (Electron + flag HEVC) lit nativement H.264/VP8/VP9/AV1 ET HEVC (8 ou 10 bits) en SDR.
-    # Le SEUL cas qui plante en noir : une étiquette HDR (HLG / HDR10). Donc on n'intervient que pour
-    # l'HDR, ou pour un codec vraiment exotique (ProRes, mpeg2…) qui, lui, demande un ré-encodage.
-    playable = codec in ("h264", "vp8", "vp9", "av1", "hevc", "h265")
+    # H.264/VP8/VP9/AV1 en SDR : lisibles nativement partout -> rien à faire.
+    # HEVC : Chromium le DÉCODE mais l'affiche souvent NOIR dans la page (bug d'overlay matériel), même en
+    # SDR. Il faut donc TOUJOURS le prendre en charge (HDR -> /sdr instantané ; SDR -> proxy H.264). Sinon un
+    # HEVC SDR (ex. vidéo de formation, GoPro…) reste noir alors que le son marche.
+    if codec in ("hevc", "h265"):
+        return True
+    playable = codec in ("h264", "vp8", "vp9", "av1")
     if playable and not hdr:
         return False
     return True
@@ -2814,15 +3144,23 @@ async def import_convert(path: str = Form(...), pid: str = Form("")):
     2) Repli : transcodage H.264 en cache. Progression via /calib_progress?pid=…"""
     if not path or not os.path.exists(path):
         return JSONResponse({"ok": False, "error": "introuvable"}, status_code=404)
-    # --- Voie instantanée : on ne réécrit que l'étiquette HDR->SDR dans le 'moov' (quelques Ko) ---
+    # HDR (HLG/HDR10) : l'écran noir vient de l'ÉTIQUETTE couleur -> voie INSTANTANÉE (patch moov, 0 recopie).
+    # SDR : si c'est noir, c'est le bug d'overlay HEVC de Chromium -> le patch couleur n'y change rien,
+    # il FAUT un vrai proxy H.264. On ne tente donc /sdr QUE pour l'HDR.
     try:
-        tok = await asyncio.to_thread(_sdr_register, path)
+        _info = await asyncio.to_thread(_probe_vinfo, path)
+        _hdr = (_info.get("color_transfer") or "").lower() in _HDR_TRC
     except Exception:
-        tok = None
-    if tok:
-        _cp(pid, 100, "prête")
-        return {"ok": True, "url": "/sdr/" + tok, "instant": True}
-    # --- Repli (codecs exotiques, scaling list, etc.) : transcodage classique ---
+        _hdr = False
+    if _hdr:
+        try:
+            tok = await asyncio.to_thread(_sdr_register, path)
+        except Exception:
+            tok = None
+        if tok:
+            _cp(pid, 100, "prête")
+            return {"ok": True, "url": "/sdr/" + tok, "instant": True}
+    # --- SDR HEVC / codecs exotiques : proxy H.264 (1080p, GPU, mis en cache et réutilisé) ---
     out = await asyncio.to_thread(_convert_to_h264, path, pid)
     if not out:
         return JSONResponse({"ok": False, "error": "conversion impossible"}, status_code=500)
@@ -3321,12 +3659,13 @@ async def render_finish(sid: str = Form(...), fps: int = Form(24), fmt: str = Fo
 # depuis la source (un seul décodage), puis on COLLE les pièces (concat). Repli auto sur le moteur image
 # par image si le moindre souci. Les images des gels viennent du navigateur (identiques à l'ancien rendu).
 _TURBO_ENCODERS = [
-    # Mode « temps réel » de l'encodeur Apple : plus rapide, image identique à l'œil à 12 Mb/s.
-    ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-realtime", "1", "-pix_fmt", "yuv420p"],
-    # Repli si -realtime n'est pas reconnu par ce ffmpeg -> videotoolbox normal (= vitesse actuelle, aucun risque).
-    ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-pix_fmt", "yuv420p"],
-    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"],
+    # Mode « temps réel » de l'encodeur Apple : le plus rapide. 8 Mb/s = identique à l'œil en 1080p sur
+    # téléphone (réels Insta/TikTok), un peu plus rapide à encoder qu'à 12.
+    ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-realtime", "1", "-pix_fmt", "yuv420p"],
+    # Repli si -realtime n'est pas reconnu par ce ffmpeg -> videotoolbox normal.
+    ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-pix_fmt", "yuv420p"],
     ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p"],
+    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"],
 ]
 
 def _turbo_scale_vf(w, h):
@@ -3358,10 +3697,26 @@ def _turbo_piece(ff, run, d, k, vc, vf, fps, vkey):
         if not (src and os.path.exists(src)):
             return None, "source match absente (%s)" % _vk
         ts0 = float(run.get("ts0", 0.0))
-        cmd = [ff, "-y", "-ss", ("%.4f" % max(0.0, ts0)), "-i", src,
-               "-t", ("%.4f" % (n / float(fps) + 0.20)),
-               "-vf", (vf + (",fps=%d" % fps))] + vc + \
-              ["-r", str(fps), "-frames:v", str(n), "-vsync", "cfr", "-an", out]
+        _tail = ["-ss", ("%.4f" % max(0.0, ts0)), "-i", src,
+                 "-t", ("%.4f" % (n / float(fps) + 0.20)),
+                 "-vf", (vf + (",fps=%d" % fps))] + vc + \
+                ["-r", str(fps), "-frames:v", str(n), "-vsync", "cfr", "-an", out]
+        # DÉCODAGE GPU (VideoToolbox) de la source HEVC 4K : c'est l'étape la plus lente du turbo.
+        # Repli automatique sur décodage CPU plus bas si le GPU échoue.
+        cmd = [ff, "-y", "-hwaccel", "videotoolbox"] + _tail
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=240)
+        except Exception:
+            p = None
+        if not (os.path.exists(out) and os.path.getsize(out) > 0):
+            cmd = [ff, "-y"] + _tail   # repli : décodage logiciel
+            try:
+                p = subprocess.run(cmd, capture_output=True, timeout=240)
+            except Exception as e:
+                return None, str(e)
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out, n
+        return None, (p.stderr.decode("utf-8", "ignore")[-300:] if (p and p.stderr) else "pièce vide")
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=240)
     except Exception as e:
@@ -4174,6 +4529,57 @@ async def snap_manual_img(file: UploadFile = File(...), corners: str = Form(...)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+@app.get("/preview_frame")
+def preview_frame(vkey: str, t: float = 0.0, w: int = 0, h: int = 0):
+    """APERÇU MONTAGE : extrait UNE SEULE image à l'instant t (ffmpeg, décodage GPU) et la renvoie en JPEG.
+    Un canvas ne sait pas dessiner une vidéo HEVC -> on lui fournit une image déjà décodée. Instantané,
+    aucun proxy à construire. Utilisé seulement pour l'aperçu ; ne touche NI la calibration NI la source."""
+    import tempfile
+    vp = _resolve_vid(vkey) or VKEYS.get(vkey)
+    if not (vp and os.path.exists(vp)):
+        return JSONResponse({"error": "video_absente", "need_file": True}, status_code=409)
+    ff = _ffexe()
+    out = os.path.join(tempfile.gettempdir(), "mlzpv_%s.jpg" % uuid.uuid4().hex)
+    vf = ("scale=%d:%d:force_original_aspect_ratio=decrease" % (int(w), int(h))) if (w and h) else "scale=1280:-2"
+    pre = [ff, "-y", "-hwaccel", "videotoolbox", "-ss", ("%.3f" % max(0.0, float(t))), "-i", vp,
+           "-frames:v", "1", "-vf", vf, "-q:v", "3", out]
+    try:
+        _run_cancelable(pre, timeout=60)
+    except Exception:
+        pass
+    if not (os.path.exists(out) and os.path.getsize(out) > 0):
+        sw = [ff, "-y", "-ss", ("%.3f" % max(0.0, float(t))), "-i", vp,
+              "-frames:v", "1", "-vf", vf, "-q:v", "3", out]
+        try:
+            _run_cancelable(sw, timeout=60)
+        except Exception:
+            pass
+    if not (os.path.exists(out) and os.path.getsize(out) > 0):
+        return JSONResponse({"error": "frame"}, status_code=500)
+    return FileResponse(out, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+@app.get("/clip_audio")
+def clip_audio(vkey: str, t0: float = 0.0, dur: float = 0.0):
+    """Extrait SEULEMENT le segment audio [t0, t0+dur] de la source (WAV). Évite de décoder toute la piste
+    son du match (45 min) pour un clip de 10 s -> génération du montage bien plus rapide. Si la source n'a
+    pas d'audio, renvoie 204 (l'app ignore)."""
+    import tempfile
+    vp = _resolve_vid(vkey) or VKEYS.get(vkey)
+    if not (vp and os.path.exists(vp)):
+        return JSONResponse({"error": "video_absente"}, status_code=409)
+    ff = _ffexe()
+    out = os.path.join(tempfile.gettempdir(), "mlzaud_%s.wav" % uuid.uuid4().hex)
+    d = max(0.05, float(dur)) if dur else 600.0
+    cmd = [ff, "-y", "-ss", ("%.3f" % max(0.0, float(t0))), "-i", vp, "-t", ("%.3f" % d),
+           "-vn", "-ac", "2", "-ar", "44100", "-f", "wav", out]
+    try:
+        _run_cancelable(cmd, timeout=120)
+    except Exception:
+        pass
+    if not (os.path.exists(out) and os.path.getsize(out) > 1024):
+        return PlainTextResponse("", status_code=204)
+    return FileResponse(out, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+
 @app.post("/calibrate_clip")
 def calibrate_clip(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Form(0.0),
                    step: float = Form(0.6), minp: int = Form(15)):
@@ -4226,7 +4632,8 @@ def ai_debug(vkey: str = Form(...), t: float = Form(0.0)):
         _kw = dict(conf=0.15, imgsz=getattr(m, "_imgsz", 1280), verbose=False)
         if not getattr(m, "_coreml", False):
             _kw["device"] = pick_device()
-        r = m.predict(im, **_kw)[0]
+        with _INFER_LOCK:
+            r = m.predict(im, **_kw)[0]; _gpu_sync()
         kp = getattr(r, "keypoints", None)
         if kp is None or kp.xy is None or len(kp.xy) == 0:
             return {"instances": 0}
