@@ -45,8 +45,10 @@ WORK = _pick_work_dir()
 WORK.mkdir(parents=True, exist_ok=True)
 # Version du MOTEUR : renvoyée à la fin du rendu pour vérifier que le serveur qui tourne est bien à jour
 # (dessins en parallèle). Si le popup n'affiche PAS cette version, c'est qu'un ancien moteur est resté actif.
-SERVER_VERSION = "s20-nocap"
+SERVER_VERSION = "s59-dessin-joueur-choisi"
 _LAST_ENC = "?"   # dernier encodeur vidéo utilisé (h264_videotoolbox = GPU, libx264 = CPU)
+_LAST_WM = "?"    # dernier état filigrane : on=incrusté · none=aucun wm.png · fail=échec (vidéo d'origine gardée)
+_LAST_WMERR = ""  # dernière erreur ffmpeg du filigrane (diagnostic)
 
 # JOURNAL DE DIAGNOSTIC DU SUIVI (pour voir OÙ ça casse même si le moteur tombe). Écrit + vidé (flush) à
 # chaque étape. Lisible via /track_diag ou le script DIAGNOSTIC-SUIVI.command.
@@ -111,6 +113,47 @@ def _prune_video_cache(max_gb=20.0):
                 pass
     except Exception as e:
         try: print("prune cache err:", e, flush=True)
+        except Exception: pass
+
+def _prune_rec_cache(max_gb=3.0):
+    """PLAFOND du dossier _rec (façon LiveTag). Dans _rec vivent surtout les VIDÉOS DE MONTAGE rendues (une par
+    « Rendre »), qui s'accumulent au fil des générations. On garde _rec sous une taille max en retirant les plus
+    ANCIENNES (jamais celles touchées depuis <30 min -> jamais le rendu en cours). La vidéo du DIRECT, elle,
+    n'est PLUS copiée ici (Phase C : fichier référencé à son emplacement d'origine)."""
+    try:
+        rec = globals().get("REC")
+        if not rec:
+            return
+        now = time.time(); files = []
+        for f in rec.glob("*"):
+            try:
+                if not f.is_file():
+                    continue
+                st = f.stat()
+                if f.name.endswith(".part") and (now - st.st_mtime) > 7200:
+                    try: f.unlink()
+                    except Exception: pass
+                    continue
+                files.append((f, st.st_size, st.st_mtime))
+            except Exception:
+                pass
+        total = sum(s for _, s, _ in files)
+        cap = max_gb * (1024 ** 3)
+        if total <= cap:
+            return
+        files.sort(key=lambda x: x[2])   # du plus ancien au plus récent
+        for f, sz, mt in files:
+            if total <= cap:
+                break
+            if (now - mt) < 1800:   # touché il y a < 30 min -> peut-être le montage en cours, on garde
+                continue
+            try:
+                f.unlink(); total -= sz
+                print("Cache _rec : ancien montage supprimé (plafond) ->", f.name, flush=True)
+            except Exception:
+                pass
+    except Exception as e:
+        try: print("prune rec err:", e, flush=True)
         except Exception: pass
 
 # ===== LICENCE / ACTIVATION (additif — INACTIF tant que LICENSE_SERVER_URL est vide) =====
@@ -312,6 +355,29 @@ _PLAYER_MODEL = {}
 # lancées en même temps (ex. deux détections concurrentes) corrompent le tampon de commandes Metal et TUENT
 # le moteur. Ce verrou sérialise toutes les inférences -> une seule à la fois -> plus de crash GPU.
 _INFER_LOCK = threading.Lock()
+# PENDANT UN SUIVI IA : compteur de suivis/calibrages en cours. Tant qu'il est > 0, on INTERDIT tout job
+# ffmpeg GPU (VideoToolbox) en arrière-plan (proxys de montage _seekI3, conversions…) : deux clients Metal
+# simultanés (modèle IA + encodeur vidéo GPU) = « command encoder already encoding » -> moteur tué. Les jobs
+# ffmpeg basculent alors en CPU (libx264) le temps du suivi. _gpu_busy() est lu par les constructeurs de proxy.
+_SUIVI_ACTIVE = 0
+_SUIVI_LOCK = threading.Lock()
+# UN SEUL JOB IA À LA FOIS : la calibration (calibrate_smart) et le suivi joueur (run_track1) sont des jobs
+# GPU distincts sur des threads distincts. Sur Mac Apple, les faire tourner EN MÊME TEMPS (même avec les
+# prédictions verrouillées) corrompt le tampon de commandes Metal (chargement d'un modèle pendant l'inférence
+# d'un autre…) -> « setCurrentCommandEncoder » -> moteur tué. Ce mutex garantit qu'un seul job IA s'exécute à
+# la fois : le second ATTEND la fin du premier. Fini les deux utilisateurs GPU simultanés.
+_AI_JOB_LOCK = threading.Lock()
+def _suivi_enter():
+    global _SUIVI_ACTIVE
+    _AI_JOB_LOCK.acquire()   # bloque tant qu'un autre job IA tourne -> exécution strictement séquentielle
+    with _SUIVI_LOCK: _SUIVI_ACTIVE += 1
+def _suivi_exit():
+    global _SUIVI_ACTIVE
+    with _SUIVI_LOCK: _SUIVI_ACTIVE = max(0, _SUIVI_ACTIVE - 1)
+    try: _AI_JOB_LOCK.release()
+    except Exception: pass
+def _gpu_busy():
+    with _SUIVI_LOCK: return _SUIVI_ACTIVE > 0
 def _gpu_sync():
     """Force le GPU Apple à TERMINER le calcul en cours avant de rendre la main. Sans ça, une prédiction peut
     rendre la main pendant que le GPU travaille encore -> la suivante démarre dessus -> « command encoder
@@ -556,6 +622,16 @@ def get_reid():
             print("ReID indisponible (repli couleur seule) :", e); _REID["m"] = None
     return _REID.get("m")
 def reid_embed(im, boxes):
+    """s57 : TOUT le ReID passe sous le verrou GPU (_INFER_LOCK) + synchro Metal. Avant, l'empreinte OSNet
+    tournait sur le GPU EN MÊME TEMPS qu'une détection (/detect demandée par l'affichage des rectangles)
+    -> « command encoder is already encoding » -> le moteur était TUÉ en plein suivi."""
+    with _INFER_LOCK:
+        try:
+            return _reid_embed_unlocked(im, boxes)
+        finally:
+            _gpu_sync()
+
+def _reid_embed_unlocked(im, boxes):
     """boxes = [(cx,cy,w,h), ...] en pixels. Renvoie une liste de vecteurs L2-normalisés
     (cosinus = produit scalaire) ou None par boîte si extraction impossible."""
     out = [None] * len(boxes)
@@ -753,8 +829,20 @@ def run_tracking(job_id, video_path, model_name, conf, min_len, vid_stride, t0s,
             gen = model.track(source=src, stream=True, persist=True,
                               conf=conf, iou=0.5, classes=getattr(model, "_pcls", [0]), tracker=tracker_name,
                               device=device, vid_stride=vid_stride, imgsz=imgsz, verbose=False)
+            # s57 : chaque image est calculée SOUS le verrou GPU (une détection demandée par l'affichage peut
+            # s'intercaler ENTRE deux images, jamais PENDANT) -> plus de collision Metal qui tue le moteur.
+            def _locked_iter(g):
+                it = iter(g)
+                while True:
+                    with _INFER_LOCK:
+                        try:
+                            r_ = next(it)
+                        except StopIteration:
+                            return
+                        _gpu_sync()
+                    yield r_
             fi = 0
-            for r in gen:
+            for r in _locked_iter(gen):
                 if JOBS.get(job_id, {}).get("cancel"):
                     break
                 frame_no = fi * vid_stride
@@ -1171,10 +1259,16 @@ def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
         # already encoding » -> moteur tué pendant le recalage des lignes. On force une seule à la fois, finie.
         with _INFER_LOCK:
             with torch.no_grad():
-                hm = P["m"](t); hml = P["ml"](t)
-            _gpu_sync()
-        kp = P["c2d"](P["kpf"](hm[:, :-1, :, :]), threshold=kp_th)
-        ln = P["c2d"](P["kpf_l"](hml[:, :-1, :, :]), threshold=line_th)
+                # SYNCHRO ENTRE LES DEUX PASSES : on FERME l'encodeur Metal de la 1re passe (modèle points-clés)
+                # AVANT de lancer la 2e (modèle lignes). Sans ce sync intermédiaire, sur Mac Apple 8 Go sous
+                # pression mémoire, la 2e passe démarrait pendant que la 1re encodait encore -> « command encoder
+                # already encoding » -> moteur tué. Un sync après CHAQUE passe = plus aucun chevauchement Metal.
+                hm = P["m"](t); _gpu_sync()
+                hml = P["ml"](t); _gpu_sync()
+                # post-traitement des heatmaps AUSSI sur le GPU -> on le fait dans le verrou, puis on resynchronise.
+                kp = P["c2d"](P["kpf"](hm[:, :-1, :, :]), threshold=kp_th)
+                ln = P["c2d"](P["kpf_l"](hml[:, :-1, :, :]), threshold=line_th)
+                _gpu_sync()
         # (Pas de filtrage par masque pelouse ici : il supprimait des détections valides et affaiblissait
         #  la reconnaissance. La confusion ligne/panneau est gérée en aval par la cohérence temporelle
         #  des ancres, qui n'enlève aucune détection.)
@@ -1237,9 +1331,13 @@ def pnl_reproj_err(im, Hf):
         if t.shape[-1] != 960:
             t = T.Resize((540, 960))(t)
         t = t.to(P["dev"]); _, _, h, w = t.shape
-        with torch.no_grad():
-            hm = P["m"](t)
-        kpc = P["kpf"](hm[:, :-1, :, :])[0].cpu().numpy()  # (C,1,3) [x,y,score] px réseau
+        # MÊME PROTECTION QUE L'INFÉRENCE PRINCIPALE : verrou + synchro GPU (cette passe n'était ni sérialisée
+        # ni synchronisée -> pouvait chevaucher une autre opération Metal -> « command encoder already encoding »).
+        with _INFER_LOCK:
+            with torch.no_grad():
+                hm = P["m"](t); _gpu_sync()
+                _kpc_t = P["kpf"](hm[:, :-1, :, :]); _gpu_sync()
+        kpc = _kpc_t[0].cpu().numpy()  # (C,1,3) [x,y,score] px réseau
         kw = P["kw"]; errs = []
         for k in range(min(len(kw), kpc.shape[0])):
             if float(kpc[k, 0, 2]) < 0.5:
@@ -1471,30 +1569,121 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
                 _tlog("LIGHT tracker=%s" % ("csrt" if use_csrt else "template"))
                 k = 0; nloss = 0
                 if use_csrt:
-                    while True:
-                        if JOBS.get(job_id, {}).get("cancel"): break
-                        ret, frame = cap.read()
-                        if not ret: break
-                        k += 1; t = offset + k / float(fps if fps else 25.0)
-                        if t1eff and t > t1eff + 1e-3: break
-                        ok = False; box = None
-                        try: ok, box = trk.update(frame)
-                        except Exception: ok = False
-                        if ok and box is not None and box[2] > 1 and box[3] > 1:
-                            # centre horizontal + PIED (bas) de la boîte suivie ; on réaffiche TA taille à ce pied.
-                            cxc = box[0] + box[2] / 2.0; foot_now = box[1] + box[3]
-                            disp_cy = foot_now - bh_px / 2.0
-                            lrec(t, cxc, disp_cy, bw_px, bh_px, 0.9); nloss = 0
-                        else:
-                            nloss += 1
-                            if nloss > 12: break
-                        if total: job["progress"] = min(98, int(k / float(total) * 100))
-                        job["msg"] = f"Suivi rapide… {job['progress']}%"
-                        if (k % 12) == 0: _time.sleep(0.001)
-                        if (k % 25) == 0: _tlog("LIGHT frame k=%d t=%.2f pts=%d" % (k, t, len(lpts)))
+                    # ===== s57 : PASSE CSRT ROBUSTE (anti-trous) =====
+                    # Avant : au 1er décrochage du traqueur, plus aucun point n'était enregistré et, après 12 images
+                    # perdues (~0,5 s), le suivi s'ARRÊTAIT -> le dessin disparaissait pour le reste du clip.
+                    # Maintenant : (1) on ré-accroche le joueur par son APPARENCE (gabarit pris dans TA boîte) autour
+                    # de la position prédite et on relance le traqueur ; (2) pendant la recherche on enregistre la
+                    # position PRÉDITE (le dessin reste sur le joueur) ; (3) à la ré-accroche, le pont prédit est
+                    # recalé en ligne droite sur la vraie position. On n'abandonne qu'après ~3 s sans le retrouver.
+                    _fpsL = float(fps if fps else 25.0)
+                    def _rec(tt, cxp, footp, cc):
+                        return {"t": round(tt, 3), "x": round(_clampf(cxp, 0, W) / W, 4), "y": round(min(1.0, max(0.0, footp) / H), 4),
+                                "w": round(bw_px / W, 4), "h": round(bh_px / H, 4), "c": round(cc, 2)}
+                    def _bridge(pts, idxs, t_new, cx_new, foot_new):
+                        i0 = idxs[0] - 1
+                        if i0 < 0: return
+                        A = pts[i0]; tA = A["t"]; span = max(1e-3, t_new - tA)
+                        xn = _clampf(cx_new, 0, W) / W; yn = min(1.0, max(0.0, foot_new) / H)
+                        for i in idxs:
+                            f = (pts[i]["t"] - tA) / span
+                            pts[i]["x"] = round(A["x"] + (xn - A["x"]) * f, 4); pts[i]["y"] = round(A["y"] + (yn - A["y"]) * f, 4); pts[i]["c"] = 0.5
+                    def _crop_g(g, x, y, w, h):
+                        x0 = _clampi(x, 0, g.shape[1] - 2); y0 = _clampi(y, 0, g.shape[0] - 2)
+                        x1 = _clampi(x + w, x0 + 2, g.shape[1]); y1 = _clampi(y + h, y0 + 2, g.shape[0])
+                        return g[y0:y1, x0:x1].copy()
+                    def _jersey(img, cxp, footp, ww, hh):
+                        # couleur du MAILLOT (haut du corps, pelouse exclue) -> refuse un obstacle / un adversaire
+                        try:
+                            x0 = _clampi(cxp - ww * 0.35, 0, img.shape[1] - 2); x1 = _clampi(cxp + ww * 0.35, x0 + 2, img.shape[1])
+                            y0 = _clampi(footp - hh * 0.92, 0, img.shape[0] - 2); y1 = _clampi(footp - hh * 0.45, y0 + 2, img.shape[0])
+                            hsv = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+                            msk = cv2.bitwise_not(cv2.inRange(hsv, (35, 40, 40), (85, 255, 255)))
+                            hh_ = cv2.calcHist([hsv], [0, 1], msk, [18, 8], [0, 180, 0, 256])
+                            if hh_.sum() < 1: return None
+                            cv2.normalize(hh_, hh_, 0, 1, cv2.NORM_MINMAX); return hh_
+                        except Exception:
+                            return None
+                    def _jsim(a, b):
+                        if a is None or b is None: return 0.5
+                        return max(0.0, min(1.0, (cv2.compareHist(a, b, cv2.HISTCMP_CORREL) + 1.0) / 2.0))
+                    def _csrt_pass(capo, frame0, tr):
+                        pts = [dict(lpts[0])]
+                        tw_ = max(4, int(bw0)); th_ = max(6, int(bh0))
+                        # gabarits en COULEUR (un obstacle gris ne ressemble plus à un joueur en maillot)
+                        tmpl_seed = _crop_g(frame0, int(bx), int(by), tw_, th_); tmpl_last = tmpl_seed
+                        jer_seed = _jersey(frame0, bx + bw0 / 2.0, by + bh0, bw0, bh0)
+                        lcx = bx + bw0 / 2.0; lfoot = by + bh0; vx = 0.0; vy = 0.0
+                        nl = 0; kk = 0; ngood = 0; pred_idx = []
+                        MAXPRED = int(round(_fpsL * 1.2)); MAXLOSS = int(round(_fpsL * 3.0)); KEEP = int(round(_fpsL * 0.5))
+                        while True:
+                            if JOBS.get(job_id, {}).get("cancel"): break
+                            rr, ff = capo.read()
+                            if not rr: break
+                            kk += 1; tt = offset + kk / _fpsL
+                            if t1eff and tt > t1eff + 1e-3: break
+                            okb = False; bb = None
+                            if tr is not None:
+                                try: okb, bb = tr.update(ff)
+                                except Exception: okb = False
+                            if okb and bb is not None and bb[2] > 1 and bb[3] > 1:
+                                ncx = bb[0] + bb[2] / 2.0; nfoot = bb[1] + bb[3]
+                                if pred_idx: _bridge(pts, pred_idx, tt, ncx, nfoot)
+                                pred_idx = []
+                                vx = 0.7 * vx + 0.3 * (ncx - lcx) / float(nl + 1); vy = 0.7 * vy + 0.3 * (nfoot - lfoot) / float(nl + 1)
+                                lcx, lfoot = ncx, nfoot; nl = 0; ngood += 1
+                                pts.append(_rec(tt, ncx, nfoot, 0.9))
+                                if (ngood % 15) == 0:
+                                    try: tmpl_last = _crop_g(ff, int(ncx - tw_ / 2.0), int(nfoot - th_), tw_, th_)
+                                    except Exception: pass
+                            else:
+                                nl += 1
+                                pcx = lcx + vx * nl * 0.85; pfoot = lfoot + vy * nl * 0.85
+                                best = -1.0; bl = None
+                                try:
+                                    g = ff
+                                    mx = tw_ * 1.5 + abs(vx) * nl; my = th_ * 0.8 + abs(vy) * nl
+                                    rx0 = _clampi(pcx - tw_ / 2.0 - mx, 0, g.shape[1] - 2); ry0 = _clampi(pfoot - th_ - my, 0, g.shape[0] - 2)
+                                    rx1 = _clampi(pcx + tw_ / 2.0 + mx, rx0 + tw_ + 1, g.shape[1]); ry1 = _clampi(pfoot + my, ry0 + th_ + 1, g.shape[0])
+                                    region = g[ry0:ry1, rx0:rx1]
+                                    for tp in (tmpl_last, tmpl_seed):
+                                        if tp is None or region.shape[0] <= tp.shape[0] or region.shape[1] <= tp.shape[1]: continue
+                                        res = cv2.matchTemplate(region, tp, cv2.TM_CCOEFF_NORMED); _, mval, _, mloc = cv2.minMaxLoc(res)
+                                        if mval > best: best = mval; bl = (rx0 + mloc[0], ry0 + mloc[1], tp.shape[1], tp.shape[0])
+                                except Exception:
+                                    best = -1.0
+                                ok_re = False
+                                if best >= 0.60 and bl is not None:
+                                    fx0, fy0, tpw, tph = bl
+                                    ncx = fx0 + tpw / 2.0; nfoot = fy0 + tph
+                                    # même MAILLOT exigé (sinon obstacle / joueur adverse) -> sinon on continue à prédire
+                                    ok_re = (_jsim(jer_seed, _jersey(ff, ncx, nfoot, tpw, tph)) >= 0.60)
+                                if ok_re:
+                                    try:
+                                        tr = make_tracker("csrt")
+                                        if tr is not None: tr.init(ff, (int(fx0), int(fy0), int(tpw), int(tph)))
+                                    except Exception:
+                                        tr = None
+                                    # ré-accroche PROVISOIRE : ce point sera recalé avec le pont dès que le traqueur
+                                    # retient vraiment le joueur (anti fausse ré-accroche sur un bord d'obstacle).
+                                    lcx, lfoot = ncx, nfoot; vx *= 0.5; vy *= 0.5
+                                    pts.append(_rec(tt, ncx, nfoot, 0.6)); pred_idx.append(len(pts) - 1)
+                                else:
+                                    if nl <= MAXPRED:
+                                        pts.append(_rec(tt, pcx, pfoot, 0.25)); pred_idx.append(len(pts) - 1)
+                                    if nl > MAXLOSS:
+                                        break
+                            if total: job["progress"] = min(98, int(kk / float(total) * 100))
+                            job["msg"] = f"Suivi rapide… {job['progress']}%"
+                            if (kk % 12) == 0: _time.sleep(0.001)
+                            if (kk % 25) == 0: _tlog("LIGHT frame k=%d t=%.2f pts=%d lost=%d" % (kk, tt, len(pts), nl))
+                        # jamais retrouvé : on ne garde qu'un COURT pont prédit (non vérifié) puis la piste s'arrête
+                        if pred_idx and len(pred_idx) > KEEP:
+                            drop = set(pred_idx[KEEP:]); pts = [p for i, p in enumerate(pts) if i not in drop]
+                        return pts, kk
+                    lpts, k = _csrt_pass(cap, frame, trk)
                     # ===== 2e PASSE si la 1re est IMMOBILE : le tout 1er suivi CSRT peut rater « à froid » (boîte
-                    # figée sur la graine). On relance alors UNE fois sur un traqueur neuf — c'est exactement ce
-                    # qui se passe quand ta 2e correction marche. On le fait donc automatiquement. =====
+                    # figée sur la graine). On relance alors UNE fois sur un traqueur neuf. =====
                     def _stat(pts):
                         if not pts or len(pts) <= 12: return False
                         _xs = [p["x"] for p in pts]; _ys = [p["y"] for p in pts]
@@ -1509,23 +1698,7 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
                             r2, f2 = c2.read(); t2 = make_tracker("csrt")
                             if r2 and t2 is not None:
                                 t2.init(f2, (int(bx), int(by), int(bw0), int(bh0)))
-                                lpts2 = [lpts[0]]; k2 = 0; nl2 = 0
-                                while True:
-                                    if JOBS.get(job_id, {}).get("cancel"): break
-                                    rr, ff = c2.read()
-                                    if not rr: break
-                                    k2 += 1; tt = offset + k2 / float(fps if fps else 25.0)
-                                    if t1eff and tt > t1eff + 1e-3: break
-                                    okb = False; bb2 = None
-                                    try: okb, bb2 = t2.update(ff)
-                                    except Exception: okb = False
-                                    if okb and bb2 is not None and bb2[2] > 1 and bb2[3] > 1:
-                                        _cxc = bb2[0] + bb2[2] / 2.0; _foot = bb2[1] + bb2[3]; _dcy = _foot - bh_px / 2.0
-                                        lpts2.append({"t": round(tt, 3), "x": round(_cxc / W, 4), "y": round(min(1.0, (_dcy + bh_px / 2) / H), 4), "w": round(bw_px / W, 4), "h": round(bh_px / H, 4), "c": 0.9}); nl2 = 0
-                                    else:
-                                        nl2 += 1
-                                        if nl2 > 12: break
-                                    if (k2 % 12) == 0: _time.sleep(0.001)
+                                lpts2, k2 = _csrt_pass(c2, f2, t2)
                                 if (not _stat(lpts2)) and len(lpts2) > 12:
                                     lpts = lpts2; k = k2; _tlog("LIGHT 2e passe OK pts=%d" % len(lpts))
                             c2.release()
@@ -1731,17 +1904,33 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
         sx, sy = seedx * W, seedy * H
         _dets = detect_boxes(frame, offset, start_fi)
         seed_box = None
-        # 1) PRIORITÉ : la détection dont la BOÎTE CONTIENT le point cliqué -> on est posé dessus.
-        #    Ça garantit que si l'utilisateur pose sur le gardien, c'est le gardien qui est verrouillé,
-        #    même si un joueur de champ est un peu plus proche en distance pure.
-        for b in _dets:
-            bx, by, bw2, bh2 = b[0], b[1], b[2], b[3]
-            if abs(sx - bx) <= bw2 * 0.55 and (by - bh2 * 0.55) <= sy <= (by + bh2 * 0.60):
-                if seed_box is None or ((b[0] - sx) ** 2 + (b[1] - sy) ** 2) < ((seed_box[0] - sx) ** 2 + (seed_box[1] - sy) ** 2):
-                    seed_box = b
-        # 2) sinon la plus proche, mais SEULEMENT si vraiment sous le clic (sinon gardien/arbitre non
-        #    détecté : on ne saute pas sur un voisin, on garde la personne désignée).
-        if seed_box is None:
+        # s57 — TA POSITION EST PRIORITAIRE. Le point reçu (sx, sy) = les PIEDS de ta boîte.
+        # Avant : on départageait les détections par leur CENTRE (milieu du corps) comparé à tes PIEDS ->
+        # un joueur placé un peu plus bas (devant) « gagnait » et le suivi partait sur ce voisin.
+        def _footd(b): return (b[4] - sx) ** 2 + (b[5] - sy) ** 2
+        _user_box = (seed_bw > 0 and seed_bh > 0)
+        if _user_box:
+            # 0) TA BOÎTE (taille connue) : on ne prend une détection QUE si elle recouvre nettement ta boîte
+            #    (IoU >= 0.35) ; sinon on garde EXACTEMENT ta boîte comme graine (aucune aimantation).
+            ux0 = sx - seed_bw * W / 2.0; ux1 = sx + seed_bw * W / 2.0; uy0 = sy - seed_bh * H; uy1 = sy
+            _bi = 0.0
+            for b in _dets:
+                bx0 = b[0] - b[2] / 2.0; bx1 = b[0] + b[2] / 2.0; by0 = b[1] - b[3] / 2.0; by1 = b[1] + b[3] / 2.0
+                iw = max(0.0, min(ux1, bx1) - max(ux0, bx0)); ih = max(0.0, min(uy1, by1) - max(uy0, by0))
+                inter = iw * ih; uni = (ux1 - ux0) * (uy1 - uy0) + b[2] * b[3] - inter
+                iou = inter / uni if uni > 0 else 0.0
+                if iou > _bi: _bi = iou; seed_box = b if iou >= 0.35 else seed_box
+        else:
+            # 1) la détection dont la BOÎTE CONTIENT le point cliqué ; s'il y en a plusieurs, celle dont les
+            #    PIEDS sont les plus proches de ton point (et non plus le centre du corps).
+            for b in _dets:
+                bx, by, bw2, bh2 = b[0], b[1], b[2], b[3]
+                if abs(sx - bx) <= bw2 * 0.55 and (by - bh2 * 0.55) <= sy <= (by + bh2 * 0.60):
+                    if seed_box is None or _footd(b) < _footd(seed_box):
+                        seed_box = b
+        # 2) sinon la plus proche (aux pieds), mais SEULEMENT si vraiment sous le clic (sinon gardien/arbitre
+        #    non détecté : on ne saute pas sur un voisin, on garde la personne désignée).
+        if seed_box is None and not _user_box:
             nb, _sd = nearest(_dets, sx, sy)
             _seed_r = max(W * 0.02, (seed_bw * W * 0.6) if seed_bw > 0 else (W * 0.035))
             if nb is not None and (_sd ** 0.5) <= _seed_r:
@@ -1774,9 +1963,10 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
             pts.append({"t": round(t, 3), "x": round(fx, 4), "y": round(fy, 4),
                         "w": round(ww / W, 4), "h": round(hh / H, 4), "c": round(conf, 2)})
         record(seg_t0, cx, cy, w, h, 0.95)
-        fi = 0; coast = 0
+        fi = 0; coast = 0; coast_idx = []
         STRIDE = max(1, int(round(fps / 10.0)))              # ~10 img/s analysées (le rendu interpole) -> plus rapide
         MAXCOAST = max(6, int(round(fps * 1.8 / STRIDE)))    # tolérance occlusion, en "pas" traités
+        KEEPCOAST = max(2, int(round(fps * 0.6 / STRIDE)))   # s57 : pont gardé si le joueur n'est jamais retrouvé
         GATE_K = min(3.0, float(STRIDE))                     # le joueur bouge plus entre 2 images traitées
         # poids du coût : empreinte profonde (OSNet) TRÈS dominante maintenant qu'elle est fiable,
         # puis couleur, position, taille.
@@ -1785,7 +1975,7 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
         # ARRIÈRE (départ->début du clip), afin de calculer TOUJOURS le clip entier quel que soit
         # l'instant de départ choisi (précision identique à un suivi lancé depuis le début).
         def process(frame, t, absfi):
-            nonlocal s, P, tw, th, tgt_hist, tgt_emb, last_cx, last_cy, coast, prev_gray
+            nonlocal s, P, tw, th, tgt_hist, tgt_emb, last_cx, last_cy, coast, prev_gray, coast_idx
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             M = cam_shift(prev_gray, gray); prev_gray = gray
             # 1) compensation caméra : on déplace l'état (position + vitesse) par le mouvement caméra
@@ -1842,6 +2032,18 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
                 accept = (best is not None) and (best_cost < 1.4) and (best_semb > 0.45) and (best_q > 0.40 or coast == 0)
             if accept:
                 bcx, bcy, bw, bh = best
+                # s57 : le joueur est RETROUVÉ après une courte occlusion -> le pont de positions prédites est
+                # recalé en douceur sur la vraie position (écart réparti linéairement) : aucun trou, aucun saut.
+                if coast_idx and not LOST:
+                    try:
+                        _dx = (float(bcx) - px) / W; _dy = (float(bcy) - py) / H; _n = len(coast_idx)
+                        for _j, _ix in enumerate(coast_idx):
+                            _f = (_j + 1) / float(_n + 1)
+                            pts[_ix]["x"] = round(min(1.0, max(0.0, pts[_ix]["x"] + _dx * _f)), 4)
+                            pts[_ix]["y"] = round(min(1.0, max(0.0, pts[_ix]["y"] + _dy * _f)), 4)
+                    except Exception:
+                        pass
+                coast_idx = []
                 # MISE À JOUR KALMAN avec la détection mesurée -> corrige position + vitesse, réduit P.
                 z = np.array([float(bcx), float(bcy)])
                 if LOST:                                             # réacquisition : on repositionne franchement
@@ -1870,8 +2072,16 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
                 # rien -> TROU dans la piste -> le rectangle DISPARAÎT (le joueur est absent, sorti du cadre).
                 # On continue de prédire pour re-verrouiller le BON joueur s'il revient (apparence forte),
                 # sinon la piste reste trouée. => jamais de transfert sur un autre joueur.
-                if coast <= 2:
-                    record(t, last_cx, last_cy, tw, th, 0.2)
+                # s57 : on enregistre la position PRÉDITE (Kalman + mouvement caméra compensé) pendant toute la
+                # tolérance d'occlusion (~1,8 s) -> le dessin RESTE sur le joueur masqué. S'il est retrouvé, ce
+                # pont est recalé (voir plus haut). S'il ne l'est pas (vraie sortie), on ne garde qu'un pont court.
+                if coast <= MAXCOAST:
+                    record(t, last_cx, last_cy, tw, th, 0.2); coast_idx.append(len(pts) - 1)
+                elif coast_idx:
+                    if len(coast_idx) > KEEPCOAST:
+                        for _ix in sorted(coast_idx[KEEPCOAST:], reverse=True):
+                            if 0 <= _ix < len(pts): pts.pop(_ix)
+                    coast_idx = []
 
         # instantané de l'état APRÈS amorçage -> point de départ commun aux deux passes
         _seed_snap = dict(s=s.copy(), P=P.copy(), tw=tw, th=th,
@@ -1897,6 +2107,11 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
             process(frame, t, start_fi + fi)
             if total: job["progress"] = min(98, int(fi / total * 100))
             job["msg"] = f"Suivi IA (ReID + caméra)… {job['progress']}%"
+        # s57 : fin de passe pendant une occlusion jamais résolue -> on ne garde qu'un pont prédit COURT
+        if coast_idx and len(coast_idx) > KEEPCOAST:
+            for _ix in sorted(coast_idx[KEEPCOAST:], reverse=True):
+                if 0 <= _ix < len(pts): pts.pop(_ix)
+        coast_idx = []
         # ===== PASSE ARRIÈRE : du point de départ jusqu'au DÉBUT du clip (calcul complet) =====
         # -> le clip entier est calculé même si tu démarres à 5s : élargir la fenêtre d'affichage
         #    ensuite (p.ex. depuis 3s) ne relance AUCUN calcul, le suivi est déjà là et précis.
@@ -1906,7 +2121,7 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
             tw = _seed_snap['tw']; th = _seed_snap['th']
             tgt_hist = (None if _seed_snap['hist'] is None else _seed_snap['hist'].copy())
             tgt_emb = (None if _seed_snap['emb'] is None else _seed_snap['emb'].copy())
-            prev_gray = _seed_snap['gray']; last_cx = _seed_snap['cx']; last_cy = _seed_snap['cy']; coast = 0
+            prev_gray = _seed_snap['gray']; last_cx = _seed_snap['cx']; last_cy = _seed_snap['cy']; coast = 0; coast_idx = []
             fmin = int(round(floor_t * fps)); fib = seed_fi - STRIDE
             while fib >= fmin:
                 if JOBS.get(job_id, {}).get("cancel"): break
@@ -1921,6 +2136,11 @@ def run_track1(job_id, video_path, t0s, t1s, seedx, seedy, model_name, imgsz, co
                 process(frame, tb, fib)
                 fib -= STRIDE
             job["msg"] = "Suivi IA (début du clip)…"
+            # s57 : fin de passe pendant une occlusion jamais résolue -> on ne garde qu'un pont prédit COURT
+            if coast_idx and len(coast_idx) > KEEPCOAST:
+                for _ix in sorted(coast_idx[KEEPCOAST:], reverse=True):
+                    if 0 <= _ix < len(pts): pts.pop(_ix)
+            coast_idx = []
         cap.release()
         pts.sort(key=lambda p: p["t"])   # avant + arrière fusionnés -> ordre chronologique
         out = {"fps": fps, "width": W, "height": H, "tracks": [{"id": 0, "n": len(pts), "color": "#00e08f", "points": pts}]}
@@ -1947,7 +2167,11 @@ async def track1(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Form(
                     "name": vkey, "fps": 0, "w": 0, "h": 0, "frames": 0, "dur": 0, "cancel": False,
                     "light": bool(int(light))}
     _t0min = None if (t0min is None or float(t0min) < 0) else float(t0min)
-    threading.Thread(target=run_track1, args=(job_id, vp, float(t0), float(t1), float(x), float(y),
+    def _run_track1_guarded(*_a):
+        _suivi_enter()   # suivi en cours -> aucun job ffmpeg GPU en arrière-plan (anti-crash Metal)
+        try: run_track1(*_a)
+        finally: _suivi_exit()
+    threading.Thread(target=_run_track1_guarded, args=(job_id, vp, float(t0), float(t1), float(x), float(y),
                      model, int(imgsz), float(conf), pg, cl, tk, float(bw), float(bh), _t0min), daemon=True).start()
     return {"job": job_id}
 
@@ -2248,6 +2472,91 @@ def _seekable_for_window(vpath, a, b, margin=3.0):
         print("seekable_window err:", e, flush=True)
     return _ensure_seekable(vpath), 0.0
 
+def _calib_src(vpath, a, b, margin=3.0):
+    """Source ALLÉGÉE pour le calibrage / suivi IA (logique LiveTag).
+
+    Problème iPhone 4K HEVC : OpenCV décode le 4K HEVC sur le GPU (VideoToolbox) EN MÊME TEMPS
+    que le modèle terrain tourne sur le GPU (Metal/MPS) -> deux clients Metal se télescopent ->
+    « IOGPUMetalCommandBuffer setCurrentCommandEncoder » -> moteur tué (« connexion perdue »).
+    La Véo (1080p H.264) est assez légère pour ne pas déclencher ce conflit.
+
+    Correctif : pour une source LOURDE (HEVC/H265, 4K, ou HDR), on fabrique UNE SEULE FOIS un
+    proxy 720p H.264 SDR de la FENÊTRE [a,b] (le build ffmpeg tourne seul, AVANT toute inférence,
+    donc le décodage GPU est sans risque ici), et le calibrage lit ensuite ce proxy léger en CPU.
+    Retourne (chemin, t_offset, heavy). Source LÉGÈRE -> comportement habituel, heavy=False."""
+    try:
+        info = _probe_vinfo(vpath)
+    except Exception:
+        info = {}
+    codec = (info.get("codec_name") or "").lower()
+    try:
+        w = int(info.get("width") or 0); h = int(info.get("height") or 0)
+    except Exception:
+        w = h = 0
+    trc = (info.get("color_transfer") or "").lower()
+    heavy = (codec in ("hevc", "h265")) or (w >= 2560 or h >= 1600) or (trc in _HDR_TRC)
+    if not heavy:
+        _p, _off = _seekable_for_window(vpath, a, b, margin=margin)
+        return _p, _off, False
+    import subprocess
+    a0 = max(0.0, float(a) - margin)
+    dur = ((float(b) - float(a)) if (b and b > a) else 0.0)
+    whole = (dur <= 0.0)
+    if whole:
+        out = os.path.splitext(vpath)[0] + "_calib720.mp4"; off = 0.0
+    else:
+        dur = dur + 2 * margin
+        out = os.path.splitext(vpath)[0] + ("_calib720_%d_%d.mp4" % (int(round(a0)), int(round(dur))))
+        off = a0
+    try:
+        if os.path.exists(out) and os.path.getsize(out) > 0 and _mp4_ok(out):
+            return out, off, True
+    except Exception:
+        pass
+    part = out + ".part"
+    _hdr = trc in _HDR_TRC
+    scale = "scale=-2:720"
+    if _hdr:
+        vf = (scale + ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+              "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+    else:
+        vf = scale + ",format=yuv420p"
+    bt709 = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+    common = ["-an", "-vsync", "cfr", "-r", "30", "-movflags", "+faststart", "-f", "mp4"]
+    VT   = ["-c:v", "h264_videotoolbox", "-b:v", "6M", "-g", "30", "-allow_sw", "1"]
+    X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-g", "30", "-keyint_min", "30"]
+    window = [] if whole else ["-ss", "%.3f" % a0, "-t", "%.3f" % dur]
+    print("Calibrage : proxy 720p SDR (source lourde %s %dx%d) :" % (codec or "?", w, h),
+          os.path.basename(vpath), flush=True)
+    last = b""
+    for ff in _ffmpeg_bins():
+        # décodage GPU autorisé POUR LE BUILD (aucune inférence en cours) ; encodeur VT puis repli CPU.
+        for (hw_dec, enc) in [(["-hwaccel", "videotoolbox"], VT), ([], VT), ([], X264)]:
+            try:
+                if os.path.exists(part): os.remove(part)
+            except Exception:
+                pass
+            cmd = ([ff, "-y", "-fflags", "+genpts"] + hw_dec + window + ["-i", vpath, "-vf", vf]
+                   + enc + ["-pix_fmt", "yuv420p"] + bt709 + common + [part])
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=14400)
+                last = r.stderr or b""
+            except Exception as e:
+                last = str(e).encode(); continue
+            if os.path.exists(part) and os.path.getsize(part) > 0 and _mp4_ok(part):
+                try: os.replace(part, out)
+                except Exception: pass
+                if os.path.exists(out):
+                    print("  -> OK proxy calibrage 720p (%s) :" % enc[1], os.path.basename(out), flush=True)
+                    return out, off, True
+    try:
+        if os.path.exists(part): os.remove(part)
+    except Exception:
+        pass
+    print("  -> échec proxy 720p, repli source d'origine :", (last[-200:] if last else b""), flush=True)
+    _p, _off = _seekable_for_window(vpath, a, b, margin=margin)
+    return _p, _off, True
+
 def _ensure_intra(vpath):
     """Version TOUT-EN-IMAGES-CLÉS (all-intra, comme le Motion JPEG de LiveTag) : chaque image est
     autonome -> le positionnement image par image est QUASI INSTANTANÉ (aucune image à re-décoder
@@ -2266,6 +2575,12 @@ def _ensure_intra(vpath):
                 os.remove(out)  # partiel/corrompu -> reconstruction
             except Exception:
                 pass
+        # SUIVI IA EN COURS : on NE construit PAS ce proxy maintenant (il se fera plus tard, quand le GPU est
+        # libre). Construire un proxy vidéo — même en CPU — pendant un suivi a provoqué des collisions Metal
+        # sur Mac Apple. On rend la source telle quelle ; le montage reste utilisable, le proxy viendra après.
+        if _gpu_busy():
+            print("Export : proxy léger DIFFÉRÉ (suivi IA en cours) :", os.path.basename(vpath), flush=True)
+            return vpath
         import subprocess
         part = out + ".part"
         # DÉTECTION HDR : une source iPhone 4K HDR (HLG/HDR10) ré-encodée SANS retirer l'étiquette HDR
@@ -2291,15 +2606,14 @@ def _ensure_intra(vpath):
         VT   = ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-g", "12", "-allow_sw", "1"]
         X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-g", "12", "-keyint_min", "12"]
-        # Essais : (filtre, encodeur, décodage GPU ?). On tente d'abord le GPU (VideoToolbox) qui est rapide,
-        # puis le logiciel en repli. hwaccel seulement sur le chemin sans tonemap (compat filtres CPU).
-        attempts = []
-        if _hdr:
-            attempts += [(vf_tm, VT, False), (vf_tm, X264, False),
-                         (vf_plain, VT, True), (vf_plain, X264, False)]
-        else:
-            attempts += [(vf_plain, VT, True), (vf_plain, VT, False), (vf_plain, X264, False)]
-        print("Export : création aperçu léger 1080p (GPU)%s :" % (" [HDR->SDR]" if _hdr else ""),
+        # ENCODAGE CPU UNIQUEMENT (libx264, jamais VideoToolbox) : ce proxy de montage pouvait démarrer en GPU
+        # juste avant/pendant un suivi IA (course de threads impossible à fermer au timing) -> 2 clients Metal
+        # simultanés -> « command encoder already encoding » -> moteur tué. En restant 100% CPU, le GPU est
+        # TOUJOURS réservé au modèle IA : plus aucune collision possible, quel que soit l'ordre des tâches.
+        # (Un peu plus lent à construire, en arrière-plan et une seule fois ; le confort de scrub est inchangé.)
+        _ = VT  # (conservé pour mémoire ; non utilisé — encodage CPU imposé pour la stabilité GPU)
+        attempts = [(vf_tm if _hdr else vf_plain, X264, False)]
+        print("Export : création aperçu léger 1080p (CPU, stable)%s :" % (" [HDR->SDR]" if _hdr else ""),
               os.path.basename(vpath), flush=True)
         last = b""
         for ff in _ffmpeg_bins():
@@ -2569,6 +2883,121 @@ async def rec_remux(file: UploadFile = File(...), rid: str = Form(...)):
     if not url:
         return JSONResponse({"ok": False, "error": "remux echoue (ffmpeg indisponible ?)"}, status_code=500)
     return {"ok": True, "url": url}
+
+@app.post("/rec_remux_path")
+def rec_remux_path(path: str = Form(...)):
+    """PHASE C (modèle LiveTag, zéro copie) : finalise le direct SUR PLACE, à partir de son CHEMIN.
+
+    Au lieu d'envoyer tout le fichier au moteur (copie complète dans jobs/_rec), on rend lisible/seekable
+    le fichier que l'app a écrit en flux pendant l'enregistrement, LÀ où il est (Bureau, disque externe…),
+    sans aucune 2e copie : remux rapide (sans ré-encodage) en MP4 faststart, repli ré-encodage si besoin,
+    puis remplacement atomique. Le montage lira ensuite ce fichier directement par son chemin (register_local).
+    """
+    import subprocess
+    try:
+        if not path or not os.path.exists(path):
+            print("rec_remux_path : FICHIER INTROUVABLE ->", path, flush=True)
+            return JSONResponse({"ok": False, "error": "fichier introuvable"}, status_code=404)
+        d = os.path.dirname(os.path.abspath(path))
+        base = os.path.basename(path)
+        try: _insz = os.path.getsize(path)
+        except Exception: _insz = 0
+        try:
+            _info = _probe_vinfo(path); _vc = (_info.get("codec_name") or "?")
+        except Exception:
+            _vc = "?"
+        print("rec_remux_path : DÉBUT  path=%s  (%.0f Mo, codec=%s)" % (path, _insz/1048576.0, _vc), flush=True)
+        # Écriture du temporaire À CÔTÉ du fichier si possible ; si le dossier n'est pas accessible en
+        # écriture au moteur (ex. TCC macOS), on bascule le temporaire dans le cache moteur (toujours
+        # inscriptible) puis on remplace l'original — l'important est de ne PAS garder 2 fichiers.
+        _wrok = os.access(d, os.W_OK)
+        tmp = os.path.join(d if _wrok else str(REC), "." + re.sub(r"[^a-zA-Z0-9_.-]","_",base) + ".mlzfin.mp4")
+        print("rec_remux_path : dossier inscriptible=%s  tmp=%s" % (_wrok, tmp), flush=True)
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception:
+            pass
+        bins = _ffmpeg_bins()
+        # 1) remux rapide SANS ré-encodage (copie des flux) : marche si déjà H.264/AAC (MP4 fragmenté).
+        copy_cmd = lambda ff: [ff, "-y", "-fflags", "+genpts", "-i", path, "-c", "copy",
+                               "-movflags", "+faststart", "-f", "mp4", tmp]
+        # 2) ré-encodage propre (VP8/VP9/WebM, ou flux non copiables) : H.264 + AAC, faststart.
+        enc_variants = [
+            ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-pix_fmt", "yuv420p"],
+            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"],
+            ["-c:v", "mpeg4", "-q:v", "3"],
+        ]
+        ok = False; last = b""
+        for ff in bins:
+            try:
+                if os.path.exists(tmp): os.remove(tmp)
+            except Exception: pass
+            try:
+                r = subprocess.run(copy_cmd(ff), capture_output=True, timeout=3600); last = r.stderr or b""
+            except Exception as e:
+                last = str(e).encode(); continue
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 0 and _mp4_ok(tmp):
+                ok = True; print("rec_remux_path : remux COPIE OK (%s)" % os.path.basename(ff), flush=True); break
+        if not ok:
+            print("rec_remux_path : copie impossible -> ré-encodage… (dernier msg: %s)" % (last[-200:] if last else b""), flush=True)
+            for ff in bins:
+                for v in enc_variants:
+                    try:
+                        if os.path.exists(tmp): os.remove(tmp)
+                    except Exception: pass
+                    cmd = [ff, "-y", "-fflags", "+genpts", "-i", path, "-vf", "format=yuv420p"] + v + \
+                          ["-r", "30", "-vsync", "cfr", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "128k", "-f", "mp4", tmp]
+                    # format=yuv420p peut gêner certains encodeurs -> on retire -vf si l'encodeur gère déjà pix_fmt
+                    if "-pix_fmt" in v:
+                        cmd = [ff, "-y", "-fflags", "+genpts", "-i", path] + v + \
+                              ["-r", "30", "-vsync", "cfr", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "128k", "-f", "mp4", tmp]
+                    try:
+                        r = subprocess.run(cmd, capture_output=True, timeout=14400); last = r.stderr or b""
+                    except Exception as e:
+                        last = str(e).encode(); continue
+                    if os.path.exists(tmp) and os.path.getsize(tmp) > 0 and _mp4_ok(tmp):
+                        ok = True; print("rec_remux_path : ré-encodage OK (%s, %s)" % (os.path.basename(ff), v[1]), flush=True); break
+                if ok: break
+        if not ok or not os.path.exists(tmp) or os.path.getsize(tmp) <= 0:
+            try:
+                if os.path.exists(tmp): os.remove(tmp)
+            except Exception: pass
+            print("rec_remux_path : ÉCHEC remux. Dernière erreur ffmpeg :", (last[-400:] if last else b""), flush=True)
+            return JSONResponse({"ok": False, "error": "remux echoue"}, status_code=500)
+        try:
+            os.replace(tmp, path)   # même dossier -> atomique ; sinon copie puis suppression du tmp
+        except Exception:
+            try:
+                import shutil; shutil.copyfile(tmp, path); os.remove(tmp)
+            except Exception as e2:
+                try:
+                    if os.path.exists(tmp): os.remove(tmp)
+                except Exception: pass
+                print("rec_remux_path : ÉCHEC remplacement :", str(e2), flush=True)
+                return JSONResponse({"ok": False, "error": "remplacement: " + str(e2)}, status_code=500)
+        try: sz = os.path.getsize(path)
+        except Exception: sz = 0
+        print("rec_remux_path : ✅ FINALISÉ SUR PLACE (zéro copie) : %s  (%.0f Mo)" % (base, sz/1048576.0), flush=True)
+        return {"ok": True, "size": sz, "path": path}
+    except Exception as e:
+        print("rec_remux_path : EXCEPTION :", str(e), flush=True)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.post("/rec_drop")
+def rec_drop(name: str = Form(...)):
+    """Supprime un fichier intermédiaire de _rec (ex. la version propre renvoyée à l'app après réécriture
+    du fichier choisi) -> on ne garde JAMAIS de 2e copie dans le cache moteur (objectif Phase C)."""
+    try:
+        safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", name or "")
+        if not safe:
+            return {"ok": False}
+        p = REC / safe
+        if p.exists():
+            try: os.remove(p)
+            except Exception: pass
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.get("/rec/{name}")
 def rec_get(name: str):
@@ -3344,7 +3773,7 @@ def _run_cancelable(cmd, timeout=36000):
     if _STOP_ALL:
         class _R: returncode = 255; stderr = b"stop"; stdout = b""
         return _R()
-    p = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.PIPE)
+    p = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.PIPE, stdin=_sp.DEVNULL)
     try: _ALL_PROCS.append(p)
     except Exception: pass
     try:
@@ -3372,6 +3801,28 @@ def _render_reset_stop():
     global _STOP_ALL
     _STOP_ALL = False
 
+# À la FERMETURE du moteur (quand on quitte l'app), on tue les ffmpeg en cours au lieu de les laisser
+# tourner en « orphelins » (c'était le bug : Cmd+Q ne coupait pas la génération). Marche si l'app envoie
+# un arrêt propre (SIGTERM/SIGINT) au moteur ; en complément du bouton Stop et du script ARRETER-GENERATION.
+def _kill_all_ffmpeg_on_exit():
+    try:
+        for p in list(_ALL_PROCS):
+            try: p.kill()
+            except Exception: pass
+    except Exception: pass
+try:
+    import atexit as _atexit, signal as _signal
+    _atexit.register(_kill_all_ffmpeg_on_exit)
+    def _sig_cleanup(_signum, _frame):
+        try: _kill_all_ffmpeg_on_exit()
+        except Exception: pass
+        os._exit(0)
+    for _s in ("SIGTERM", "SIGINT", "SIGHUP"):
+        try: _signal.signal(getattr(_signal, _s), _sig_cleanup)
+        except Exception: pass
+except Exception:
+    pass
+
 def _sid_dir(sid):
     safe = re.sub(r"[^a-f0-9]", "", sid or "")
     if not safe:
@@ -3382,6 +3833,8 @@ def _sid_dir(sid):
 async def render_start():
     _render_reset_stop()            # nouveau rendu -> on lève un éventuel « Stop » précédent
     try: _prune_video_cache(20.0)   # plafond du cache (façon LiveTag) : nettoie les vieilles copies avant de rendre
+    except Exception: pass
+    try: _prune_rec_cache(3.0)      # plafond de _rec : retire les vieilles vidéos de montage (jamais la récente)
     except Exception: pass
     sid = uuid.uuid4().hex
     (RENDER / sid).mkdir(parents=True, exist_ok=True)
@@ -3399,6 +3852,36 @@ async def render_cancel(sid: str = Form("")):
     except Exception:
         pass
     return {"ok": True}
+
+@app.post("/drop_proxies")
+def drop_proxies(keep: str = Form("")):
+    """OPTION 2 (façon LiveTag) : quand on FERME le montage d'un match, on supprime les proxys « image par
+    image » (_seekI3 / _seekc / _seek) du cache. Ils ne servent qu'à parcourir/générer le montage en cours ;
+    une fois le match fermé ils ne servent plus -> AUCUNE accumulation d'un match à l'autre. Ils se
+    reconstruisent tout seuls si on rouvre ce montage. On peut en GARDER un (keep = vkey du match courant)."""
+    freed = 0; n = 0; keep_path = None
+    try:
+        if keep:
+            kp = FAST_INTRA.get(keep)
+            if isinstance(kp, str): keep_path = os.path.abspath(kp)
+    except Exception: pass
+    try:
+        for pat in ("*_seekI3.mp4", "*_seekc*.mp4", "*_seek.mp4", "*_tl.mp4"):
+            for f in VID.glob(pat):
+                try:
+                    if not f.is_file(): continue
+                    if keep_path and os.path.abspath(str(f)) == keep_path: continue
+                    sz = f.stat().st_size; f.unlink(); freed += sz; n += 1
+                except Exception: pass
+        for k, v in list(FAST_INTRA.items()):
+            try:
+                if isinstance(v, str) and not os.path.exists(v): FAST_INTRA.pop(k, None)
+            except Exception: pass
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    try: print("drop_proxies : %d proxy(s) supprimé(s), %.0f Mo libérés." % (n, freed/1048576.0), flush=True)
+    except Exception: pass
+    return {"ok": True, "freed": freed, "count": n}
 
 @app.post("/render_frame")
 async def render_frame(sid: str = Form(...), idx: int = Form(...), file: UploadFile = File(...)):
@@ -3450,7 +3933,7 @@ def _assemble_render(d, fps, ext):
                 out.unlink()
         except Exception:
             pass
-        cmd = [ff, "-y", "-framerate", str(fps), "-i", frames]
+        cmd = [ff, "-nostdin", "-y", "-framerate", str(fps), "-i", frames]
         if have_audio:
             cmd += ["-i", str(audio)]
         cmd += vc + ["-movflags", "+faststart", "-r", str(fps)]
@@ -3459,7 +3942,7 @@ def _assemble_render(d, fps, ext):
             cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
         cmd += [str(out)]
         try:
-            p = subprocess.run(cmd, capture_output=True, timeout=36000)
+            p = _run_cancelable(cmd, timeout=1800)
             err = (p.stderr.decode("utf-8", "ignore")[-700:] if p.stderr else "")
         except Exception as e:
             err = str(e)
@@ -3526,7 +4009,7 @@ def _assemble_render_overlay(d, fps, ext, nframes):
         except Exception:
             pass
         _nc = str(os.cpu_count() or 8)
-        cmd = [ff, "-y", "-filter_complex_threads", _nc, "-filter_threads", _nc,
+        cmd = [ff, "-nostdin", "-y", "-filter_complex_threads", _nc, "-filter_threads", _nc,
                "-framerate", str(fps), "-i", frames,
                "-framerate", str(fps), "-i", ovseq]
         if have_audio:
@@ -3545,7 +4028,7 @@ def _assemble_render_overlay(d, fps, ext, nframes):
             cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
         cmd += [str(out)]
         try:
-            p = subprocess.run(cmd, capture_output=True, timeout=36000)
+            p = _run_cancelable(cmd, timeout=1800)
             err = (p.stderr.decode("utf-8", "ignore")[-700:] if p.stderr else "")
         except Exception as e:
             err = str(e)
@@ -3580,6 +4063,116 @@ def _composite_overlays_cv2(d, nframes):
         fg = ov[:, :, :3].astype(np.float32)
         outimg = (fg * a + base.astype(np.float32) * (1.0 - a)).astype(np.uint8)
         cv2.imwrite(str(base_p), outimg, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+
+# ===================== FILIGRANE MATCHLYZ (marque sur chaque vidéo générée) =====================
+# Le navigateur génère UNE image PNG transparente (le logo « MatchLyz » placé en bas à gauche, à la
+# résolution de la vidéo) et la dépose dans la session via /render_watermark. À l'assemblage FINAL
+# (standard ET turbo), on l'incruste par-dessus la vidéo : la marque est donc présente sur 100 % des
+# images, quel que soit le chemin de rendu (segments décodés par le serveur compris).
+@app.post("/render_watermark")
+async def render_watermark(sid: str = Form(...), file: UploadFile = File(...)):
+    safe, d = _sid_dir(sid)
+    if not d or not d.exists():
+        return JSONResponse({"ok": False, "error": "session inconnue"}, status_code=400)
+    try:
+        data = await file.read()
+        (d / "wm.png").write_bytes(data)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+def _probe_ok(p):
+    """Vérifie qu'un fichier vidéo est lisible (au moins un flux vidéo) via ffprobe. Si ffprobe est
+    indisponible, on ne bloque pas (le contrôle de taille suffit)."""
+    try:
+        ff = _ffexe()
+        pb = ff.replace("ffmpeg", "ffprobe") if ("ffmpeg" in ff) else "ffprobe"
+        r = subprocess.run([pb, "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=codec_name", "-of", "default=nw=1", str(p)],
+                           capture_output=True, timeout=30)
+        return (r.returncode == 0) and (b"codec_name" in (r.stdout or b""))
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return True
+
+def _probe_wh(p):
+    """Largeur,hauteur de la 1re piste vidéo via ffprobe (0,0 si indisponible)."""
+    try:
+        ff = _ffexe()
+        pb = ff.replace("ffmpeg", "ffprobe") if ("ffmpeg" in ff) else "ffprobe"
+        r = subprocess.run([pb, "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(p)],
+                           capture_output=True, timeout=30)
+        s = (r.stdout or b"").decode("utf-8", "ignore").strip()
+        w, h = s.split("x")[:2]
+        return int(w), int(h)
+    except Exception:
+        return 0, 0
+
+def _apply_watermark(d, src, ext):
+    """Incruste d/wm.png (si présent) par-dessus la vidéo 'src'. On réutilise EXACTEMENT les encodeurs
+    éprouvés du moteur (videotoolbox puis libx264, yuv420p, audio AAC, faststart) et on VALIDE la sortie :
+    si l'incrustation échoue d'une quelconque façon, on renvoie la vidéo d'origine INTACTE (jamais de
+    fichier cassé — une génération réussie ne doit pas être perdue à cause du logo)."""
+    try:
+        import os as _os
+        # 1) image envoyée par l'app pour cette session ; sinon 2) le bandeau fourni avec le moteur
+        #    (watermark.png à côté de server.py) -> le VRAI bandeau MatchLyz de Micka.
+        wm = str(d / "wm.png")
+        if not _os.path.exists(wm):
+            wm = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "watermark.png")
+        if not _os.path.exists(wm):
+            globals()["_LAST_WM"] = "none"
+            return src
+        outp = d / ("wm_out." + (ext or "mp4"))
+        # Le bandeau (851×315 transparent) est mis à l'échelle à ~22 % de la largeur vidéo, posé en bas à
+        # gauche, avec une légère transparence (discret). On déduit la largeur cible via ffprobe (pas de
+        # scale2ref, qui manque sur certains ffmpeg). Repli : 420 px si la sonde échoue.
+        W, H = _probe_wh(src)
+        # Taille EN % DE LA HAUTEUR (cohérent quelle que soit la résolution de sortie — montage ou clip) et
+        # réduit pour rester discret. Repli : 70 px si la sonde échoue.
+        th = max(48, int(H * 0.080)) if H > 0 else 90   # s57 : bandeau un peu plus grand (6 % -> 8 % de la hauteur)
+        fc = ("[1:v]scale=-1:%d,format=rgba,colorchannelmixer=aa=0.78[wm];"
+              "[0:v][wm]overlay=x=(W*0.022):y=(H-h-H*0.045)[v]") % th
+        vcodecs = [
+            ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-pix_fmt", "yuv420p"],
+            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"],
+            ["-c:v", "mpeg4", "-q:v", "3", "-pix_fmt", "yuv420p"],
+        ]
+        last_err = ""
+        for ff in _ffmpeg_bins():                     # Homebrew (complet) -> PATH -> embarqué
+            for vc in vcodecs:
+                try:
+                    if outp.exists():
+                        outp.unlink()
+                except Exception:
+                    pass
+                cmd = [ff, "-nostdin", "-y", "-i", str(src), "-i", str(wm),
+                       "-filter_complex", fc, "-map", "[v]", "-map", "0:a?"] + vc + \
+                      ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(outp)]
+                try:
+                    p = _run_cancelable(cmd, timeout=1800)
+                    last_err = (p.stderr.decode("utf-8", "ignore")[-400:] if (p and p.stderr) else last_err)
+                except Exception as e:
+                    last_err = str(e)
+                    continue
+                if outp.exists() and outp.stat().st_size > 1000 and _probe_ok(outp):
+                    globals()["_LAST_ENC"] = vc[1] + "+wm"
+                    globals()["_LAST_WM"] = "on"
+                    globals()["_LAST_WMERR"] = ""
+                    return outp
+        globals()["_LAST_WM"] = "fail"
+        globals()["_LAST_WMERR"] = (last_err or "inconnu").replace("\n", " ")[-300:]
+        try:
+            print("FILIGRANE échec : " + globals().get("_LAST_WMERR", ""), flush=True)
+        except Exception:
+            pass
+        return src   # échec -> on garde la vidéo d'origine, lisible
+    except Exception as e:
+        globals()["_LAST_WM"] = "fail"
+        globals()["_LAST_WMERR"] = str(e)[-300:]
+        return src
 
 @app.post("/render_finish")
 async def render_finish(sid: str = Form(...), fps: int = Form(24), fmt: str = Form("mov"), nframes: int = Form(0)):
@@ -3620,6 +4213,7 @@ async def render_finish(sid: str = Form(...), fps: int = Form(24), fmt: str = Fo
         out, err = await asyncio.to_thread(_assemble_render, d, int(fps), ext)
     if not out:
         return JSONResponse({"ok": False, "error": "ffmpeg: " + (err or "assemblage echoue")}, status_code=500)
+    out = await asyncio.to_thread(_apply_watermark, d, out, ext)   # marque MatchLyz (si wm.png présent)
     # DIAG durée : audio.wav et sortie (pour vérifier une éventuelle troncature en fin de montage).
     _auddur = 0.0; _outdur = 0.0
     try:
@@ -3651,7 +4245,7 @@ async def render_finish(sid: str = Form(...), fps: int = Form(24), fmt: str = Fo
             shutil.rmtree(d, ignore_errors=True)
         except Exception:
             pass
-    return {"ok": True, "url": "/rec/" + dest.name, "sv": SERVER_VERSION, "enc": globals().get("_LAST_ENC", "?")}
+    return {"ok": True, "url": "/rec/" + dest.name, "sv": SERVER_VERSION, "enc": globals().get("_LAST_ENC", "?"), "wm": globals().get("_LAST_WM", "?"), "wmerr": globals().get("_LAST_WMERR", "")}
 
 # ===================== MOTEUR TURBO : montage par SEGMENTS (pas image par image) =====================
 # Idée : au lieu de matérialiser TOUTES les images en JPEG puis de tout ré-encoder (lent), on encode
@@ -3837,6 +4431,7 @@ async def render_turbo_finish(sid: str = Form(...), fps: int = Form(24), fmt: st
     out, err = await asyncio.to_thread(_turbo_concat, d, int(fps), ext, int(nframes))
     if not out:
         return JSONResponse({"ok": False, "error": err or "assemblage échoué"}, status_code=500)
+    out = await asyncio.to_thread(_apply_watermark, d, out, ext)   # marque MatchLyz (si wm.png présent)
     dest = REC / (safe + "." + ext)
     ok_dest = False
     try:
@@ -3852,7 +4447,8 @@ async def render_turbo_finish(sid: str = Form(...), fps: int = Form(24), fmt: st
         except Exception:
             pass
     return {"ok": True, "url": "/rec/" + dest.name, "sv": SERVER_VERSION,
-            "enc": globals().get("_LAST_ENC", "?"), "nframes": int(nframes)}
+            "enc": globals().get("_LAST_ENC", "?"), "wm": globals().get("_LAST_WM", "?"),
+            "wmerr": globals().get("_LAST_WMERR", ""), "nframes": int(nframes)}
 
 def _render_turbo_build(d, vkey, w, h, fps, ext, runs):
     """Construit la vidéo par pièces + concat. Renvoie (chemin_sortie, err, nframes_total)."""
@@ -4195,11 +4791,16 @@ def render_match(sid: str = Form(...), vkey: str = Form(...),
             seg_dur = (count / rate) + 0.20 if rate > 0 else 1.0
             # DÉCODAGE GPU (VideoToolbox) : accélère fortement le HEVC 4K iPhone. Repli AUTOMATIQUE sans
             # hwaccel si l'accélération matérielle échoue (certains conteneurs) -> on ne perd jamais le rendu.
-            base_out = ["-t", ("%.4f" % seg_dur), "-vf", vf, "-q:v", "2", tmp]
+            # SEEK « grossier puis précis » (comme cut_clip) pour ÉVITER L'IMAGE NOIRE sur l'original non
+            # ré-encodé : on saute vite à une image-clé ~1 s AVANT (-ss avant -i), puis on avance précisément
+            # jusqu'à ts0 (-ss après -i) -> décodeur chaud dès la 1re image, frame exacte. Plus besoin du
+            # proxy all-intra : le montage lit l'original directement (logique LiveTag).
+            _pre = max(0.0, ts0 - 1.0); _fine = ts0 - _pre
+            base_out = ["-ss", ("%.4f" % _fine), "-t", ("%.4f" % seg_dur), "-vf", vf, "-q:v", "2", tmp]
             cmd_hw = [ff, "-y", "-hwaccel", "videotoolbox", "-fflags", "+genpts",
-                      "-ss", ("%.4f" % max(0.0, ts0)), "-i", src] + base_out
+                      "-ss", ("%.4f" % _pre), "-i", src] + base_out
             cmd_sw = [ff, "-y", "-fflags", "+genpts",
-                      "-ss", ("%.4f" % max(0.0, ts0)), "-i", src] + base_out
+                      "-ss", ("%.4f" % _pre), "-i", src] + base_out
             pr = _run_cancelable(cmd_hw)
             # si le GPU n'a rien produit (et qu'on n'a pas été stoppé), on retente en CPU
             if (pr.returncode != 0) and (not _STOP_ALL):
@@ -4976,25 +5577,47 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
     clip, 2) PnLCalib sur quelques ANCRES précises, 3) propagation de la calibration le long
     du mouvement réel + points-clés ADAPTATIFS (serrés quand la caméra bouge)."""
     print("RECALAGE demandé — vkey=%s  t0=%.1f t1=%.1f" % (vkey, t0, t1), flush=True)
+    _suivi_enter()   # TRÈS TÔT : dès la demande de suivi, on bloque tout job ffmpeg GPU en arrière-plan
     vp = _resolve_vid(vkey)   # ignore .part / _win_ ; retrouve le vrai match même après redémarrage
     if not vp or not os.path.exists(vp):
         print("  -> vidéo introuvable côté serveur", flush=True)
+        _suivi_exit()
         return JSONResponse({"error": "video_absente", "need_file": True}, status_code=409)
     print("  -> source :", os.path.basename(vp), flush=True)
     # RAPIDE : on ne prépare (image-par-image) QUE la fenêtre du clip, pas les 47 min. Pour un MP4
     # téléchargé -> renvoyé tel quel (T_OFF=0). Pour un WebM direct -> petite fenêtre en ~quelques s.
     _cp(pid, 1, "préparation du clip…")
+    _calib_heavy = False
     try:
-        vp, T_OFF = _seekable_for_window(vp, t0, t1, margin=3.0)   # temps locaux = temps d'origine - T_OFF
+        # Source lourde (iPhone 4K HEVC / HDR) -> proxy 720p SDR + décodage CPU (voir _calib_src) :
+        # le GPU n'est plus occupé à décoder du 4K HEVC pendant que le modèle terrain tourne dessus.
+        vp, T_OFF, _calib_heavy = _calib_src(vp, t0, t1, margin=3.0)   # temps locaux = origine - T_OFF
     except Exception as _pe:
         print("prep window err:", _pe, flush=True); T_OFF = 0.0
-    print("  -> prêt : %s  (t_off=%.1fs)" % (os.path.basename(vp), T_OFF), flush=True)
+    print("  -> prêt : %s  (t_off=%.1fs, lourde=%s)" % (os.path.basename(vp), T_OFF, _calib_heavy), flush=True)
     try:
         import cv2, numpy as np, time as _time
+        # DÉCODAGE CPU (CAP_FFMPEG) TOUJOURS : c'est la clé anti-crash Metal. Si OpenCV décode la vidéo sur
+        # le GPU (VideoToolbox) PENDANT que le modèle de calibrage tourne aussi sur le GPU (Metal/MPS), les
+        # deux clients Metal se télescopent -> « IOGPUMetalCommandBuffer setCurrentCommandEncoder » -> moteur
+        # tué. En décodant en CPU (libavcodec), le GPU ne sert QU'au modèle (déjà sérialisé) -> plus de
+        # collision, quel que soit le type de source (Véo, direct 1080p, iPhone 4K). libavcodec tolère aussi
+        # mieux un flux légèrement malformé (direct MediaRecorder) que VideoToolbox. Repli backend par défaut
+        # si, pour une raison quelconque, CAP_FFMPEG n'ouvre pas le fichier.
+        def _VC(_p):
+            try:
+                c = cv2.VideoCapture(_p, cv2.CAP_FFMPEG)
+                if c and c.isOpened():
+                    return c
+                try: c.release()
+                except Exception: pass
+            except Exception:
+                pass
+            return cv2.VideoCapture(_p)
         _tA = _time.perf_counter(); _anc_errs = []; _snap_res = []
         _cdiag("\n===== NOUVEAU CALIBRAGE  vkey=%s  t0=%.1f t1=%.1f =====" % (os.path.basename(vp), t0, t1))
         _cp(pid, 2, "préparation…")
-        cap = cv2.VideoCapture(vp); fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        cap = _VC(vp); fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0); dur = (total / fps) if fps else 0
         a = max(0.0, t0 - T_OFF); b = (t1 - T_OFF) if (t1 and t1 > 0) else dur   # temps LOCAUX (fenêtre)
         if b <= a: b = dur
@@ -5091,7 +5714,7 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         if idxs and idxs[-1] != n - 1: idxs.append(n - 1)
         # (plus de plafond : l'émission ci-dessus est déjà pilotée par le mouvement caméra -> le nombre
         #  d'ancres est proportionnel au mouvement, donc un clip long/mouvementé en a naturellement plus.)
-        cap2 = cv2.VideoCapture(vp); anchors = []; anc_idx = set(); _prop_rej = 0; _ai = 0
+        cap2 = _VC(vp); anchors = []; anc_idx = set(); _prop_rej = 0; _ai = 0
         print("  %d ancres à analyser (modèle terrain)…" % len(idxs), flush=True)
         for idx in idxs:
             _ai += 1
@@ -5159,7 +5782,7 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         if eidx[-1] != n - 1: eidx.append(n - 1)
         emit_idx = sorted(set(eidx) | set(anc_idx))
         print("  recalage lignes : %d images à traiter…" % len(emit_idx), flush=True)
-        cap4 = cv2.VideoCapture(vp); out = []; _degen = 0; _ei = 0
+        cap4 = _VC(vp); out = []; _degen = 0; _ei = 0
         for i in emit_idx:
             _ei += 1
             if pid: _cp(pid, 90 + int(9 * _ei / max(1, len(emit_idx))), "recalage lignes…")
@@ -5269,6 +5892,8 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         _cdiag("==> RETOUR calibrate_smart : ERREUR -> " + str(e))
         _cdiag(traceback.format_exc())
         traceback.print_exc(); return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        _suivi_exit()
 
 @app.get("/ai_status")
 def ai_status():
@@ -5658,6 +6283,12 @@ def _warmup_models():
     En service auto (arrière-plan permanent), on saute ce préchauffage pour rester léger :
     les modèles se chargeront à la 1re utilisation du suivi/calibrage."""
     import os as _os
+    # AU DÉMARRAGE : on plafonne les caches (façon LiveTag) -> _videos et _rec (vieilles vidéos de montage)
+    # ne s'accumulent jamais, même entre deux rendus. Ne touche JAMAIS les vidéos référencées (à leur emplacement).
+    try: _prune_video_cache(20.0)
+    except Exception: pass
+    try: _prune_rec_cache(3.0)
+    except Exception: pass
     # Par DÉFAUT on NE PRÉCHARGE PAS les modèles : ils occupent ~4 Go de RAM et, sur un Mac 8 Go,
     # saturent la mémoire -> swap -> TOUT le rendu du montage devient 2× plus lent. Les modèles se
     # chargent tout seuls à la 1re utilisation du Suivi IA / calibrage (léger délai la 1re fois, une seule fois).

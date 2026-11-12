@@ -2288,7 +2288,7 @@ else document.addEventListener('DOMContentLoaded',function(){ buildLangSel(); se
       <button class="btn acc" id="tRender" title="Télécharger la vidéo du clip sélectionné">🎬 Rendre</button>
       <button class="btn acc" id="topFreeze" title="Arrêt sur image sur l'action sélectionnée">📸 Arrêt sur image</button>
       <button class="btn acc" id="topTrack" title="Ouvrir le Suivi IA sur l'action sélectionnée">🎯 Suivi IA</button>
-      <button class="btn" id="topImport" title="Importer un fichier de suivi (.json)">📥 Importer</button>
+      <button class="btn hidden" id="topImport" title="Importer un fichier de suivi (.json)">📥 Importer</button>
       <input type="file" id="importTrkFile" accept="application/json,.json" style="display:none">
     </span>
     <span class="save" id="saveState">enregistré</span>
@@ -2930,10 +2930,13 @@ function closeAllOverlays(){
 }
 function navTo(n){
   try{ closeAllOverlays(); }catch(e){}
+  // Le bandeau « Relier / Vidéo introuvable » appartient à l'éditeur : on le masque dès qu'on navigue
+  // (sinon il restait collé, y compris sur l'Accueil).
+  try{ aiBarHide(); window._mlzRelinkShown=false; }catch(e){}
   try{ homeFxStop(); }catch(e){}   // le fond terrain n'apparaît que sur Accueil / Tableau tactique / Montage
   $('ovrl').classList.add('hidden'); if(n!=='montage'&&n!=='export') $('montage').classList.add('hidden'); if(n!=='live'&&liveRec&&liveRec.state==='recording'){} else if(n!=='live') $('live').classList.add('hidden');
   if(n==='home'){ $('editor').classList.add('hidden'); $('home').classList.remove('hidden'); renderHome(); return; }
-  if(n==='board'){ $('home').classList.add('hidden'); boardGalleryOpen(); return; }   // Tableau tactique -> galerie (bibliothèque globale)
+  if(n==='board'){ $('home').classList.add('hidden'); setNav('board'); boardGalleryOpen(); return; }   // Tableau tactique -> galerie (bibliothèque globale)
   if(n==='actions'){ $('home').classList.add('hidden'); setNav('actions'); openActionsPage(); return; }   // Actions globales (tous dossiers)
   if(n==='montage'){ $('home').classList.add('hidden'); setNav('montage'); montageGalleryOpen(); return; }   // Montages : bibliothèque globale (aucun dossier requis)
   if(n==='roster'){ $('home').classList.add('hidden'); setNav('roster'); openPlayersPage(); return; }   // Joueurs & Équipes (base commune)
@@ -4241,17 +4244,14 @@ function openSettings(){
     }
     else if(cat==='engine'){
       p.innerHTML=`<div class="setSec"><h4>Moteur — génération vidéo & Suivi IA</h4>
-        <div class="setItem"><label>Adresse du moteur</label><input id="setEngine" value="${esc(engine)}" style="width:270px" placeholder="http://localhost:8000"><button class="btn" id="setEngineReset">Défaut</button></div>
-        <div class="setItem"><label>Connexion</label><button class="btn acc" id="setEngineTest">Tester</button><span id="setEngineSt" class="setSub"></span></div>
-        <div class="setSub">Le moteur (génération vidéo, Suivi IA, calibrage) tourne <b>en local</b> via <b>DEMARRER.command</b> sur <b>http://localhost:8000</b>. Ne change l'adresse que si ton moteur tourne ailleurs. <b>Recharge la page (Cmd/Ctrl + R)</b> après modification.</div>
+        <div class="setItem"><label>Connexion au moteur</label><button class="btn acc" id="setEngineTest">Tester</button><span id="setEngineSt" class="setSub"></span></div>
+        <div class="setSub">Le moteur (génération vidéo, Suivi IA, calibrage) tourne <b>en local</b> et démarre automatiquement avec l'application.</div>
         </div>`+(hasP?`<div class="setSec"><h4>Diagnostic</h4>
         <div class="setItem"><label>Tester tout le pipeline d'export et afficher l'étape qui échoue</label><button class="btn acc" id="setDiag">🔧 Lancer</button></div>
         <pre id="diagOut" style="white-space:pre-wrap;background:#101014;border:1px solid var(--line);border-radius:8px;padding:12px;margin-top:6px;font-size:12px;display:none"></pre></div>`:'');
-      $('setEngine').onchange=()=>{ const v=$('setEngine').value.trim()||'http://localhost:8000'; try{localStorage.setItem('mlz_engine',v);}catch(e){} };
-      $('setEngineReset').onclick=()=>{ $('setEngine').value='http://localhost:8000'; try{localStorage.setItem('mlz_engine','http://localhost:8000');}catch(e){} };
       $('setEngineTest').onclick=async()=>{ const st=$('setEngineSt'); st.style.color='var(--mut,#8a94a0)'; st.textContent='⏳ test…';
-        try{ await fetch(($('setEngine').value.trim()||'http://localhost:8000'),{mode:'no-cors',cache:'no-store'}); st.textContent='✅ Moteur joignable'; st.style.color='#26DE81'; }
-        catch(e){ st.textContent='❌ Injoignable — lance DEMARRER.command'; st.style.color='#ff6b6b'; } };
+        try{ await fetch((AI_BASE||'http://localhost:8000'),{mode:'no-cors',cache:'no-store'}); st.textContent='✅ Moteur joignable'; st.style.color='#26DE81'; }
+        catch(e){ st.textContent='❌ Injoignable — ferme et rouvre l\'application'; st.style.color='#ff6b6b'; } };
       if(hasP)$('setDiag').onclick=()=>exportDiagnostic($('diagOut'));
     }
     else if(cat==='backup'){
@@ -4263,17 +4263,13 @@ function openSettings(){
         <div class="setSub" style="margin-top:6px">« Restaurer une sauvegarde auto » récupère tes dossiers depuis les sauvegardes automatiques du moteur (toutes les 2 min). Choisis une date d'avant la perte — <b>rien n'est supprimé</b>, les dossiers manquants sont ré-ajoutés.</div>
         <div class="setSub" id="bakStatus"></div></div>
         <div class="setSec"><h4>Stockage vidéo</h4>
-        <div class="setSub" style="margin-bottom:10px">Choisis où sont stockées tes vidéos, et récupère de l'espace disque en supprimant les vidéos qui ne servent plus.</div>
-        <div class="setItem"><label>Emplacement des vidéos (référencer sur ton disque ou copier dans l'app)</label><button class="btn" id="setVidStore">📁 Stockage vidéos</button></div>
-        <div class="setItem"><label>Récupérer l'espace des vidéos supprimées (garde les matchs conservés)</label><button class="btn" id="setCleanStorage">🧹 Nettoyer le stockage</button></div>
-        <div class="setItem"><label>Dossier de travail du moteur (cache + rendus) — mets-le sur un <b>disque externe</b> pour que ton Mac ne se remplisse plus<div class="setSub" id="engStoreCur" style="margin-top:3px"></div></label><button class="btn" id="setEngineStore">💽 Disque externe</button></div></div>
+        <div class="setSub" style="margin-bottom:10px">Tes vidéos restent <b>à leur place sur ton disque</b> — l'app garde juste un lien, elle ne remplit pas ton Mac. Tu peux ici récupérer l'espace des vidéos qui ne servent plus.</div>
+        <div class="setItem"><label>Récupérer l'espace des vidéos supprimées (garde les matchs conservés)</label><button class="btn" id="setCleanStorage">🧹 Nettoyer le stockage</button></div></div>
         <div class="setSec"><h4>Raccourcis clavier</h4><div class="setSub"><b>Cmd/Ctrl + Z</b> — annuler · <b>Cmd/Ctrl + Shift + Z</b> — rétablir (partout dans l'app).</div></div>`;
       $('setBackup').onclick=()=>exportBackup($('bakStatus'));
       $('setImport').onchange=e=>{ const f=e.target.files[0]; if(f)importBackup(f,$('bakStatus')); e.target.value=''; };
       { const rb=$('setRestoreAuto'); if(rb)rb.onclick=restoreAutoBackupPicker; }
-      { const vs=$('setVidStore'); if(vs)vs.onclick=chooseVidStore; }
       { const cs=$('setCleanStorage'); if(cs)cs.onclick=cleanStorage; }
-      { const es=$('setEngineStore'); if(es)es.onclick=chooseEngineStorage; try{ _refreshEngineStoreLabel(); }catch(e){} }
     }
     else if(cat==='shortcuts'){
       // GESTIONNAIRE COMPLET (façon LiveTag) : par section, chaque action a un ou plusieurs raccourcis
@@ -4513,14 +4509,26 @@ document.addEventListener('keydown',ev=>{ if($('montage').classList.contains('hi
 function refreshVidBtn(){ $('loadVid').textContent = project&&project.videoName ? ('🎬 '+project.videoName) : '🎬 Choisir la vidéo'; }
 let _seekOnce=null;
 async function loadVideoFile(f){ if(!f)return;
-  if(projectMode()==='live'){ alert('⛔ Ce dossier a été réalisé en DIRECT.\n\nPour analyser une vidéo importée, crée un NOUVEAU dossier (＋ Analyse). Un dossier ne peut pas mélanger direct et fichier importé.'); return; }
+  if(projectMode()==='live'){
+    // Vidéo déjà liée à ce direct -> re-sélectionner = RE-LIER le fichier déplacé (par le chemin), pas un import.
+    if(project && (project.videoHandleId||project.videoPath)){ await relinkMainVideo(null,f); return; }
+    alert('⛔ Ce dossier a été réalisé en DIRECT.\n\nPour analyser une vidéo importée, crée un NOUVEAU dossier (＋ Analyse). Un dossier ne peut pas mélanger direct et fichier importé.'); return; }
   try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
   setProjectMode('file');
   project.videoConverted=false; project.videoUrl='';   // nouvelle vidéo -> on oublie l'éventuelle conversion de l'ancienne
   vid.src=URL.createObjectURL(f); try{ vid.load(); }catch(e){}   // load() -> l'image s'affiche DÈS le 1er chargement (sinon il fallait re-sélectionner)
   project.videoName=f.name; project.videoSize=f.size;   // taille mémorisée -> vkey calculable même sans relire le fichier
-  const id=project.videoBlobId||('vid_'+uid()); project.videoBlobId=id;
-  try{ await dbPut('blobs',{id,blob:f}); }catch(e){ alert('La vidéo est trop volumineuse pour être mémorisée ('+e.message+'). Elle marche pour cette session mais devra être re-sélectionnée à la réouverture.'); project.videoBlobId=null; }
+  // MODÈLE LIVETAG : si on tourne dans l'app MatchLyz ET qu'on connaît le CHEMIN du fichier, on NE COPIE PAS la
+  // vidéo (elle reste lue depuis ton disque) -> import = zéro place. Sinon (navigateur simple / chemin inconnu),
+  // on garde l'ancien comportement : copie interne pour pouvoir rouvrir le match.
+  let _vpath=''; try{ _vpath=_filePath(f)||''; }catch(e){} if(_vpath)project.videoPath=_vpath;
+  if(window.matchlyzVideoRef && _vpath){
+    if(project.videoBlobId){ try{ await dbDel('blobs',project.videoBlobId); }catch(e){} }
+    project.videoBlobId=null; project.videoRef=true;
+  } else {
+    const id=project.videoBlobId||('vid_'+uid()); project.videoBlobId=id;
+    try{ await dbPut('blobs',{id,blob:f}); }catch(e){ alert('La vidéo est trop volumineuse pour être mémorisée ('+e.message+'). Elle marche pour cette session mais devra être re-sélectionnée à la réouverture.'); project.videoBlobId=null; }
+  }
   _seekOnce=project.lastTime||0; save(); refreshVidBtn();
   mlzAutoConvert(f);
   // WebM importé (direct / MediaRecorder) -> CONVERSION MP4 automatique côté serveur : lecture + seek
@@ -4546,7 +4554,10 @@ async function loadVideoFile(f){ if(!f)return;
 // (FileSystemFileHandle). L'app ne copie donc PAS la vidéo dans sa base -> le Mac ne se remplit pas. C'est TOI qui
 // choisis l'emplacement (le fichier reste sur ton disque). À la réouverture, la vidéo est rechargée via ce lien.
 async function loadVideoHandle(h,f){ if(!h||!f)return;
-  if(projectMode()==='live'){ alert('⛔ Ce dossier a été réalisé en DIRECT.\n\nCrée un NOUVEAU dossier (＋ Analyse) pour analyser une vidéo importée.'); return; }
+  if(projectMode()==='live'){
+    // Une vidéo est DÉJÀ liée à ce direct -> re-sélectionner = RE-LIER le fichier déplacé (pas un nouvel import).
+    if(project && (project.videoHandleId||project.videoPath)){ await relinkMainVideo(h,f); return; }
+    alert('⛔ Ce dossier a été réalisé en DIRECT.\n\nCrée un NOUVEAU dossier (＋ Analyse) pour analyser une vidéo importée.'); return; }
   try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
   setProjectMode('file');
   project.videoConverted=false; project.videoUrl='';   // nouvelle vidéo -> on oublie l'éventuelle conversion de l'ancienne
@@ -4580,10 +4591,10 @@ async function mlzAutoConvert(f){
 function mlzShowRelinkBanner(){
   window._mlzRelinkShown=true;   // permet l'auto-masquage dès qu'une vraie image s'affiche
   if(window.matchlyzVideoRef){
-    aiBar('🎬 Vidéo iPhone (HEVC) : pour afficher l\'image, je dois lire le fichier en direct. <button id="mlzRelink" style="margin-left:8px;padding:5px 11px;border-radius:8px;border:0;background:#1bd47a;color:#042;font-weight:800;cursor:pointer">🔗 Relier pour afficher</button>');
-    try{ const btn=document.getElementById('mlzRelink'); if(btn)btn.onclick=async()=>{ let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){} if(r&&r.path){ project.videoPath=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; try{save();}catch(e){} await mlzConvertPath(r.path); } }; }catch(e){}
+    aiBar('🎬 Vidéo introuvable ou déplacée : clique pour retrouver le fichier. <button id="mlzRelink" style="margin-left:8px;padding:5px 11px;border-radius:8px;border:0;background:#1bd47a;color:#042;font-weight:800;cursor:pointer">🔗 Relier la vidéo</button>');
+    try{ const btn=document.getElementById('mlzRelink'); if(btn)btn.onclick=async()=>{ let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){} if(r&&r.path){ project.videoPath=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; project.videoBlobId=null; project.videoConverted=false; project.videoUrl=''; try{save();}catch(e){} try{ aiBarHide(); window._mlzRelinkShown=false; }catch(e){} await mlzConvertPath(r.path); } }; }catch(e){}
   } else {
-    aiBar('ℹ️ Cette vidéo iPhone (HEVC) ne s\'affiche que dans l\'app MatchLyz (le navigateur ne donne pas le chemin du fichier).'); setTimeout(aiBarHide,8000);
+    aiBar('ℹ️ La vidéo de ce match n\'est plus trouvée à son emplacement — ouvre le match dans l\'app MatchLyz pour la re-relier.'); setTimeout(aiBarHide,8000);
   }
 }
 // Convertit la vidéo au CHEMIN donné (HEVC/HDR -> H.264 lisible) avec barre de progression, puis bascule l'affichage.
@@ -4707,6 +4718,20 @@ async function tryAutoVideo(){
   if(project.videoUrl){ try{ vid.src=project.videoUrl; _seekOnce=project.lastTime||0; refreshVidBtn(); return; }catch(e){} }
   if(project.videoHandleId){ $('loadVid').textContent='🎬 Recharger «'+(project.videoName||'')+'»'; }
 }
+// RE-LIAISON d'une vidéo déjà référencée qui a été DÉPLACÉE/renommée (direct OU importée). On garde le MÊME
+// identifiant de handle -> tous les clips du montage restent reliés. Ne passe PAS par loadVideoHandle (qui
+// bloque les dossiers Direct) : re-choisir le même match déplacé est légitime, ce n'est pas un nouvel import.
+async function relinkMainVideo(h,f){ try{
+    const hid=project.videoHandleId||('vh_'+uid()); project.videoHandleId=hid; project.videoBlobId=null;
+    if(h){ try{ await dbPut('blobs',{id:hid,handle:h}); }catch(e){} }   // h peut être null (champ de fichier de secours) -> on garde le chemin
+    if(f&&f.name)project.videoName=f.name; if(f&&f.size)project.videoSize=f.size;
+    try{ const _p=_filePath(f); if(_p)project.videoPath=_p; }catch(e){}
+    project.videoRef=true; project.videoConverted=false; project.videoUrl='';
+    try{ save(); }catch(e){}
+    try{ vid.src=URL.createObjectURL(f); _seekOnce=project.lastTime||0; refreshVidBtn(); }catch(e){}
+    try{ await mlzAutoConvert(f); }catch(e){}
+    mstat('Vidéo reliée à son nouvel emplacement.');
+  }catch(e){ alert('Reconnexion impossible : '+((e&&e.message)||e)); } }
 $('loadVid').onclick=async()=>{
   // Une vidéo est DÉJÀ affichée -> le clic sert à EN CHANGER (on ouvre le sélecteur).
   // Sinon (après redémarrage, rien de chargé) -> on ré-ouvre la vidéo référencée SANS re-sélection.
@@ -4721,7 +4746,9 @@ $('loadVid').onclick=async()=>{
     if(r==='moved')mstat('Fichier introuvable à son ancien emplacement — retrouve-le.');
   }
   if(window.showOpenFilePicker){ try{ const [h]=await window.showOpenFilePicker({types:[{description:'Vidéo',accept:{'video/*':['.mp4','.mov','.m4v','.webm','.mkv','.avi']}}]}); const f=await h.getFile();
-    if(_isReload){ await loadVideoHandle(h,f); return; }   // rechargement d'une vidéo déjà référencée : on garde le mode lien
+    if(_isReload){ await relinkMainVideo(h,f); return; }   // vidéo déjà référencée (déplacée) : re-liaison directe (direct OU import), sans blocage
+    // DIRECT dont le fichier a été déplacé (une vidéo est déjà liée) : re-sélectionner = RE-LIER, pas importer.
+    if(projectMode()==='live' && project && project.videoHandleId){ await relinkMainVideo(h,f); return; }
     // TON CHOIX : référencer le fichier sur ton disque (ne remplit pas le Mac) OU le copier dans l'app.
     // COMME LIVETAG : par défaut on RÉFÉRENCE la vidéo là où elle est sur le disque (on ne la copie JAMAIS dans
     // l'app) -> le stockage interne ne peut plus saturer. L'app la retrouve toute seule à l'ouverture ; si le
@@ -4734,7 +4761,7 @@ $('loadVid').onclick=async()=>{
   }catch(e){ if(e&&e.name==='AbortError')return; } }
   $('fileFallback').click();
 };
-$('fileFallback').onchange=e=>{ loadVideoFile(e.target.files[0]); e.target.value=''; };
+$('fileFallback').onchange=e=>{ const f=e.target.files[0]; e.target.value=''; if(f)loadVideoFile(f); };
 // ===== EXPORT / IMPORT DES TAGS (sauvegarde des actions taguées + dessins + calibrations) =====
 async function exportTags(){ if(!project){ alert('Ouvre un match d\'abord.'); return; }
   const data={ _type:'matchlyz-tags', v:1, exportedAt:new Date().toISOString(),
@@ -6056,7 +6083,7 @@ function _segMeas(c,W,H,pts,closed){ if(!pts||pts.length<2)return; const n=pts.l
 function drawMeasure(c,W,H,a){ if(!a||!a.measure||!window._curFieldH)return;
   if(a.type==='circle'){ const d=_fieldDist(a.x1,a.y1,a.x2,a.y2); if(isFinite(d))_measLabel(c,W,H,(a.x1+a.x2)/2,(a.y1+a.y2)/2,'⌀ '+d.toFixed(1).replace('.',',')+' m'); return; }
   if(a.type==='zone'){ _segMeas(c,W,H,zoneCorners(a),true); return; }
-  if(a.type==='poly'&&a.pts&&a.pts.length>=2){ const raw=a.pts.map(q=>[q[0]*W,q[1]*H]); const hull=(a.pts.length>=3&&typeof convexHull==='function')?convexHull(raw).map(p=>[p[0]/W,p[1]/H]):a.pts.slice(); _segMeas(c,W,H,hull,hull.length>=3); return; }
+  if(a.type==='poly'&&a.pts&&a.pts.length>=2){ const raw=a.pts.map(q=>[q[0]*W,q[1]*H]); const hull=(a.pts.length>=3&&!a._keepOrder&&typeof convexHull==='function')?convexHull(raw).map(p=>[p[0]/W,p[1]/H]):a.pts.slice(); _segMeas(c,W,H,hull,hull.length>=3); return; }
   if((a.type==='line'||a.type==='mur')&&a.pts&&a.pts.length>=2){ _segMeas(c,W,H,a.pts,false); return; }
   if(a.x1!=null){ const d=_fieldDist(a.x1,a.y1,a.x2,a.y2); if(isFinite(d))_measLabel(c,W,H,(a.x1+a.x2)/2,(a.y1+a.y2)/2,d.toFixed(1).replace('.',',')+' m'); } }
 function layeredStroke(c,build,w,colr,uc,off,dash){ uc=uc||'#000000'; off=off||Math.max(1.4,w*0.4);
@@ -6156,7 +6183,7 @@ function drawShape(c,W,H,a){
     for(let i=0;i<verts.length-1;i++)wallSeg(verts[i],verts[i+1]);
     { const rrm=Math.max(10,lw*4.6), _tm=ringTime(a); verts.forEach(p=>{ drawRing(c,p[0],p[1],rrm,rrm*0.5,(a.ringColor||col),(a.color2||'#ffffff'),'reticle',_tm); }); }
     if(a.measure&&window._curFieldH&&a.pts&&a.pts.length>=2){ for(let i=1;i<a.pts.length;i++){ const A=a.pts[i-1],B=a.pts[i],d=_fieldDist(A[0],A[1],B[0],B[1]); if(isFinite(d))_measTxt(c,(A[0]+B[0])/2*W,(A[1]+B[1])/2*H-hgt-Math.max(10,W/90),d.toFixed(1).replace('.',',')+' m',W); } } }
-  else if(a.type==='poly'&&a.space!=='field'){ let raw=(a.pts||[]).map(q=>[q[0]*W,q[1]*H]); if(raw.length<2){ c.restore(); return; } const hull=(raw.length>=3)?convexHull(raw):raw; const fa=(a.fillA!=null?a.fillA:0.28), sa=(a.strokeA!=null?a.strokeA:0.9);
+  else if(a.type==='poly'&&a.space!=='field'){ let raw=(a.pts||[]).map(q=>[q[0]*W,q[1]*H]); if(raw.length<2){ c.restore(); return; } const hull=(raw.length>=3&&!a._keepOrder)?convexHull(raw):raw;   /* s58 : polygone suivi = ordre fixe (se déforme) */ const fa=(a.fillA!=null?a.fillA:0.28), sa=(a.strokeA!=null?a.strokeA:0.9);
     const path=()=>{ c.beginPath(); c.moveTo(hull[0][0],hull[0][1]); for(let i=1;i<hull.length;i++)c.lineTo(hull[i][0],hull[i][1]); c.closePath(); };
     const xs=hull.map(p=>p[0]),ys=hull.map(p=>p[1]),left=Math.min(...xs),right=Math.max(...xs),top=Math.min(...ys),bottom=Math.max(...ys),H2=bottom-top;
     // striage intérieur identique à la zone / au mur (rayures serrées + contour en couches)
@@ -6460,8 +6487,9 @@ async function downloadClipVideo(a,opts){
   // CLIP AVEC DESSINS / ARRÊTS SUR IMAGE : le découpage brut (/cut_clip) ne contient AUCUN dessin. On rend donc
   // via le MOTEUR DE COMPOSITION du Suivi IA (canvas = vidéo + dessins + gels), puis MP4/MOV par le moteur —
   // exactement le même rendu que le bouton 🎬 Rendre du Suivi IA.
-  const hasOverlay=!!((a.aiAnnos&&a.aiAnnos.length)||(a.aiFreezes&&a.aiFreezes.length)||(a.freezes&&a.freezes.length)||(a.tracks&&a.tracks.length)||(a.links&&a.links.length));
-  if(hasOverlay){ await renderActionViaMontage(a, fmt, opts); return; }
+  // TOUJOURS passer par le moteur du montage (progression + aperçu + filigrane MatchLyz), que le clip ait
+  // des dessins ou non. (Avant : un clip sans dessin partait en coupe directe /cut_clip, SANS filigrane.)
+  await renderActionViaMontage(a, fmt, opts); return;
   const keepVoice=('keepVoice' in opts)?opts.keepVoice:!!a.audioId;
   const chooseFolder=('chooseFolder' in opts)?opts.chooseFolder:false;
   const sz = project.videoSize||0;
@@ -6758,27 +6786,47 @@ let aiPfMap={};      // action.id -> détections image par image (tous les joueu
 // Boîtes des joueurs DÉTECTÉS à l'instant t (image la plus proche) — indépendant du suivi : montre TOUS les
 // joueurs présents même si leur piste n'a pas été reliée (vue haute où le suivi fragmente).
 function _perframeBoxesAt(t){ const pf=(aiwin&&aiwin._perframe)||null; if(!pf||!pf.length)return []; let best=null,bd=1e9;
-  for(const e of pf){ const d=Math.abs((e.t||0)-t); if(d<bd){bd=d;best=e;} } if(!best||bd>0.5)return []; return (best.b||[]).map(x=>({x:x.x,y:x.y,w:x.w,h:x.h})); }
+  for(const e of pf){ const d=Math.abs((e.t||0)-t); if(d<bd){bd=d;best=e;} } if(!best||bd>0.05)return [];   /* s58 : ±0,05 s max (avant 0,5 s -> rectangles d'une autre image = vides) */ return (best.b||[]).map(x=>({x:x.x,y:x.y,w:x.w,h:x.h})); }
 // Construit la TRAJECTOIRE d'un joueur À PARTIR des détections image-par-image DÉJÀ calculées (aucun recalcul
 // serveur) : on part de la boîte cliquée puis on relie, image après image, la détection la plus proche (plus
 // proche voisin). Instantané, et le dessin reste collé au joueur. Évite de relancer YOLO à chaque dessin.
-function _trackFromPerframe(nx,ny,t){ const pf=(aiwin&&aiwin._perframe)||null; if(!pf||!pf.length)return null;
-  const frames=pf.slice().sort((a,b)=>(a.t||0)-(b.t||0));
-  let ci=0,cd=1e9; for(let i=0;i<frames.length;i++){ const d=Math.abs((frames[i].t||0)-t); if(d<cd){cd=d;ci=i;} }
-  const bxs=frames[ci].b||[]; let seed=null,sd=0.07;
-  // 1) boîte qui CONTIENT le clic (priorité -> on part du bon joueur, pas d'un voisin)
-  for(const b of bxs){ const bw=(b.w||0.05),bh=(b.h||0.13); if(nx>=b.x-bw*0.6&&nx<=b.x+bw*0.6&&ny>=b.y-bh*1.0&&ny<=b.y+bh*0.2){ seed=b; break; } }
-  if(!seed){ for(const b of bxs){ const d=Math.hypot(b.x-nx,b.y-ny); if(d<sd){sd=d;seed=b;} } }
-  if(!seed)return null;
-  const step=(frames,i0,dir,prev0)=>{ let prev=prev0, miss=0; const acc=[];
-    for(let i=i0; dir>0?(i<frames.length):(i>=0); i+=dir){ let best=null,bd2=0.07;
-      (frames[i].b||[]).forEach(b=>{ const d=Math.hypot(b.x-prev.x,b.y-prev.y); if(d<bd2){bd2=d;best=b;} });
-      if(!best){ miss++; if(miss>6)break; continue; }   // trou court toléré (occlusion) sans casser la piste
-      miss=0; const pt={t:frames[i].t,x:best.x,y:best.y,w:best.w,h:best.h}; acc.push(pt); prev=best; }
-    return acc; };
-  const fwd=step(frames,ci+1,1,seed); const bwd=step(frames,ci-1,-1,seed).reverse();
-  const out=bwd.concat([{t:frames[ci].t,x:seed.x,y:seed.y,w:seed.w,h:seed.h}],fwd);
-  return out.length>=2?out:null; }
+// ===== s59 — LE DESSIN RESTE SUR LE JOUEUR CHOISI (plus de saut sur un voisin) =====
+// Avant : la trajectoire était reconstruite en prenant, image après image, la détection la plus proche dans un rayon
+// de 7 % de l'écran ; et si le joueur choisi manquait sur l'image de départ, on partait sur le plus proche = le VOISIN.
+// Maintenant : départ = EXACTEMENT le rectangle choisi ; chaque image : position prévue (vitesse), fenêtre de la taille
+// d'un joueur ; si deux joueurs sont aussi plausibles l'un que l'autre, on S'ARRÊTE (on ne devine pas) et le moteur
+// prend le relais depuis ce dernier point sûr, calé sur le rectangle exact du joueur.
+function _chainBoxes(frames,ci,seed,dir){ const acc=[]; let prev={t:seed.t,x:seed.x,y:seed.y,w:seed.w,h:seed.h}, vx=0,vy=0,nv=0,miss=0,stop=null;
+  for(let i=ci+dir; dir>0?i<frames.length:i>=0; i+=dir){ const f=frames[i]; const dt=(f.t||0)-prev.t; if(Math.abs(dt)>0.7){ stop='gap'; break; }
+    const w=Math.max(0.006,prev.w||0.02), h=Math.max(0.02,prev.h||0.06); const px=prev.x+vx*dt, py=prev.y+vy*dt; const gate=w*(0.6+0.2*miss);
+    let b1=null,d1=1e9,d2=1e9;
+    for(const b of (f.b||[])){ const hr=(b.h||h)/h; if(hr<0.6||hr>1.67)continue; const d=Math.hypot(b.x-px,(b.y-py)*0.8); if(d<d1){ d2=d1; d1=d; b1=b; } else if(d<d2)d2=d; }
+    if(!b1||d1>gate){ if(++miss>3){ stop='lost'; break; } continue; }
+    if(d2<gate*1.25 && d2<d1*1.8+w*0.15){ stop='ambig'; break; }   // deux joueurs possibles -> on ne devine pas
+    const sdt=(Math.abs(dt)>1e-4)?dt:(dir*1e-4); const ivx=(b1.x-prev.x)/sdt, ivy=(b1.y-prev.y)/sdt;
+    if(nv===0){ vx=ivx; vy=ivy; } else { vx=0.6*vx+0.4*ivx; vy=0.6*vy+0.4*ivy; } nv++;
+    vx=Math.max(-0.6,Math.min(0.6,vx)); vy=Math.max(-0.6,Math.min(0.6,vy));
+    prev={t:f.t,x:b1.x,y:b1.y,w:b1.w,h:b1.h}; acc.push(Object.assign({},prev)); miss=0; }
+  return {acc:acc,stop:stop}; }
+// Détections image par image -> trames triées [{t,b:[...]}] (null si aucune analyse).
+function _pfFrames(){ const pf=(aiwin&&aiwin._perframe)||null; if(!pf||!pf.length)return null; return pf.slice().sort((a,b)=>(a.t||0)-(b.t||0)); }
+// Construit la TRAJECTOIRE d'un joueur À PARTIR des détections image-par-image DÉJÀ calculées (aucun recalcul serveur).
+// box = le rectangle VERT choisi : le départ est CE rectangle (jamais un voisin). Sans box : rectangle qui contient le point.
+function _trackFromPerframe(nx,ny,t,box){ const frames=_pfFrames(); if(!frames)return null;
+  let ci=0,cd=1e9; for(let i=0;i<frames.length;i++){ const d=Math.abs((frames[i].t||0)-t); if(d<cd){cd=d;ci=i;} } if(cd>0.06)return null;
+  const bxs=frames[ci].b||[]; let seed=null;
+  if(box){ let bs=-1; for(const b of bxs){ const s2=_boxIoU(b,box); if(!(s2>=0.3||_sameBox(b,box,false)))continue; if(s2>bs){bs=s2;seed=b;} } }
+  else { let _bd=1e9; for(const b of bxs){ const bw=(b.w||0.05),bh=(b.h||0.13); if(nx>=b.x-bw*0.5&&nx<=b.x+bw*0.5&&ny>=b.y-bh*1.0&&ny<=b.y+bh*0.15){ const _d=Math.hypot(b.x-nx,b.y-ny); if(_d<_bd){_bd=_d;seed=b;} } } }
+  if(!seed)return null;   // le joueur choisi n'est pas dans l'analyse à cet instant -> le moteur s'en charge (pas de voisin)
+  const s0={t:frames[ci].t,x:seed.x,y:seed.y,w:seed.w,h:seed.h};
+  const F=_chainBoxes(frames,ci,s0,1), B=_chainBoxes(frames,ci,s0,-1);
+  const out=B.acc.reverse().concat([s0],F.acc); if(out.length<2)return null;
+  out._fwdStop=F.stop; out._bwdStop=B.stop; return out; }
+// Piste qui s'arrête avant la fin du clip (joueur ambigu / perdu) -> le moteur CONTINUE depuis le dernier point sûr,
+// calé sur le rectangle exact du joueur à cet instant (tout ce qui est avant est conservé).
+function _extendIfShort(an,slot,pts){ const a=aiwin.action; if(!a||!an||!pts||!pts.length)return false; const last=pts[pts.length-1];
+  if(last.t>=a.out-0.3)return false; if(!an._jobs)an._jobs=[];
+  startFollowTrack(an,slot,last.x,last.y,+(+last.t).toFixed(3),last.w||0.03,last.h||0.08,true); return true; }
 // Clé moteur de la SOURCE COURANTE du Suivi IA : vidéo IMPORTÉE (clip de montage) -> même schéma que
 // l'envoi des médias ('media_<nom>_<taille>') pour retomber sur le fichier DÉJÀ envoyé (pas de ré-upload
 // sous une mauvaise clé) ; sinon -> schéma du match. C'est ce qui faisait échouer la détection de joueurs
@@ -6800,12 +6848,15 @@ function smoothTrk(pts){ return smoothTrack(smoothMedian(pts)); }
 async function ensureDetBoxes(){ const a=aiwin.action; if(!a)return; if(aiwin._detRunning)return; aiwin._detRunning=true;
   try{ return await _ensureDetBoxesInner(a); } finally{ aiwin._detRunning=false; } }
 async function _ensureDetBoxesInner(a){ const blob=await getVideoBlob(); if(!blob)return; const vkey=_aiSrcVkey(blob);
-  const _call=async()=>{ const fd=new FormData(); fd.append('vkey',vkey); fd.append('t',vid.currentTime); fd.append('model','yolo11s.pt'); fd.append('imgsz','960'); { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); } try{ return await fetch(AI_BASE+'/detect',{method:'POST',body:fd}).then(r=>r.json()); }catch(e){ return null; } };
+  // s58 : la détection est DATÉE de l'image DEMANDÉE (pas de l'instant où la réponse arrive) -> si tu as avancé
+  // entre-temps, ces rectangles ne sont plus affichés sur la nouvelle image (avant : rectangles d'une autre image = vides).
+  let tReq=vid.currentTime;
+  const _call=async()=>{ tReq=vid.currentTime; const fd=new FormData(); fd.append('vkey',vkey); fd.append('t',tReq); fd.append('model','yolo11s.pt'); fd.append('imgsz','960'); { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); } try{ return await fetch(AI_BASE+'/detect',{method:'POST',body:fd}).then(r=>r.json()); }catch(e){ return null; } };
   let r=await _call();
   // Suivi IA lancé DEPUIS LE MONTAGE : la vidéo du match n'a pas encore été envoyée au moteur -> /detect répond
   // « need_file » et aucun joueur ne s'affichait. On l'envoie alors automatiquement puis on relance la détection.
-  if(r&&r.need_file){ aiBar('📤 Préparation de la vidéo pour la détection des joueurs…'); try{ const vk=await aiEnsureUploaded(); if(vk)r=await _call(); }catch(e){} }
-  if(r&&r.boxes){ aiwin._detBoxes=r.boxes; aiwin._detT=vid.currentTime; aiBarHide(); }
+  let _upMsg=false; if(r&&r.need_file){ _upMsg=true; aiBar('📤 Préparation de la vidéo pour la détection des joueurs…'); try{ const vk=await aiEnsureUploaded(); if(vk)r=await _call(); }catch(e){} }
+  if(r&&r.boxes){ aiwin._detBoxes=r.boxes; aiwin._detT=tReq; if(_upMsg)aiBarHide(); }   /* s58 : la détection se rafraîchit à chaque image -> ne masque plus les autres messages (progression du suivi) */
   else if(r&&r.need_file){ aiBar('❌ Vidéo non prête sur le moteur — clique « 🎬 Reconnecter la vidéo » puis réessaie.'); setTimeout(aiBarHide,3600); } }
 function aiTrackClip(a){
   if(!a){ alert('Sélectionne une action d\'abord.'); return; }
@@ -7013,7 +7064,7 @@ const ICON_SVG={
 };
 let aiwin={open:false,action:null,cands:[],tool:'select',sel:null,raf:0,pend:null,col:'#ffffff',col2:'#ffffff',w:1};
 let aiwinPlaying=false; let aiwinTLH=196;
-function aiwinCss(){ if(document.getElementById('aiwinCss'))return; const s=document.createElement('style'); s.id='aiwinCss'; s.textContent="#aiwin{position:fixed;left:0;right:0;top:0;bottom:var(--barH);z-index:120;background:linear-gradient(180deg,#0a0d0c,#070a09);display:flex;flex-direction:column;color:#eef}#aiwin .hd{display:flex;align-items:center;gap:5px;padding:3px 10px;border-bottom:1px solid rgba(0,224,143,.4);background:#070a09}#aiwin .hd b{color:var(--accent);letter-spacing:1px;text-shadow:0 0 12px rgba(0,224,143,.5)}#aiwin .hd .btn{height:23px;padding:0 8px;font-size:11px;border-radius:7px}#aiwin .hd svg{width:16px!important;height:16px!important}#aiwin .hd span[style*='font-size:18px']{font-size:14px!important}#aiwin .bd{flex:1;display:flex;min-height:0}#aiwin .maincol{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}#aiwin .toprow{flex:1;display:flex;min-height:0;min-width:0}#aiwin .tools{width:172px;min-width:52px;max-width:260px;flex:none;background:rgba(18,23,26,.96);border-right:1px solid rgba(0,224,143,.15);display:grid;grid-template-columns:repeat(auto-fill,minmax(44px,1fr));gap:4px;align-content:start;padding:6px;overflow-y:auto;overflow-x:hidden}#aiwin .aiwtsres{width:5px;flex:none;cursor:col-resize;background:#0e1211}#aiwin .aiwtsres:hover{background:var(--accent)}#aiwin .tools button{height:auto;border-radius:7px;border:1px solid var(--line);background:rgba(28,34,38,.8);color:#dfe;font-size:13px;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;padding:3px 2px 2px}#aiwin .tools button small{font-size:7px;line-height:1;color:#9fb3ab;text-align:center;letter-spacing:.1px}#aiwin .tools button.on small{color:#062117}#aiwin .tlres{height:3px;flex:none;cursor:row-resize;background:#1c2228;border-radius:3px}#aiwin .tlres:hover{background:var(--accent)}#aiwCtx{position:fixed;z-index:130;background:#1d1d22;border:1px solid var(--line);border-radius:8px;padding:4px;font-size:13px;box-shadow:0 12px 34px #000b;min-width:150px}#aiwCtx .it{padding:7px 12px;border-radius:6px;cursor:pointer;white-space:nowrap}#aiwCtx .it:hover{background:#2a2a33}#aiwin .tools button.on{background:linear-gradient(180deg,#00e08f,#00b873);color:#062117;border:none;box-shadow:0 4px 14px rgba(0,224,143,.4)}#aiwin .tools button svg{width:16px;height:16px;display:block;margin:0 auto}#aiwin .tools button.on svg path,#aiwin .tools button.on svg line,#aiwin .tools button.on svg circle,#aiwin .tools button.on svg rect,#aiwin .tools button.on svg ellipse,#aiwin .tools button.on svg polygon{stroke:#062117}#aiwin .tools button.on svg [fill='#e6f0ea']{fill:#062117}#aiwin .tools .cat{grid-column:1/-1;font-size:8px;letter-spacing:.8px;color:#7a8;text-transform:uppercase;margin:3px 0 0;padding-left:2px}#aiwin .stage{flex:1;display:flex;flex-direction:column;min-width:0;padding:5px;gap:4px}#aiwin .cvwrap{flex:1;position:relative;min-height:0;background:#000;border:1px solid rgba(0,224,143,.25);border-radius:10px;overflow:hidden;box-shadow:0 0 40px rgba(0,224,143,.1)}#aiwin #aiwcv{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}#aiwin .tl{flex:none;display:flex;align-items:center;gap:4px;background:rgba(18,23,26,.96);border:1px solid var(--line);border-radius:8px;padding:2px 6px}#aiwin .tl input[type=range]{flex:1}#aiwin .tl button{height:22px;padding:0 6px;font-size:11px;border-radius:6px}#aiwin .tl select.spd{height:22px;padding:0 2px}#aiwin .pr{width:250px;flex:none;background:rgba(18,23,26,.96);border-left:1px solid rgba(0,224,143,.15);padding:12px;overflow:auto}#aiwin .pr .arow{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:9px 0;font-size:12px;color:#bcd}#aiwin .pr input[type=range]{width:128px}#aiwin .hint{font-size:11px;color:#8aa}#aiwin .aiwtl{flex:none;height:138px;overflow-x:auto;overflow-y:scroll;background:rgba(12,16,15,.96);border:1px solid var(--line);border-radius:10px;position:relative}#aiwin .aiwtl .ruler{height:18px;background:#0a0d0c;border-bottom:1px solid var(--line);position:relative}#aiwin .aiwtl .ruler span{position:absolute;top:2px;font-size:9px;color:#9ab;transform:translateX(-50%)}#aiwin .aiwtl .ruler i.mtick{position:absolute;bottom:0;width:1px;height:4px;background:rgba(255,255,255,.16)}#aiwin .aiwtl .ruler i.mtick.maj{height:8px;background:rgba(255,255,255,.32)}#aiwin .aiwtl .ph{position:absolute;top:0;bottom:0;width:2px;background:#ffce3a;z-index:6;pointer-events:none}#aiwin .aiwtl .lane{position:relative;height:26px;border-bottom:1px solid rgba(255,255,255,.16)}#aiwin .aiwtl .seg{position:absolute;top:2px;height:calc(var(--rh,24px) - 4px);border-radius:5px;opacity:.94;cursor:move;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#062117;padding:0 9px;overflow:hidden;white-space:nowrap;z-index:3}#aiwin .aiwtl .seg.sel{outline:2px solid #ffce3a}#aiwin .aiwtl .hdl{position:absolute;top:0;width:13px;height:100%;cursor:ew-resize;background:rgba(0,0,0,.4);border-radius:4px}#aiwin .aiwtl .hdl:hover{background:rgba(0,0,0,.62)}#aiwin .aiwtl .vkfm{position:absolute;top:50%;width:11px;height:11px;margin-left:-5.5px;margin-top:-5.5px;transform:rotate(45deg);background:#fff;border:1.5px solid #06210f;cursor:ew-resize;z-index:7;box-shadow:0 1px 3px rgba(0,0,0,.6)}#aiwin .aiwtl .vkfm:hover{background:#ffe38a}#aiwin .aiwtl .fz{position:absolute;top:18px;bottom:0;border-left:2px dashed #4da6ff;z-index:5}#aiwin .aiwtl .calbar{position:relative;height:13px;background:#0a0d0c;border-bottom:1px solid var(--line)}#aiwin .aiwtl .calbar .calm{position:absolute;top:2px;width:8px;height:8px;transform:translateX(-50%) rotate(45deg);background:#00e08f;border:1px solid #042;box-shadow:0 0 5px rgba(0,224,143,.85);cursor:pointer}#aiwin .aiwtl .calbar .calm:hover{background:#fff}#aiwin .aiwtl .calbar .calm.bad{background:#ffb03c;box-shadow:0 0 5px rgba(255,176,60,.9)}#aiwin .aiwtl .calbar .calm.man{border:1.5px solid #fff}#aiwCalSt{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;cursor:pointer;white-space:nowrap}#aiwCalSt.ok{background:rgba(0,224,143,.18);color:#00e08f;border:1px solid rgba(0,224,143,.5)}#aiwCalSt.no{background:rgba(255,170,60,.15);color:#ffb03c;border:1px solid rgba(255,170,60,.5)}#aiwin #calField{margin:6px 0}#aiwin #calField .lm{fill:#ffce3a;cursor:pointer}#aiwin #calField .lm:hover{fill:#fff}#aiwin #calField .lm.done{fill:#00e08f}#aiwin #calField .lm.active{fill:#fff;stroke:#fff;stroke-width:1.2}#aiwin .kflist{margin:6px 0;display:flex;flex-direction:column;gap:4px}#aiwin .calrow{display:flex;justify-content:space-between;align-items:center;gap:6px;background:rgba(28,34,38,.7);border:1px solid var(--line);border-radius:7px;padding:4px 8px;font-size:11px;color:#bcd}#aiwin .calrow.sel{border-color:var(--accent);box-shadow:0 0 0 1px rgba(0,224,143,.4) inset}#aiwin .btn.xs{font-size:10px;padding:2px 7px;border-radius:6px;background:rgba(28,34,38,.9);border:1px solid var(--line);color:#dfe;cursor:pointer}#aiwin .btn.xs.danger{color:#ff8d8d;border-color:#5a2a2a}#aiwin .btn.xs:hover{border-color:var(--accent)}#aiwin .shots{display:flex;flex-wrap:wrap;gap:5px;margin:5px 0}#aiwin .seekbar{flex:none;position:relative;height:9px;margin:0 2px;cursor:pointer}#aiwin .seekbar::before{content:'';position:absolute;left:0;right:0;top:6px;height:3px;border-radius:3px;background:rgba(255,255,255,.18)}#aiwin .seekfill{position:absolute;left:0;top:6px;height:3px;border-radius:3px;background:var(--accent);width:0;pointer-events:none}#aiwin .seekhandle{position:absolute;top:1px;left:0;width:11px;height:11px;border-radius:50%;background:#fff;box-shadow:0 0 8px rgba(0,224,143,.9);transform:translateX(-50%);pointer-events:none}#aiwin .seekcals{position:absolute;left:0;right:0;top:0;bottom:0;pointer-events:none;z-index:2}#aiwin .seekcal{position:absolute;top:-3px;width:2px;height:15px;background:#00e08f;box-shadow:0 0 5px rgba(0,224,143,.95);transform:translateX(-50%);border-radius:2px}#aiwin .seekcal.bad{background:#ffb03c;box-shadow:0 0 5px rgba(255,176,60,.95)}#aiwin .seekcal.man{background:#fff;box-shadow:0 0 6px rgba(255,255,255,.95)}#aiwin .aiwtime{font-size:11px;min-width:118px;font-variant-numeric:tabular-nums;color:#cfe}#aiwin .tl select.spd{flex:none;width:62px}#aiwin .tl input.vol{flex:none;width:78px}#aiwin .cvwrap.zoomed{overflow:auto}#aiwin .aiwtabs{flex:none;display:flex;gap:5px;margin:2px 0}#aiwin .aiwtabs button{height:20px;padding:0 9px;border-radius:7px 7px 0 0;border:1px solid var(--line);border-bottom:none;background:rgba(18,23,26,.96);color:#9fb;font-size:10px;font-weight:700;cursor:pointer;letter-spacing:.3px}#aiwin .aiwtabs button.on{background:linear-gradient(180deg,#00e08f,#00b873);color:#062117;box-shadow:0 -2px 10px rgba(0,224,143,.3)}#aiwin .aiwtabs .tlzlabel{margin-left:auto;font-size:9px;color:#9ab;align-self:center}#aiwin .aiwtabs .tlzoom{width:118px;flex:none;align-self:center}#aiwin .aiwtl .tlrow{display:flex;align-items:stretch;min-height:var(--rh,24px);border-bottom:1px solid rgba(255,255,255,.14)}#aiwin .aiwtl .tlrow.grpend{border-bottom:2px solid rgba(0,224,143,.4)}#aiwin .aiwtl .tlrow.tlrul{min-height:20px;border-bottom:1px solid var(--line)}#aiwin .aiwtl .tllabel{display:none;flex:none;width:0;background:#0c100f;border-right:1px solid rgba(0,224,143,.3);font-size:10px;font-weight:700;color:#9fb;align-items:center;gap:5px;padding:0 8px;letter-spacing:.3px;text-transform:uppercase;position:sticky;left:0;z-index:3}#aiwin .aiwtl .tllabel.tlcorner{background:#0a0d0c}#aiwin .aiwtl .tllabel .mute{margin-left:auto;cursor:pointer;font-size:13px}#aiwin .aiwtl .fzbands{position:absolute;left:0;top:20px;bottom:0;pointer-events:none;z-index:1}#aiwin .aiwtl .fzband{position:absolute;top:0;bottom:0;background:rgba(255,255,255,.14);border-left:1.5px solid rgba(255,255,255,.4);border-right:1.5px solid rgba(255,255,255,.4);box-sizing:border-box}#aiwin .aiwtl .fzband.sel{background:rgba(255,255,255,.22);border-color:rgba(255,255,255,.7)}#aiwin .aiwtl .tlsnapwrap{position:absolute;left:0;top:18px;bottom:0;pointer-events:none;z-index:9}#aiwin .aiwtl .tlsnap{position:absolute;top:0;bottom:0;width:2px;background:rgba(90,200,255,.95);box-shadow:0 0 5px rgba(90,200,255,.85)}#aiwin .aiwtl .tllane{flex:1;position:relative;min-width:0}#aiwin .aiwtl .tllane .ruler{position:absolute;inset:0;border-bottom:none}#aiwin .aiwtl .tlempty{position:absolute;left:8px;top:6px;font-size:10px;color:#566}"; document.head.appendChild(s); }
+function aiwinCss(){ if(document.getElementById('aiwinCss'))return; const s=document.createElement('style'); s.id='aiwinCss'; s.textContent="#aiwin{position:fixed;left:0;right:0;top:0;bottom:var(--barH);z-index:120;background:linear-gradient(180deg,#0a0d0c,#070a09);display:flex;flex-direction:column;color:#eef}#aiwin .hd{display:flex;align-items:center;gap:5px;padding:3px 10px;border-bottom:1px solid rgba(0,224,143,.4);background:#070a09}#aiwin .hd b{color:var(--accent);letter-spacing:1px;text-shadow:0 0 12px rgba(0,224,143,.5)}#aiwin .hd .btn{height:23px;padding:0 8px;font-size:11px;border-radius:7px}#aiwin .hd svg{width:16px!important;height:16px!important}#aiwin .hd span[style*='font-size:18px']{font-size:14px!important}#aiwin .bd{flex:1;display:flex;min-height:0}#aiwin .maincol{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}#aiwin .toprow{flex:1;display:flex;min-height:0;min-width:0}#aiwin .tools{width:172px;min-width:52px;max-width:260px;flex:none;background:rgba(18,23,26,.96);border-right:1px solid rgba(0,224,143,.15);display:grid;grid-template-columns:repeat(auto-fill,minmax(44px,1fr));gap:4px;align-content:start;padding:6px;overflow-y:auto;overflow-x:hidden}#aiwin .aiwtsres{width:5px;flex:none;cursor:col-resize;background:#0e1211}#aiwin .aiwtsres:hover{background:var(--accent)}#aiwin .tools button{height:auto;border-radius:7px;border:1px solid var(--line);background:rgba(28,34,38,.8);color:#dfe;font-size:13px;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;padding:3px 2px 2px}#aiwin .tools button small{font-size:7px;line-height:1;color:#9fb3ab;text-align:center;letter-spacing:.1px}#aiwin .tools button.on small{color:#062117}#aiwin .tlres{height:3px;flex:none;cursor:row-resize;background:#1c2228;border-radius:3px}#aiwin .tlres:hover{background:var(--accent)}#aiwCtx{position:fixed;z-index:130;background:#1d1d22;border:1px solid var(--line);border-radius:8px;padding:4px;font-size:13px;box-shadow:0 12px 34px #000b;min-width:150px}#aiwCtx .it{padding:7px 12px;border-radius:6px;cursor:pointer;white-space:nowrap}#aiwCtx .it:hover{background:#2a2a33}#aiwin .tools button.on{background:linear-gradient(180deg,#00e08f,#00b873);color:#062117;border:none;box-shadow:0 4px 14px rgba(0,224,143,.4)}#aiwin .tools button svg{width:16px;height:16px;display:block;margin:0 auto}#aiwin .tools button.on svg path,#aiwin .tools button.on svg line,#aiwin .tools button.on svg circle,#aiwin .tools button.on svg rect,#aiwin .tools button.on svg ellipse,#aiwin .tools button.on svg polygon{stroke:#062117}#aiwin .tools button.on svg [fill='#e6f0ea']{fill:#062117}#aiwin .tools .cat{grid-column:1/-1;font-size:8px;letter-spacing:.8px;color:#7a8;text-transform:uppercase;margin:3px 0 0;padding-left:2px}#aiwin .stage{flex:1;display:flex;flex-direction:column;min-width:0;padding:5px;gap:4px}#aiwin .cvwrap{flex:1;position:relative;min-height:0;background:#000;border:1px solid rgba(0,224,143,.25);border-radius:10px;overflow:hidden;box-shadow:0 0 40px rgba(0,224,143,.1)}#aiwin #aiwcv{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}#aiwin .tl{flex:none;display:flex;align-items:center;gap:4px;background:rgba(18,23,26,.96);border:1px solid var(--line);border-radius:8px;padding:2px 6px}#aiwin .tl input[type=range]{flex:1}#aiwin .tl button{height:22px;padding:0 6px;font-size:11px;border-radius:6px}#aiwin .tl select.spd{height:22px;padding:0 2px}#aiwin .pr{width:250px;flex:none;background:rgba(18,23,26,.96);border-left:1px solid rgba(0,224,143,.15);padding:12px;overflow:auto}#aiwin .pr .arow{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:9px 0;font-size:12px;color:#bcd}#aiwin .pr input[type=range]{width:128px}#aiwin .hint{font-size:11px;color:#8aa}#aiwin .aiwtl{flex:none;height:138px;overflow-x:auto;overflow-y:scroll;background:rgba(12,16,15,.96);border:1px solid var(--line);border-radius:10px;position:relative}#aiwin .aiwtl .ruler{height:18px;background:#0a0d0c;border-bottom:1px solid var(--line);position:relative}#aiwin .aiwtl .ruler span{position:absolute;top:2px;font-size:9px;color:#9ab;transform:translateX(-50%)}#aiwin .aiwtl .ruler i.mtick{position:absolute;bottom:0;width:1px;height:4px;background:rgba(255,255,255,.16)}#aiwin .aiwtl .ruler i.mtick.maj{height:8px;background:rgba(255,255,255,.32)}#aiwin .aiwtl .ph{position:absolute;top:0;bottom:0;width:2px;background:#ffce3a;z-index:6;pointer-events:none}#aiwin .aiwtl .lane{position:relative;height:26px;border-bottom:1px solid rgba(255,255,255,.16)}#aiwin .aiwtl .seg{position:absolute;top:2px;height:calc(var(--rh,24px) - 4px);border-radius:5px;opacity:.94;cursor:move;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#062117;padding:0 9px;overflow:hidden;white-space:nowrap;z-index:3}#aiwin .aiwtl .seg.sel{outline:2px solid #ffce3a}#aiwin .aiwtl .hdl{position:absolute;top:0;width:13px;height:100%;cursor:ew-resize;background:rgba(0,0,0,.4);border-radius:4px}#aiwin .aiwtl .hdl:hover{background:rgba(0,0,0,.62)}#aiwin .aiwtl .vkfm{position:absolute;top:50%;width:11px;height:11px;margin-left:-5.5px;margin-top:-5.5px;transform:rotate(45deg);background:#fff;border:1.5px solid #06210f;cursor:ew-resize;z-index:7;box-shadow:0 1px 3px rgba(0,0,0,.6)}#aiwin .aiwtl .vkfm:hover{background:#ffe38a}#aiwin .aiwtl .fz{position:absolute;top:18px;bottom:0;border-left:2px dashed #4da6ff;z-index:5}#aiwin .aiwtl .calbar{position:relative;height:13px;background:#0a0d0c;border-bottom:1px solid var(--line)}#aiwin .aiwtl .calbar .calm{position:absolute;top:2px;width:8px;height:8px;transform:translateX(-50%) rotate(45deg);background:#00e08f;border:1px solid #042;box-shadow:0 0 5px rgba(0,224,143,.85);cursor:pointer}#aiwin .aiwtl .calbar .calm:hover{background:#fff}#aiwin .aiwtl .calbar .calm.bad{background:#ffb03c;box-shadow:0 0 5px rgba(255,176,60,.9)}#aiwin .aiwtl .calbar .calm.man{border:1.5px solid #fff}#aiwCalSt{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;cursor:pointer;white-space:nowrap}#aiwCalSt.ok{background:rgba(0,224,143,.18);color:#00e08f;border:1px solid rgba(0,224,143,.5)}#aiwCalSt.no{background:rgba(255,170,60,.15);color:#ffb03c;border:1px solid rgba(255,170,60,.5)}#aiwin #calField{margin:6px 0}#aiwin #calField .lm{fill:#ffce3a;cursor:pointer}#aiwin #calField .lm:hover{fill:#fff}#aiwin #calField .lm.done{fill:#00e08f}#aiwin #calField .lm.active{fill:#fff;stroke:#fff;stroke-width:1.2}#aiwin .kflist{margin:6px 0;display:flex;flex-direction:column;gap:4px}#aiwin .calrow{display:flex;justify-content:space-between;align-items:center;gap:6px;background:rgba(28,34,38,.7);border:1px solid var(--line);border-radius:7px;padding:4px 8px;font-size:11px;color:#bcd}#aiwin .calrow.sel{border-color:var(--accent);box-shadow:0 0 0 1px rgba(0,224,143,.4) inset}#aiwin .btn.xs{font-size:10px;padding:2px 7px;border-radius:6px;background:rgba(28,34,38,.9);border:1px solid var(--line);color:#dfe;cursor:pointer}#aiwin .btn.xs.danger{color:#ff8d8d;border-color:#5a2a2a}#aiwin .btn.xs:hover{border-color:var(--accent)}#aiwin .shots{display:flex;flex-wrap:wrap;gap:5px;margin:5px 0}#aiwin .seekbar{flex:none;position:relative;height:9px;margin:0 2px;cursor:pointer}#aiwin .seekbar::before{content:'';position:absolute;left:0;right:0;top:6px;height:3px;border-radius:3px;background:rgba(255,255,255,.18)}#aiwin .seekfill{position:absolute;left:0;top:6px;height:3px;border-radius:3px;background:var(--accent);width:0;pointer-events:none}#aiwin .seekhandle{position:absolute;top:1px;left:0;width:11px;height:11px;border-radius:50%;background:#fff;box-shadow:0 0 8px rgba(0,224,143,.9);transform:translateX(-50%);pointer-events:none}#aiwin .seekcals{position:absolute;left:0;right:0;top:0;bottom:0;pointer-events:none;z-index:2}#aiwin .seekcal{position:absolute;top:-3px;width:2px;height:15px;background:#00e08f;box-shadow:0 0 5px rgba(0,224,143,.95);transform:translateX(-50%);border-radius:2px}#aiwin .seekcal.bad{background:#ffb03c;box-shadow:0 0 5px rgba(255,176,60,.95)}#aiwin .seekcal.man{background:#fff;box-shadow:0 0 6px rgba(255,255,255,.95)}#aiwin .aiwtime{font-size:11px;min-width:118px;font-variant-numeric:tabular-nums;color:#cfe}#aiwin .tl select.spd{flex:none;width:62px}#aiwin .tl input.vol{flex:none;width:78px}#aiwin .cvwrap.zoomed{overflow:auto}#aiwin .aiwtabs{flex:none;display:flex;gap:5px;margin:2px 0}#aiwin .aiwtabs button{height:20px;padding:0 9px;border-radius:7px 7px 0 0;border:1px solid var(--line);border-bottom:none;background:rgba(18,23,26,.96);color:#9fb;font-size:10px;font-weight:700;cursor:pointer;letter-spacing:.3px}#aiwin .aiwtabs button.on{background:linear-gradient(180deg,#00e08f,#00b873);color:#062117;box-shadow:0 -2px 10px rgba(0,224,143,.3)}#aiwin .aiwtabs .tlzlabel{margin-left:auto;font-size:9px;color:#9ab;align-self:center}#aiwin .aiwtabs .tlzoom{width:118px;flex:none;align-self:center}#aiwin .aiwtl .tlrow{display:flex;align-items:stretch;min-height:var(--rh,24px);border-bottom:1px solid rgba(255,255,255,.14)}#aiwin .aiwtl .tlrow.grpend{border-bottom:2px solid rgba(0,224,143,.4)}#aiwin .aiwtl .tlrow.tlrul{min-height:20px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:8;background:#0a0d0c}#aiwin .aiwtl .tllabel{display:none;flex:none;width:0;background:#0c100f;border-right:1px solid rgba(0,224,143,.3);font-size:10px;font-weight:700;color:#9fb;align-items:center;gap:5px;padding:0 8px;letter-spacing:.3px;text-transform:uppercase;position:sticky;left:0;z-index:3}#aiwin .aiwtl .tllabel.tlcorner{background:#0a0d0c}#aiwin .aiwtl .tllabel .mute{margin-left:auto;cursor:pointer;font-size:13px}#aiwin .aiwtl .fzbands{position:absolute;left:0;top:20px;bottom:0;pointer-events:none;z-index:1}#aiwin .aiwtl .fzband{position:absolute;top:0;bottom:0;background:rgba(255,255,255,.14);border-left:1.5px solid rgba(255,255,255,.4);border-right:1.5px solid rgba(255,255,255,.4);box-sizing:border-box}#aiwin .aiwtl .fzband.sel{background:rgba(255,255,255,.22);border-color:rgba(255,255,255,.7)}#aiwin .aiwtl .tlsnapwrap{position:absolute;left:0;top:18px;bottom:0;pointer-events:none;z-index:9}#aiwin .aiwtl .tlsnap{position:absolute;top:0;bottom:0;width:2px;background:rgba(90,200,255,.95);box-shadow:0 0 5px rgba(90,200,255,.85)}#aiwin .aiwtl .tllane{flex:1;position:relative;min-width:0}#aiwin .aiwtl .tllane .ruler{position:absolute;inset:0;border-bottom:none}#aiwin .aiwtl .tlempty{position:absolute;left:8px;top:6px;font-size:10px;color:#566}"; document.head.appendChild(s); }
 function shiftAnno(an,dx,dy){ const o=Object.assign({},an); ['x','y','x1','y1','x2','y2'].forEach(k=>{ if(o[k]!=null)o[k]=o[k]+(k[0]==='x'?dx:dy); }); if(o.pts)o.pts=o.pts.map(p=>[p[0]+dx,p[1]+dy]); return o; }
 // Ancre VISUELLE d'un dessin = le point EXACT où drawShape le dessine (centre de l'anneau/faisceau/spot).
 // DOIT coller à drawShape : sinon un dessin qui suit un joueur s'affiche décalé du rectangle (écart x1−x).
@@ -7093,15 +7144,24 @@ function followShape(c,W,H,an,t,act){ if(an.trackOnly)return;
     else if(an.vkf&&an.vkf.length){ const e=trkInterp({points:an.vkf},t); if(e){ a2.x2=e.x; a2.y2=e.y; } }
     drawShape(c,W,H,a2); return; }
   if(an.follow&&an.follow.length){
+    // s57 : FORME À PLUSIEURS JOUEURS (polygone / mur / zone) -> un seul joueur sans piste à cet instant ne fait
+    // plus disparaître TOUTE la forme : ce sommet reste à sa dernière position connue, les autres suivent leurs
+    // joueurs. La forme ne se masque que s'il reste moins de 2 joueurs réellement suivis. (Ligne / dessin d'un
+    // seul joueur : règle inchangée -> masqué si son joueur est absent.)
+    const _multi=(an.type==='poly'||an.type==='mur'||an.type==='zone')&&an.follow.length>=3;
+    if(_multi){ let _ok=0, _trk=0; for(const fk of an.follow){ if(fk&&fk.pts&&fk.pts.length){ _trk++; if(trkCovers(fk.pts,t))_ok++; } } if(_trk&&_ok<2)return; }
+    else {
     // joueur suivi absent (sorti du cadre / trou dans la piste) -> on masque le dessin à cet instant.
     for(const fk of an.follow){ if(fk&&fk.pts&&fk.pts.length&&!trkCovers(fk.pts,t))return; }
     // Ne pas dessiner hors de la plage temporelle du suivi : trkInterp bloque sur le dernier point,
     // ce qui laissait des rectangles "fantômes" affichés après la fin de l'action. On masque au-delà.
     for(const fk of an.follow){ if(fk&&fk.pts&&fk.pts.length){ let _t0=Infinity,_t1=-Infinity; for(const p of fk.pts){ if(p.t<_t0)_t0=p.t; if(p.t>_t1)_t1=p.t; } if(t<_t0-0.15||t>_t1+0.15)return; } }
+    }
     const P=an.follow.map(fk=>{ if(fk&&fk.pts){ const p=trkInterp({points:fk.pts},t); if(!p)return null; return {x:p.x, y:p.y}; } if(fk&&fk.xy)return {x:fk.xy[0],y:fk.xy[1]}; return null; }); if(aiwin._dragAnchor&&aiwin._dragAnchor.anno===an){ P[aiwin._dragAnchor.slot]={x:aiwin._dragAnchor.xy[0],y:aiwin._dragAnchor.xy[1]}; } const a=Object.assign({},an);
     if(an.type==='mur'){ const pp=P.filter(Boolean); if(pp.length){ a.pts=pp.map(p=>[p.x,p.y]); a.x1=pp[0].x; a.y1=pp[0].y; a.x2=pp[pp.length-1].x; a.y2=pp[pp.length-1].y; } }
     else if(an.type==='line'){ a.pts=P.map((p,i)=> p?[p.x,p.y]:((an.pts&&an.pts[i])||[0.5,0.5])); }
-    else if(an.type==='poly'||an.type==='zone'){ const pts=P.map(p=> p?[p.x,p.y]:null).filter(Boolean); if(pts.length>=2){ if(an.type==='zone')a.c=pts; else a.pts=pts; } }
+    else if(an.type==='poly'){ const pts=P.map(p=> p?[p.x,p.y]:null).filter(Boolean); if(pts.length>=2){ a.pts=pts; a._keepOrder=(pts.length>=3); } }   // s59 : joueurs reliés DANS L'ORDRE OÙ TU LES AS CLIQUÉS (la forme se déforme, aucun réordonnancement)
+    else if(an.type==='zone'){ const pts=P.map(p=> p?[p.x,p.y]:null).filter(Boolean); if(pts.length>=2){ a.c=pts; } }
     else { if(P[0]){ const _A=_drawAnchorXY(an); const dx=P[0].x-_A.x, dy=P[0].y-_A.y; Object.assign(a,shiftAnno(an,dx,dy)); } }
     drawShape(c,W,H,a); return; }
   let a=an; if(an.trk&&an.trk.length){ if(!trkCovers(an.trk,t))return; const p=correctedPos(an,t), p0=correctedPos(an,an.t0!=null?an.t0:an.trk[0].t); if(p&&p0)a=shiftAnno(an,p.x-p0.x,p.y-p0.y); } drawShape(c,W,H,a); }
@@ -7625,7 +7685,11 @@ async function aiEnsureUploaded(){
   // SANS copie ni chargement du gros fichier. Si le fichier a bougé/été supprimé -> on prévient et on stoppe.
   if(window.matchlyzVideoRef && project && project.videoPath && !window._aiBlobOverride){
     try{ const ex=await window.matchlyzVideoRef.exists(project.videoPath);
-      if(ex){ const sz=project.videoSize||0; const vkey=((project.videoName||'video')+'_'+sz).replace(/[^a-zA-Z0-9_.-]/g,'_');
+      if(ex){
+        // PHASE C : si c'est un direct pas encore finalisé, on le finalise SUR PLACE ici (1er montage/suivi),
+        // avant de le référencer -> le moteur lit un MP4 propre/seekable, et toujours AUCUNE copie.
+        try{ await _liveFinalizeInPlace(); }catch(e){}
+        const sz=project.videoSize||0; const vkey=((project.videoName||'video')+'_'+sz).replace(/[^a-zA-Z0-9_.-]/g,'_');
         const fd=new FormData(); fd.append('vkey',vkey); fd.append('path',project.videoPath);
         const r=await fetch(AI_BASE+'/register_local',{method:'POST',body:fd}).then(r=>r.json());
         if(r&&r.ok){ aiBarHide(); return vkey; } }
@@ -8686,6 +8750,7 @@ function openBoard(existing){
   try{ openAiWin(a); }catch(e){ alert('Erreur ouverture tableau : '+(e&&e.message||e)); return; }
   aiwin._board=true; aiwin.tool='select'; aiwin._boardView=a._boardView||'top'; aiwin._boardT=0; aiwin._boardKey=0;
   try{ aiwinResize(); }catch(e){} try{ aiwinParams(); }catch(e){} try{ aiwinDraw(); }catch(e){} try{ renderBoardTL(); }catch(e){}
+  try{ setNav('board'); }catch(e){}
 }
 // ===== BIBLIOTHÈQUE GLOBALE DE MONTAGES NOMMÉS =====
 let _montDoc=null;
@@ -9206,7 +9271,7 @@ function aiwinLoop(){ if(!aiwin.open){aiwin.raf=0;return;}
   }
   // Mode Correction IA : réactualise les rectangles détectés pour l'image courante (à l'arrêt), pour cliquer le bon joueur
   { const _plcDet=['line','mur','poly','spot','proj','num','ptext','speed','offside','vision','zoom','text','ghost','trace'].includes(aiwin.tool) && aiwin.tab!=='track' && !aiwin.calMode; if(_plcDet)aiwin._showDet=true; }
-  if((aiwin._fixMode||aiwin._showDet) && !aiwinPlaying && !aiwin._detBusy){ const _ct=vid.currentTime||0; if(Math.abs(_ct-(aiwin._detT!=null?aiwin._detT:-9))>0.05){ const _n=(performance.now?performance.now():Date.now()); if(_n-(aiwin._detReqTs||0)>170){ aiwin._detReqTs=_n; aiwin._detBusy=true; try{ const _p=ensureDetBoxes(); if(_p&&_p.finally)_p.finally(()=>{aiwin._detBusy=false;}); else aiwin._detBusy=false; }catch(e){ aiwin._detBusy=false; } } } }
+  if((aiwin._fixMode||aiwin._showDet) && !aiwinPlaying && !aiwin._detBusy){ const _ct=vid.currentTime||0; if(Math.abs(_ct-(aiwin._detT!=null?aiwin._detT:-9))>0.012){ const _n=(performance.now?performance.now():Date.now()); if(_n-(aiwin._detReqTs||0)>120){ aiwin._detReqTs=_n; aiwin._detBusy=true; try{ const _p=ensureDetBoxes(); if(_p&&_p.finally)_p.finally(()=>{aiwin._detBusy=false;}); else aiwin._detBusy=false; }catch(e){ aiwin._detBusy=false; } } } }
   aiwinDraw(); const a=aiwin.action, dur=(a.out-a.in)||1;
   if(aiwinPlaying){
     // ARRÊT SUR IMAGE : quand la lecture atteint fz.t, on GÈLE l'image (vidéo en pause sur fz.t) pendant « dur » s
@@ -9325,17 +9390,16 @@ function aiwinDraw(){ const cvt=document.getElementById('aiwcv'); if(!cvt)return
     // qu'on CORRIGE (glisser en cours), ou en mode d'accroche. Sinon (lecture, sélection/validation) : rien.
     const _placing=['line','mur','poly','spot','proj','num','ptext','speed','offside','vision','zoom','text','ghost','trace'].includes(aiwin.tool) && aiwin.tab!=='track' && !aiwin.calMode;
     const _showBoxes = !_bd && !aiwin._rendering && !aiwinPlaying && !aiwin._manMap && (aiwin._fixMode || aiwin._correcting || aiwin.tool==='correct' || aiwin._follow || _placing || (aiwin._playersOn && !aiwin._board));
-    if(_showBoxes){ boxes=_mergeBoxes(_mergeBoxes((aiwin.cands||[]).map(cd=>_candBoxAt(cd,t)).filter(Boolean), _perframeBoxesAt(t)), (aiwin._detBoxes||[]));
-      // + les rectangles de TES pistes (corrections IA) : on les AJOUTE sans fusion (pour ne jamais les perdre)
-      // et on les marque _mine -> ils seront dessinés dans une couleur DISTINCTE (repérables au premier coup d'œil).
-      const _mine=_myTrackBoxesAt(t); if(_mine.length)boxes=(boxes||[]).concat(_mine); }
-    if(boxes){ let snap=null; if(aiwin._dragPos){ let bd=0.3; boxes.forEach(b=>{ const d=Math.hypot(b.x-aiwin._dragPos[0],b.y-aiwin._dragPos[1]); if(d<bd){bd=d;snap=b;} }); } aiwin._snapBox=snap;
+    if(_showBoxes){ // s57 : MÊME liste que celle utilisée au clic (_shownPlayerBoxes) ; tes pistes (_mine) incluses.
+      boxes=_shownPlayerBoxes(t); }
+    if(boxes){ let snap=null; if(aiwin._dragPos){ /* s57 : TA position d'abord — on ne s'accroche qu'à une boîte qui CONTIENT ton point (pieds les plus proches), plus d'aimantation à distance */ const qx=aiwin._dragPos[0],qy=aiwin._dragPos[1]; let bd=1e9; boxes.forEach(b=>{ const w=(b.w||0.05),h=(b.h||0.13); if(qx>=b.x-w*0.5&&qx<=b.x+w*0.5&&qy>=b.y-h&&qy<=b.y+h*0.12){ const d=Math.hypot(b.x-qx,b.y-qy); if(d<bd){bd=d;snap=b;} } }); } aiwin._snapBox=snap;
       // survol (outil ligne/mur/poly) : joueur visé en vert
-      let hov=null; if(aiwin._mouse && ['line','mur','poly','spot','proj','num','ptext','speed','offside','vision','zoom','text','ghost','trace'].includes(aiwin.tool)){ const hb=nearestPlayerBox(aiwin._mouse[0],aiwin._mouse[1],t); if(hb)hov=hb; }
+      let hov=null; if(aiwin._mouse && ['line','mur','poly','spot','proj','num','ptext','speed','offside','vision','zoom','text','ghost','trace'].includes(aiwin.tool)){ hov=pickGreenBox(aiwin._mouse[0],aiwin._mouse[1],t,boxes); }
+      aiwin._hovGreen=hov?{b:hov,t:t,mx:aiwin._mouse[0],my:aiwin._mouse[1]}:null;
       let pendRecs=[]; if(aiwin._building&&(aiwin.action.aiAnnos||[]).indexOf(aiwin._building)>=0){ pendRecs=(aiwin._building.follow||[]).map(fk=>{ const p=fk&&fk.pts?trkInterp({points:fk.pts},t):(fk&&fk.xy?{x:fk.xy[0],y:fk.xy[1]}:null); return p?{seed:[p.x,p.y]}:null; }).filter(Boolean); }
       const isPend=b=>pendRecs.some(r=>Math.abs(b.x-r.seed[0])<0.02&&Math.abs(b.y-r.seed[1])<0.02);
       boxes.forEach(b=>{ const bw=(b.w||0.05)*dw,bh=(b.h||0.13)*dh,x=ox+b.x*dw,y=oy+b.y*dh;
-        const green=(b===snap)||(hov&&Math.hypot(b.x-hov.x,b.y-hov.y)<0.001)||isPend(b);
+        const green=(b===snap)||(hov&&b===hov)||isPend(b);
         c.save(); if(green){ c.lineWidth=3;c.strokeStyle='#00e08f';c.shadowColor='rgba(0,224,143,.7)';c.shadowBlur=10;c.strokeRect(x-bw/2,y-bh,bw,bh);c.shadowBlur=0;c.globalAlpha=.22;c.fillStyle='#00e08f';c.fillRect(x-bw/2,y-bh,bw,bh);}
         else if(b._mine){ c.lineWidth=2.2;c.strokeStyle='#ffce3a';c.shadowColor='rgba(0,0,0,.6)';c.shadowBlur=3;c.strokeRect(x-bw/2,y-bh,bw,bh);c.shadowBlur=0;c.globalAlpha=.14;c.fillStyle='#ffce3a';c.fillRect(x-bw/2,y-bh,bw,bh);} /* TES rectangles de correction : en JAUNE, distincts de l'auto (blanc) */
         else { c.lineWidth=1;c.strokeStyle='rgba(255,255,255,.95)';c.shadowColor='rgba(0,0,0,.6)';c.shadowBlur=2;c.strokeRect(x-bw/2,y-bh,bw,bh);} c.restore(); });
@@ -9363,7 +9427,7 @@ function aiwinDraw(){ const cvt=document.getElementById('aiwcv'); if(!cvt)return
       const BX0=bR2.x0*dw, BY0=bR2.y0*dh, BWp=(bR2.x1-bR2.x0)*dw, BHp=(bR2.y1-bR2.y0)*dh;
       c.strokeStyle=col; c.lineWidth=1; c.beginPath(); c.moveTo(BX0+BWp/2,BY0+BHp); c.lineTo(x,y-bh); c.stroke();
       c.fillStyle='rgba(3,12,8,.9)'; c.fillRect(BX0,BY0,BWp,BHp); c.strokeStyle=col; c.strokeRect(BX0,BY0,BWp,BHp);
-      c.fillStyle=col; c.textAlign='center'; c.textBaseline='middle'; c.font='bold '+Math.max(9,dw/120)+'px sans-serif'; c.fillText(String(pnumOf(aiwin.action,h.an,h.slot)),BX0+BWp/2,BY0+BHp/2+1); c.textAlign='left'; c.textBaseline='alphabetic';
+      c.fillStyle=col; c.textAlign='center'; c.textBaseline='middle'; c.font='bold '+Math.max(9,dw/120)+'px sans-serif'; c.fillText(String(jnumOf(aiwin.action,h.an,h.slot)),BX0+BWp/2,BY0+BHp/2+1); c.textAlign='left'; c.textBaseline='alphabetic';
       c.restore(); }catch(e){} });
     // pendant un déplacement : anneau vert sur le joueur cible détecté
     if(aiwin._fixDrag&&aiwin._fixDrag.onTarget&&aiwin._fixDrag.tgt){ const tb=aiwin._fixDrag.tgt; c.save(); c.strokeStyle='#00e676'; c.lineWidth=3; c.shadowColor='rgba(0,0,0,.6)'; c.shadowBlur=6; c.beginPath(); c.arc(tb.x*dw,tb.y*dh,Math.max(14,dw*0.026),0,7); c.stroke(); c.restore(); }
@@ -9496,6 +9560,7 @@ function finalizeFollowDraw(){ const pend=aiwin.pend; if(!pend||!pend.line||pend
   an.tin=a.in; an.tout=a.out; a.aiAnnos.push(an); aiwin.sel=an; aiwin.selMulti=[an]; save(); aiwinParams(); renderAiTimeline();
   if(anyBox){ recs.forEach((r,i)=>{ if(r.box)startFollowTrack(an,i,r.seed[0],r.seed[1]); }); aiBar('✅ Dessin posé — suivi lancé.'); setTimeout(aiBarHide,1600); }
   else { aiBar('Dessin fixe.'); setTimeout(aiBarHide,1400); } }
+// s59 — POLYGONE : sommets reliés dans l'ORDRE DES CLICS (an.follow), sans enveloppe convexe ni réordonnancement.
 function syncFollowGeom(an,t){ t=t!=null?t:vid.currentTime; const P=(an.follow||[]).map(f=> f&&f.pts?trkInterp({points:f.pts},t):(f&&f.xy?{x:f.xy[0],y:f.xy[1]}:null)).filter(Boolean); if(!P.length)return; an.pts=P.map(p=>[p.x,p.y]); an.x1=P[0].x; an.y1=P[0].y; an.x2=P[P.length-1].x; an.y2=P[P.length-1].y; }
 function convexHull(pts){ if(!pts||pts.length<3)return (pts||[]).slice(); const p=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]); const cross=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]); const lo=[]; for(const q of p){ while(lo.length>=2&&cross(lo[lo.length-2],lo[lo.length-1],q)<=0)lo.pop(); lo.push(q);} const up=[]; for(let i=p.length-1;i>=0;i--){ const q=p[i]; while(up.length>=2&&cross(up[up.length-2],up[up.length-1],q)<=0)up.pop(); up.push(q);} lo.pop(); up.pop(); return lo.concat(up); }
 function applyFollow(){ const f=aiwin._follow; if(!f||!f.got.length)return; const a=f.anno; const trks=f.got.map(cd=>({pts:_fullCandPts(cd).map(p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h}))}));
@@ -9515,19 +9580,30 @@ function _bridgeTrk(before, after){ if(!before.length||!after.length)return befo
   const A=before[before.length-1], B=after[0], gap=B.t-A.t;
   // On ne comble QUE les PETITS trous (< ~1 s = le joueur est là mais le suivi a bafouillé). Un GROS trou
   // (joueur sorti de l'écran) reste un VRAI trou -> le dessin disparaît puis réapparaît au retour.
-  if(gap>0.2 && gap<=1.0){ const n=Math.max(1,Math.round(gap/0.15)), mid=[]; for(let i=1;i<n;i++){ const f=i/n; mid.push({t:+(A.t+gap*f).toFixed(3), x:A.x+(B.x-A.x)*f, y:A.y+(B.y-A.y)*f, w:(A.w!=null&&B.w!=null)?A.w+(B.w-A.w)*f:(B.w||A.w), h:(A.h!=null&&B.h!=null)?A.h+(B.h-A.h)*f:(B.h||A.h)}); } return before.concat(mid).concat(after); }
+  if(gap>0.2 && gap<=1.5){ const n=Math.max(1,Math.round(gap/0.15)), mid=[]; for(let i=1;i<n;i++){ const f=i/n; mid.push({t:+(A.t+gap*f).toFixed(3), x:A.x+(B.x-A.x)*f, y:A.y+(B.y-A.y)*f, w:(A.w!=null&&B.w!=null)?A.w+(B.w-A.w)*f:(B.w||A.w), h:(A.h!=null&&B.h!=null)?A.h+(B.h-A.h)*f:(B.h||A.h)}); } return before.concat(mid).concat(after); }
   return before.concat(after); }
 // RECOUD les FRAGMENTS d'un même joueur : le moteur redonne parfois un nouvel identifiant quand le joueur
 // est brièvement masqué (occlusion, bord d'écran, mouvement caméra). On enchaîne automatiquement le fragment
 // SUIVANT s'il reprend juste après (< 1,5 s) et proche en position (< 0,07) -> une piste CONTINUE. Une vraie
 // absence (gros trou / loin) N'est PAS recousue -> elle reste un trou (le dessin disparaît puis on prolonge).
+// s59 — RECOLLAGE STRICT de deux morceaux de piste du MÊME joueur : le morceau suivant doit commencer là où le joueur
+// est attendu (vitesse), à moins d'un rectangle de distance (+ marge selon le temps écoulé, ≤ 1 s), taille cohérente.
+// Si deux morceaux sont plausibles (deux joueurs proches), on NE recolle PAS (avant : rayon de 7 à 9 % de l'écran, 2 s
+// de trou -> la piste pouvait repartir sur un voisin).
+function _bestStitch(pts,cands,used,dir){ if(!pts||!pts.length)return null; const n=pts.length, e=dir>0?pts[n-1]:pts[0];
+  let vx=0,vy=0; if(n>=2){ let a2,b2; if(dir>0){ b2=pts[n-1]; a2=pts[n-2]; for(let k=n-2;k>=0;k--){ a2=pts[k]; if(b2.t-a2.t>=0.3)break; } } else { a2=pts[0]; b2=pts[1]; for(let k=1;k<n;k++){ b2=pts[k]; if(b2.t-a2.t>=0.3)break; } } const dtv=(b2.t-a2.t)||1; vx=(b2.x-a2.x)/dtv; vy=(b2.y-a2.y)/dtv; vx=Math.max(-0.5,Math.min(0.5,vx)); vy=Math.max(-0.5,Math.min(0.5,vy)); }
+  const w=Math.max(0.008,e.w||0.02), h=Math.max(0.02,e.h||0.06); let best=null,d1=1e9,d2=1e9;
+  (cands||[]).forEach(c=>{ if(used.has(c)||!c||!c.points||!c.points.length)return; const f=dir>0?c.points[0]:c.points[c.points.length-1]; const dt=dir>0?(f.t-e.t):(e.t-f.t); if(dt<-0.1||dt>1.0)return;
+    const hr=(f.h||h)/h; if(hr<0.65||hr>1.55)return; const sdt=Math.max(0,dt)*dir; const px=e.x+vx*sdt, py=e.y+vy*sdt; const d=Math.hypot(f.x-px,(f.y-py)*0.8);
+    const gate=Math.min(0.035,w*(0.75+2.0*Math.max(0,dt))); if(d>gate)return; if(d<d1){ d2=d1; d1=d; best=c; } else if(d<d2)d2=d; });
+  if(!best)return null; if(d2<1e8 && d2<d1*1.8+w*0.2)return null; return best; }
 function stitchTrackFrom(startCand, fromT){ if(!startCand||!startCand.points)return [];
   const cands=(aiwin.cands&&aiwin.cands.length)?aiwin.cands:((aiwin.action&&typeof aiCacheMap!=='undefined'&&aiCacheMap[aiwin.action.id])||[]);
   const cp=p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h});
   let pts=startCand.points.filter(p=>p.t>=((fromT!=null?fromT:-1e9)-1e-3)).map(cp);
   const used=new Set([startCand]); let guard=0;
-  while(guard++<40){ const last=pts[pts.length-1]; if(!last)break; let nb=null,ns=1e9;
-    (cands||[]).forEach(c=>{ if(used.has(c)||!c||!c.points||!c.points.length)return; const f=c.points[0]; const dt=f.t-last.t; if(dt<-0.2||dt>1.5)return; const d=Math.hypot(f.x-last.x,f.y-last.y); if(d>0.07)return; const s=dt+d*3; if(s<ns){ns=s;nb=c;} });
+  while(guard++<40){ const last=pts[pts.length-1]; if(!last)break;
+    const nb=_bestStitch(pts,cands,used,1);   // s59 : recollage STRICT (taille d'un joueur, vitesse) — ambigu = on s'arrête
     if(!nb)break; used.add(nb); const add=nb.points.filter(p=>p.t>last.t+1e-3).map(cp); if(!add.length)break; pts=pts.concat(add); }
   return pts; }
 // Piste COMPLÈTE d'un joueur analysé : on RECOUD tous ses morceaux (stitchTrackFrom) pour qu'un dessin
@@ -9538,12 +9614,10 @@ function _fullCandPts(cd){ if(!cd||!cd.points||!cd.points.length)return (cd&&cd.
     const cp=p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h});
     let pts=cd.points.map(cp); const used=new Set([cd]); let g;
     // VERS L'AVANT : on recolle les morceaux qui suivent (même joueur).
-    g=0; while(g++<80){ const last=pts[pts.length-1]; let nb=null,ns=1e9;
-      (cands||[]).forEach(c=>{ if(used.has(c)||!c||!c.points||!c.points.length)return; const f=c.points[0]; const dt=f.t-last.t; if(dt<-0.3||dt>2.0)return; const d=Math.hypot(f.x-last.x,f.y-last.y); if(d>0.09)return; const s=Math.abs(dt)+d*3; if(s<ns){ns=s;nb=c;} });
+    g=0; while(g++<80){ const last=pts[pts.length-1]; const nb=_bestStitch(pts,cands,used,1);   // s59 : strict
       if(!nb)break; used.add(nb); const add=nb.points.filter(p=>p.t>last.t+1e-3).map(cp); if(!add.length)break; pts=pts.concat(add); }
     // VERS L'ARRIÈRE : on recolle les morceaux qui PRÉCÈDENT -> le dessin couvre AUSSI le début du clip.
-    g=0; while(g++<80){ const first=pts[0]; let nb=null,ns=1e9;
-      (cands||[]).forEach(c=>{ if(used.has(c)||!c||!c.points||!c.points.length)return; const l=c.points[c.points.length-1]; const dt=first.t-l.t; if(dt<-0.3||dt>2.0)return; const d=Math.hypot(l.x-first.x,l.y-first.y); if(d>0.09)return; const s=Math.abs(dt)+d*3; if(s<ns){ns=s;nb=c;} });
+    g=0; while(g++<80){ const first=pts[0]; const nb=_bestStitch(pts,cands,used,-1);   // s59 : strict
       if(!nb)break; used.add(nb); const add=nb.points.filter(p=>p.t<first.t-1e-3).map(cp); if(!add.length)break; pts=add.concat(pts); }
     pts.sort((a,b)=>a.t-b.t); return (pts.length>=cd.points.length)?pts:cd.points;
   }catch(e){ return cd.points; } }
@@ -9556,33 +9630,49 @@ function _fullCandPts(cd){ if(!cd||!cd.points||!cd.points.length)return (cd&&cd.
 // personne la plus proche image par image (vitesse constante) -> TA sélection est absolue, AUCUN recalcul
 // serveur. On s'arrête sur un GROS trou (joueur sorti de l'écran) -> tu prolonges au retour.
 function followPlayerFrom(sx, sy, fromT){ const a=aiwin.action; if(!a)return null;
-  const cs=(aiwin.cands&&aiwin.cands.length)?aiwin.cands:((typeof aiCacheMap!=='undefined'&&aiCacheMap[a.id])||[]);
-  const pool=[]; cs.concat(a.tracks||[]).forEach(c=>{ ((c&&c.points)||[]).forEach(p=>{ if(p.t>=fromT-1e-3)pool.push(p); }); });
-  if(!pool.length)return null; pool.sort((p,q)=>p.t-q.t);
-  const out=[]; let cx=sx,cy=sy,vx=0,vy=0,lt=fromT,i=0,started=false;
-  const VMAX=1.2;                       // vitesse max (normalisée/s) -> anti-emballement
-  while(i<pool.length){ const tt=pool[i].t; let j=i; const frame=[]; while(j<pool.length&&Math.abs(pool[j].t-tt)<1e-3){ frame.push(pool[j]); j++; }
-    const dt=Math.max(0.001,tt-lt);
-    const pvx=Math.max(-VMAX,Math.min(VMAX,vx)), pvy=Math.max(-VMAX,Math.min(VMAX,vy));
-    const px=cx+(started?pvx*dt:0), py=cy+(started?pvy*dt:0);   // 1er accrochage : pas de prédiction (v=0)
-    // GATE : STRICT au 1er accrochage (le joueur EST sous ton point), et BORNÉ ensuite -> jamais de saut lointain.
-    const gate=started?Math.min(0.10,0.045+dt*0.35):0.055;
-    let best=null,bd=gate; frame.forEach(p=>{ const d=Math.hypot(p.x-px,p.y-py); if(d<bd){bd=d;best=p;} });
-    if(best){ const nvx=(best.x-cx)/dt, nvy=(best.y-cy)/dt; vx=0.5*vx+0.5*nvx; vy=0.5*vy+0.5*nvy; cx=best.x; cy=best.y; lt=tt; started=true; out.push({t:tt,x:best.x,y:best.y,w:best.w,h:best.h}); }
-    else if(started && tt-lt>1.0){ break; }   // gros trou -> le joueur est sorti
-    i=j; }
+  // s59 : même moteur de liaison STRICT que le dépôt d'un dessin (départ = le rectangle sous ton point, fenêtre de la
+  // taille d'un joueur, arrêt si deux joueurs sont possibles). Avant : rayon de 4,5 à 10 % de l'écran -> saut sur un voisin.
+  let frames=_pfFrames();
+  if(!frames){ const cs=(aiwin.cands&&aiwin.cands.length)?aiwin.cands:((typeof aiCacheMap!=='undefined'&&aiCacheMap[a.id])||[]); const by={};
+    cs.concat(a.tracks||[]).forEach(c=>{ ((c&&c.points)||[]).forEach(p=>{ const k=Math.round(p.t*1000); (by[k]=by[k]||{t:p.t,b:[]}).b.push({x:p.x,y:p.y,w:p.w,h:p.h}); }); });
+    frames=Object.keys(by).map(k=>by[k]).sort((u,v)=>u.t-v.t); if(!frames.length)return null; }
+  let ci=-1,cd=1e9; for(let i=0;i<frames.length;i++){ const d=Math.abs(frames[i].t-fromT); if(d<cd){cd=d;ci=i;} } if(ci<0||cd>0.08)return null;
+  let seed=null,bd=1e9; for(const b of (frames[ci].b||[])){ const bw=(b.w||0.05),bh=(b.h||0.13); if(sx>=b.x-bw*0.6&&sx<=b.x+bw*0.6&&sy>=b.y-bh*1.0&&sy<=b.y+bh*0.2){ const d=Math.hypot(b.x-sx,b.y-sy); if(d<bd){bd=d;seed=b;} } }
+  if(!seed)return null;
+  const s0={t:frames[ci].t,x:seed.x,y:seed.y,w:seed.w,h:seed.h}; const F=_chainBoxes(frames,ci,s0,1);
+  const out=[s0].concat(F.acc); out._fwdStop=F.stop;
   return (out.length>=2)?out:null; }
+// s57 — CORRECTION d'un dessin collé à un joueur : l'extrémité glissée va sur le rectangle choisi et Y RESTE.
+// Avant : on cherchait « le joueur le plus proche » image par image (rayon de 5,5 % de l'écran) -> dans un groupe,
+// le dessin sautait sur un voisin ; et la correction s'écrivait toujours sur le joueur n°1 du dessin, pas forcément
+// sur l'extrémité déplacée. Maintenant : la piste PROPRE du rectangle choisi est reprise telle quelle, sur la SEULE
+// extrémité déplacée, à partir de l'instant de la correction (tout ce qui est avant est conservé).
+function correctFollowSlotTo(an,slot,CT,gb,lx,ly){ if(!an||!an.follow||!an.follow[slot])return;
+  if(gb){ let pts=null, pid=null;
+    if(gb._an&&gb._an.trk&&gb._an.trk.length){ pts=gb._an.trk; pid=gb._an._pid; }
+    else if(gb._cd&&gb._cd.points&&gb._cd.points.length){ pts=stitchTrackFrom(gb._cd,CT); if(!pts||!pts.length)pts=gb._cd.points; pid=gb._cd.id; }
+    if(pts){ const old=an.follow[slot].pts||[]; const before=old.filter(p=>p.t<CT-1e-3);
+      const after=pts.filter(p=>p.t>=CT-1e-3).map(p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h}));
+      if(after.length){ an.follow[slot]={pts:_bridgeTrk(before,after).sort((u,v)=>u.t-v.t),_fix:CT};
+        if(an.follow.length===1&&pid!=null)an._pid=pid;
+        try{ syncFollowGeom(an,CT); }catch(e){} save(); aiwinParams(); renderAiTimeline();
+        aiBar('✅ Corrigé — le dessin reste sur le rectangle choisi à partir d\'ici.'); setTimeout(aiBarHide,1800); return; } }
+    // rectangle choisi SANS piste (détection seule) -> suivi lancé EXACTEMENT depuis ce rectangle (taille incluse)
+    if(!an._jobs)an._jobs=[]; startFollowTrack(an,slot,gb.x,gb.y,CT,gb.w,gb.h,true); return; }
+  // déposé hors de tout rectangle -> suivi depuis le point EXACT du curseur (aucun rattachement à un voisin)
+  if(!an._jobs)an._jobs=[]; startFollowTrack(an,slot,lx,ly,CT,0,0,true); }
 function correctPlayerFrom(an, CT, sxr, syr){ const a=aiwin.action; if(!a||!an)return false;
   // TA SÉLECTION EST ABSOLUE : on suit LE joueur exactement sous ton point, à partir du curseur, avec les
   // détections déjà calculées (aucun recalcul). L'AVANT du curseur est conservé tel quel.
   const after=followPlayerFrom(sxr,syr,CT); if(!after||!after.length)return false;
+  if(after[after.length-1].t<a.out-0.3)return false;   // s59 : liaison interrompue (joueurs proches) -> le moteur prend le relais sur ta boîte
   const pid=an._pid; const targets=(pid!=null)?(a.aiAnnos||[]).filter(o=>o._pid===pid):[an];
   targets.forEach(o=>{ const old=(o.follow&&o.follow[0]&&o.follow[0].pts)?o.follow[0].pts:(o.trk||[]);
     const before=old.filter(p=>p.t<CT-1e-3);
     const merged=_bridgeTrk(before,after).sort((x,y)=>x.t-y.t);
     if(o.follow&&o.follow[0]){ o.follow[0]={pts:merged,_ref:true}; } else { o.trk=merged; } });
   save(); aiwinParams(); renderAiTimeline(); aiBar('✅ Corrigé — suivi manuel sur TON joueur à partir du curseur (moteur robuste, aucun recalcul).'); setTimeout(aiBarHide,1900); return true; }
-function trkCovers(pts,t){ if(!pts||!pts.length)return false; let first=pts[0].t,last=pts[0].t; for(const p of pts){ if(p.t<first)first=p.t; if(p.t>last)last=p.t; } if(t<first-0.25||t>last+0.25)return false; let prev=null,next=null; for(const p of pts){ if(p.t<=t+1e-6&&(!prev||p.t>prev.t))prev=p; if(p.t>=t-1e-6&&(!next||p.t<next.t))next=p; } if(prev&&next&&(next.t-prev.t)>0.6)return false; return true; }
+function trkCovers(pts,t){ if(!pts||!pts.length)return false; let first=pts[0].t,last=pts[0].t; for(const p of pts){ if(p.t<first)first=p.t; if(p.t>last)last=p.t; } if(t<first-0.25||t>last+0.25)return false; let prev=null,next=null; for(const p of pts){ if(p.t<=t+1e-6&&(!prev||p.t>prev.t))prev=p; if(p.t>=t-1e-6&&(!next||p.t<next.t))next=p; } if(prev&&next&&(next.t-prev.t)>1.5)return false; return true; }
 // Liste des JOUEURS corrigeables à l'instant t (Correction IA) : pistes .trk (mono-joueur) + chaque
 // joueur d'un dessin multi-joueurs (follow[slot]). Boîte à la VRAIE taille du joueur. Handle absent = caché.
 // Petit badge (numéro) au coin haut-gauche du rectangle — taille NORMALISÉE fixe pour que l'affichage
@@ -9603,8 +9693,19 @@ function fixHandles(a,t){ const hs=[]; if(!a)return hs;
 // NUMÉRO STABLE d'un joueur : attribué une seule fois et conservé (stocké sur la piste .trk ou l'ancre follow).
 // Supprimer un joueur ne renumérote PAS les autres — chacun garde son numéro du début à la fin.
 function pnumOf(a,an,slot){ const key=(slot!=null&&slot>=0)?(an.follow&&an.follow[slot]):an; if(!key)return 0; if(key._pnum!=null)return key._pnum;
-  const used=new Set(); (a.aiAnnos||[]).forEach(o=>{ if(o.trk&&o.type!=='trace'&&o.space!=='field'&&o._pnum!=null)used.add(o._pnum); if(o.follow)o.follow.forEach(fk=>{ if(fk&&!fk._ref&&fk._pnum!=null)used.add(fk._pnum); }); });
+  const used=new Set(); (a.aiAnnos||[]).forEach(o=>{ if(o.trk&&o.type!=='trace'&&o.space!=='field'&&o._pnum!=null)used.add(o._pnum); if(o.follow)o.follow.forEach(fk=>{ if(fk&&fk._pnum!=null)used.add(fk._pnum); }); });
   let n=0; while(used.has(n))n++; key._pnum=n; return n; }
+// s58 — UN SEUL NUMÉRO PAR JOUEUR, PARTOUT : le badge à l'écran et la ligne de la timeline Correction IA lisaient
+// deux compteurs différents (12 à l'écran, 2 ou 3 dans la timeline). Désormais les deux lisent CE numéro : pour un
+// joueur identifié (_pid), c'est le numéro de sa piste de référence (la 1re créée, ex. ton rectangle encadré).
+function jnumOf(a,an,slot){ if(!a||!an)return 0;
+  if(an._pid!=null && (slot==null||slot<=0) && !(an.follow&&an.follow.length>1)){
+    const own=o=>(o.trk&&o.trk.length&&o.type!=='trace'&&o.space!=='field')?-1:((o.follow&&o.follow.length===1&&o.follow[0]&&o.follow[0].pts&&o.follow[0].pts.length)?(o.follow[0]._ref?-2:0):null);
+    const same=(a.aiAnnos||[]).filter(o=>o._pid===an._pid);
+    let canon=same.find(o=>{ const k=own(o); return k===-1||k===0; }), cs;
+    if(canon){ cs=own(canon); } else { canon=same.find(o=>own(o)===-2)||an; cs=(canon.follow&&canon.follow[0])?0:-1; }
+    return pnumOf(a,canon,cs); }
+  return pnumOf(a,an,slot); }
 // Numéro STABLE par JOUEUR (identifiant _pid) : un joueur garde le même numéro (0,1,2…) quel que soit le
 // nombre de dessins posés dessus. Sert à la Correction IA « une ligne par joueur ».
 function _playerNum(a,pid){ if(pid==null)return 0; if(!a._pnums)a._pnums={}; if(a._pnums[pid]==null){ const used=new Set(Object.keys(a._pnums).map(k=>a._pnums[k])); let n=0; while(used.has(n))n++; a._pnums[pid]=n; } return a._pnums[pid]; }
@@ -9657,12 +9758,12 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
     if(!_hit) for(const h of _H){ const bw=h.w,bh=h.h; if(nx>=h.x-bw/2&&nx<=h.x+bw/2&&ny>=h.y-bh&&ny<=h.y){ const dc=Math.hypot(nx-h.x,ny-(h.y-bh/2)); if(dc<_hd){_hd=dc;_hit=h;} } }
     if(aiwin.tool==='select' && !_hit){
       // POINT 1 : clic sur un rectangle de DÉTECTION d'un joueur PAS ENCORE suivi -> on lance son suivi.
-      const dbx=(aiwin._detBoxes||[]); let db=null; for(const b of dbx){ const bw=(b.w||0.05),bh=(b.h||0.13); if(nx>=b.x-bw/2&&nx<=b.x+bw/2&&ny>=b.y-bh&&ny<=b.y+bh*0.10){ if(!db||Math.hypot(b.x-nx,b.y-ny)<Math.hypot(db.x-nx,db.y-ny))db=b; } }
+      const dbx=_shownPlayerBoxes(t); let db=null; for(const b of dbx){   /* s58 : rectangles affichés à CETTE image */ const bw=(b.w||0.05),bh=(b.h||0.13); if(nx>=b.x-bw/2&&nx<=b.x+bw/2&&ny>=b.y-bh&&ny<=b.y+bh*0.10){ if(!db||Math.hypot(b.x-nx,b.y-ny)<Math.hypot(db.x-nx,db.y-ny))db=b; } }
       if(db){
         // LIGNE SÉLECTIONNÉE -> on REPREND cette ligne (le trou d'absence est conservé), PAS de nouvelle ligne.
         const fs0=aiwin._fixSel;
         if(fs0&&fs0.an&&(a.aiAnnos||[]).indexOf(fs0.an)>=0){ aiwin.sel=fs0.an; aiwin.selMulti=[fs0.an];
-          if(correctPlayerFrom(fs0.an,+t.toFixed(3),db.x,db.y)){ aiBar('🔄 Reprise sur la même ligne '+(fs0.an._pid!=null?_playerNum(a,fs0.an._pid):'')+' (joueur détecté).'); setTimeout(aiBarHide,1700); ev.preventDefault(); return; }
+          if(correctPlayerFrom(fs0.an,+t.toFixed(3),db.x,db.y)){ aiBar('🔄 Reprise sur la même ligne '+jnumOf(a,fs0.an,-1)+' (joueur détecté).'); setTimeout(aiBarHide,1700); ev.preventDefault(); return; }
           fs0.an._fixok=(performance.now?performance.now():Date.now())+1600; save(); aiwinParams(); renderAiTimeline(); aiRecompute(fs0.an,+t.toFixed(3),db.x,db.y,(db.w||0.05),(db.h||0.13)); aiBar('🔄 Reprise (encadré) sur la même ligne.'); setTimeout(aiBarHide,1700); ev.preventDefault(); return; }
         const nn=mkAnno('spot'); nn._fixbox=true; nn.trackOnly=true; nn._pid='t'+uid(); nn.t0=+t.toFixed(3); placeStatic(nn,{x:db.x,y:db.y,w:(db.w||0.05),h:(db.h||0.13)});
         const _cd=nearestCandAt(db.x,db.y,t,null);
@@ -9672,16 +9773,19 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
     }  // clic dans le vide (hors rectangle) en Sélection = rien
     if(_hit){   // --- déplacer CE joueur (piste .trk OU joueur d'un dessin) — cliquer-déposer ---
       aiwin._fixSel=null; aiwin.sel=_hit.an; aiwin.selMulti=[_hit.an]; aiwinParams(); renderAiTimeline();
-      let lx=nx,ly=ny,moved=false; aiwin._fixDrag={anno:_hit.an,slot:_hit.slot,x:nx,y:ny,onTarget:false,tgt:null};
+      // s57 : la boîte garde le décalage de prise (elle ne « saute » plus sous le curseur) -> la graine envoyée au
+      // moteur = EXACTEMENT la boîte que tu vois posée sur le joueur (pieds = bas de la boîte).
+      const _gx=(_hit.x-nx), _gy=(_hit.y-ny);
+      let lx=_hit.x,ly=_hit.y,moved=false; aiwin._fixDrag={anno:_hit.an,slot:_hit.slot,x:lx,y:ly,onTarget:false,tgt:null};
       // La boîte suit EXACTEMENT le curseur (aucune aimantation sur une détection voisine).
-      const mv=e=>{ const n2=toN(e.clientX,e.clientY); if(Math.hypot(n2[0]-nx,n2[1]-ny)>0.005)moved=true; lx=n2[0]; ly=n2[1];
+      const mv=e=>{ const n2=toN(e.clientX,e.clientY); if(Math.hypot(n2[0]-nx,n2[1]-ny)>0.005)moved=true; lx=n2[0]+_gx; ly=n2[1]+_gy;
         aiwin._fixDrag={anno:_hit.an,slot:_hit.slot,x:lx,y:ly,onTarget:false,tgt:null}; };
       const up=()=>{ document.removeEventListener('mousemove',mv); document.removeEventListener('mouseup',up); aiwin._fixDrag=null;
         if(moved){ const bw=_hit.w, bh=_hit.h, sxr=lx, syr=ly; const _nowMs=(performance.now?performance.now():Date.now())+1600;
           // RECALCUL depuis EXACTEMENT le point déposé : on relance le suivi mono-joueur sur CE que tu montres,
           // SANS re-rattachement automatique (qui pouvait sauter sur un autre joueur à l'autre bout du terrain).
           if(_hit.slot<0){ _hit.an._fixok=_nowMs; aiRecompute(_hit.an,+t.toFixed(3),sxr,syr,bw,bh); }
-          else { if(_hit.fk)_hit.fk._fixok=_nowMs; aiRecomputeFollow(_hit.an,_hit.slot,+t.toFixed(3),sxr,syr); } }
+          else { if(_hit.fk)_hit.fk._fixok=_nowMs; aiRecomputeFollow(_hit.an,_hit.slot,+t.toFixed(3),sxr,syr,bw,bh); } }
         else { save(); aiwinParams(); } };
       document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up); ev.preventDefault(); return;
     }
@@ -9702,7 +9806,7 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
         // d'absence est conservé). Sinon (toujours invisible pour le moteur) -> suivi seedé sur l'encadré.
         if(correctPlayerFrom(fs.an,+t.toFixed(3),sxr,syr)){ aiBar('🔄 Joueur prolongé sur sa ligne (trou d\'absence conservé).'); setTimeout(aiBarHide,1700); return; }
         if(fs.slot<0){ fs.an._fixok=(performance.now?performance.now():Date.now())+1600; aiRecompute(fs.an,+t.toFixed(3),sxr,syr,sbw,sbh); }
-        else { const fk=fs.an.follow&&fs.an.follow[fs.slot]; if(fk)fk._fixok=(performance.now?performance.now():Date.now())+1600; aiRecomputeFollow(fs.an,fs.slot,+t.toFixed(3),sxr,syr); }
+        else { const fk=fs.an.follow&&fs.an.follow[fs.slot]; if(fk)fk._fixok=(performance.now?performance.now():Date.now())+1600; aiRecomputeFollow(fs.an,fs.slot,+t.toFixed(3),sxr,syr,sbw,sbh); }
         aiwinParams(); renderAiTimeline(); aiBar('🔄 Reprise du suivi du joueur — recalcul à partir d\'ici.'); setTimeout(aiBarHide,1600); return; }
       // NOUVEAU rectangle INDÉPENDANT : piste seedée EXACTEMENT sur ta boîte, suivi mono-joueur frais
       // depuis cet instant jusqu'à la fin (ou coupure). AUCUNE réutilisation d'une piste YOLO voisine
@@ -9804,7 +9908,7 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
         const _cd=nearestCandAt(lx,ly,vid.currentTime,_used);
         // CAS A (joueur détecté sous le curseur) : re-rattachement à la piste robuste À PARTIR du curseur
         // (avant conservé), appliqué à TOUS les dessins du joueur. CAS B (introuvable) : suivi seedé en dernier recours.
-        if(isFollow&&moved&&fSlot>=0){ if(correctPlayerFrom(best,CT,sx,sy)){} else { if(!best._jobs)best._jobs=[]; startFollowTrack(best,fSlot,sx,sy,CT); } }
+        if(isFollow&&moved&&fSlot>=0){ correctFollowSlotTo(best,fSlot,CT,_tgt,lx,ly); }
         else if(isPlayer&&moved){ ['x','y','x1','y1','x2','y2'].forEach(k=>{ if(orig[k]!=null)best[k]=orig[k]; else delete best[k]; }); best.pts=orig.pts;
           // LIVETAG : on relance TOUJOURS un vrai re-suivi depuis EXACTEMENT là où tu reposes la boîte
           // (lx,ly), SANS aimantation sur un rectangle existant -> ça re-traque CE que tu montres, même si
@@ -9819,20 +9923,23 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
   if(aiwin.tool==='correct'){ const an=aiwin.sel; if(!an||!(an.trk||an.manual)){ alert('Sélectionne d\'abord un dessin de joueur (outil 🖱) à corriger.'); return; }
     if(an.manual){ an.mpts=an.mpts||[]; let w=0.05,h2=0.13; const cd=nearestCandWin(nx,ny,t); if(cd){ const p=trkInterp(cd,t); if(p){ w=p.w||w; h2=p.h||h2; } } const near=an.mpts.find(p=>Math.abs(p.t-t)<0.04); if(near){ near.x=nx; near.y=ny; near.w=w; near.h=h2; } else an.mpts.push({t:+t.toFixed(3),x:nx,y:ny,w:w,h:h2}); an.mpts.sort((u,v)=>u.t-v.t); save(); aiwinParams(); return; }
     // aimante le point de départ sur le rectangle détecté le plus proche (correction précise)
-    let sxr=nx,syr=ny; const dbx=_mergeBoxes(_mergeBoxes((aiwin.cands||[]).map(cd=>_candBoxAt(cd,t)).filter(Boolean), _perframeBoxesAt(t)), (aiwin._detBoxes||[])); let bdr=0.3,bb=null; (dbx||[]).forEach(bx=>{ const d=Math.hypot(bx.x-nx,bx.y-ny); if(d<bdr){bdr=d;bb=bx;} }); if(bb){ sxr=bb.x; syr=bb.y; }
+    let sxr=nx,syr=ny; const dbx=_shownPlayerBoxes(t);   /* s58 : les rectangles affichés (image courante) */ let bdr=0.3,bb=null; (dbx||[]).forEach(bx=>{ const d=Math.hypot(bx.x-nx,bx.y-ny); if(d<bdr){bdr=d;bb=bx;} }); if(bb){ sxr=bb.x; syr=bb.y; }
     // RECALCUL À PARTIR DU POINT CORRIGÉ UNIQUEMENT : aiRecompute garde tout ce qui est AVANT l'instant t
     // (la partie déjà bonne) et relance le suivi de t jusqu'à la fin du clip, verrouillé sur le BON joueur
     // (le rectangle cliqué). -> 3 s gardées + 7 s recalculées, id conservé jusqu'à la fin.
     aiRecompute(an,+t.toFixed(3),sxr,syr); return; }
   if(['num','ptext','speed','offside'].includes(aiwin.tool)){   // ANALYSE : suit UN joueur (1 clic)
-    const _exp=fixExistingTrackPts(nx,ny,t,null); const cd=_exp?null:nearestCandAt(nx,ny,t,null); const box1=(_exp||cd)?null:detBoxAt(nx,ny); const an=mkAnno(aiwin.tool); an.space='player'; an.follow=[ _exp?{pts:_exp,_ref:true}:(cd?{pts:_fullCandPts(cd)}:{xy:[box1?box1.x:nx, box1?box1.y:ny]}) ]; an._jobs=[]; an.tin=a.in; an.tout=a.out;
+    // s57 : le joueur = EXACTEMENT le rectangle VERT sous le curseur.
+    const _gb=pickGreenBox(nx,ny,t), _rs=resolveGreenPick(_gb,t,null);
+    const _exp=(_rs&&_rs.kind==='ref')?_rs.pts:null, cd=(_rs&&_rs.kind==='cand')?_rs.cd:null, box1=(_rs&&_rs.kind==='seed')?_rs.box:null;
+    const an=mkAnno(aiwin.tool); an.space='player'; an.follow=[ _exp?{pts:_exp,_ref:true}:(cd?{pts:_rs.pts}:{xy:[box1?box1.x:nx, box1?box1.y:ny]}) ]; if(_rs&&_rs.pts&&_rs.pts._pid!=null)an._pid=_rs.pts._pid; an._jobs=[]; an.tin=a.in; an.tout=a.out;
     if(aiwin.tool==='num'){ an.num=((a.aiAnnos||[]).filter(x=>x.type==='num').length)+1; an.color='#0a1512'; an.color2='#ffd23a'; }
     if(aiwin.tool==='ptext'){ an.text=(prompt('Nom / texte du joueur :','Joueur')||'Joueur'); an.color='#ffffff'; an.color2='#14202b'; }
     if(aiwin.tool==='speed'){ an.color='#ffffff'; an.color2='#12406b'; }
     if(aiwin.tool==='offside'){ an.color='#ffffff'; an.color2='#000000'; }
     a.aiAnnos.push(an); aiwin.sel=an; aiwin.selMulti=[an]; save(); aiwinParams(); renderAiTimeline();
-    if(_exp||cd){ aiBar('✅ '+(AIWIN_NAMES[aiwin.tool]||aiwin.tool)+' sur le joueur.'); }
-    else if(box1){ startFollowTrack(an,0,box1.x,box1.y); aiBar('✅ '+(AIWIN_NAMES[aiwin.tool]||aiwin.tool)+' — suivi lancé.'); }
+    if(_exp||cd){ aiBar('✅ '+(AIWIN_NAMES[aiwin.tool]||aiwin.tool)+' sur le joueur.'); if(cd&&an.follow[0]&&an.follow[0].pts)_extendIfShort(an,0,an.follow[0].pts); }
+    else if(box1){ startFollowTrack(an,0,box1.x,box1.y,null,box1.w,box1.h,true); aiBar('✅ '+(AIWIN_NAMES[aiwin.tool]||aiwin.tool)+' — suivi lancé.'); }
     else { aiBar('✏️ '+(AIWIN_NAMES[aiwin.tool]||aiwin.tool)+' posé. Coche « Suivi joueur n° » à droite pour l\'attacher.'); }
     setTimeout(aiBarHide,2000); return;
   }
@@ -9845,16 +9952,17 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
   }
   if((aiwin.tool==='line'||aiwin.tool==='mur'||aiwin.tool==='poly')){
     // LIGNE / MUR / POLYGONE : chaque clic ajoute un joueur ET lance son suivi tout de suite. 2, 3, 4+ joueurs.
-    const box=nearestPlayerBox(nx,ny,t); const seed=[box?box.x:nx, box?box.y:ny];
+    const seed=[nx,ny];   // s57 : hors rectangle vert = point posé exactement au curseur
     let an=aiwin._building;
     if(!an || an._btool!==aiwin.tool || (aiwin.action.aiAnnos||[]).indexOf(an)<0){ an=mkAnno(aiwin.tool); an.space='player'; an.follow=[]; an._jobs=[]; an._btool=aiwin.tool; an.pts=[]; an.tin=a.in; an.tout=a.out; a.aiAnnos.push(an); aiwin._building=an; }
     const slot=an.follow.length;
     // priorité au SUIVI ANALYSÉ (accroche par rectangle), en interdisant un joueur déjà pris par une autre extrémité
     const usedTrk=new Set((an.follow||[]).map(f=>f&&f.pts).filter(Boolean));
-    const _exp=fixExistingTrackPts(nx,ny,t,an); const cd=_exp?null:nearestCandAt(nx,ny,t,usedTrk); const box2=(_exp||cd)?null:detBoxAt(nx,ny);
-    if(_exp){ an.follow.push({pts:_exp,_ref:true}); aiBar('✅ Joueur '+(slot+1)+' rattaché à son suivi existant.'); }
-    else if(cd){ an.follow.push({pts:_fullCandPts(cd)}); aiBar('✅ Joueur '+(slot+1)+' (suivi analysé). Clique un autre joueur, ou change d\'outil.'); }
-    else if(box2){ an.follow.push({xy:[box2.x,box2.y]}); if(!an._jobs)an._jobs=[]; startFollowTrack(an,slot,box2.x,box2.y); aiBar('✅ Joueur '+(slot+1)+' — suivi lancé. Clique un autre joueur, ou change d\'outil.'); }
+    // s57 : le joueur = EXACTEMENT le rectangle VERT sous le curseur (aucune autre règle ne passe avant).
+    const _gb=pickGreenBox(nx,ny,t), _rs=resolveGreenPick(_gb,t,an);
+    if(_rs&&_rs.kind==='ref'){ an.follow.push({pts:_rs.pts,_ref:true}); aiBar('✅ Joueur '+(slot+1)+' rattaché à son suivi existant.'); }
+    else if(_rs&&_rs.kind==='cand'){ an.follow.push({pts:_rs.pts}); aiBar('✅ Joueur '+(slot+1)+' (suivi analysé). Clique un autre joueur, ou change d\'outil.'); _extendIfShort(an,slot,_rs.pts); }
+    else if(_rs){ const box2=_rs.box; an.follow.push({xy:[box2.x,box2.y]}); if(!an._jobs)an._jobs=[]; startFollowTrack(an,slot,box2.x,box2.y,null,box2.w,box2.h,true); aiBar('✅ Joueur '+(slot+1)+' — suivi lancé. Clique un autre joueur, ou change d\'outil.'); }
     else { an.follow.push({xy:seed.slice()}); aiBar('✏️ Point '+(slot+1)+' posé (zone vide). Coche les « Suivi joueur n° » à droite pour attacher.'); }
     syncFollowGeom(an,t);
     aiwin.sel=an; aiwin.selMulti=[an]; save(); aiwinParams(); renderAiTimeline(); setTimeout(aiBarHide,1800);
@@ -9883,39 +9991,33 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
     const toN=(cx,cy)=>{ const ssx=(cx-r.left)*(cvt.width/r.width), ssy=(cy-r.top)*(cvt.height/r.height); return [(ssx-rect.ox)/rect.dw,(ssy-rect.oy)/rect.dh]; };
     const an=mkAnno('ghost'); an.space='player'; an.t0=t; an.r=0.045;
     let px=nx, py=ny, bbRef=null;
-    const _exp=fixExistingTrackPts(nx,ny,t,null);
-    if(_exp){ an.trk=_exp.map(p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h})); if(_exp._pid!=null)an._pid=_exp._pid; const p0=trkInterp({points:_exp},t)||{x:nx,y:ny}; px=p0.x; py=p0.y; }
-    else { let cd=nearestCandAt(nx,ny,t,null); if(cd){ const pc=trkInterp(cd,t); if(pc){ const bw=(pc.w||0.05),bh=(pc.h||0.13); const inside=(nx>=pc.x-bw*0.62&&nx<=pc.x+bw*0.62&&ny>=pc.y-bh*1.05&&ny<=pc.y+bh*0.18); if(inside){ an.trk=cd.points; px=pc.x; py=pc.y; } } }
-      if(!an.trk){ const dbx=_mergeBoxes((aiwin._detBoxes||[]), _perframeBoxesAt(t)); if(dbx&&dbx.length){ for(const bx of dbx){ const bw=(bx.w||0.05),bh=(bx.h||0.13); if(nx>=bx.x-bw*0.85&&nx<=bx.x+bw*0.85&&ny>=bx.y-bh*1.2&&ny<=bx.y+bh*0.35){ bbRef=bx; px=bx.x; py=bx.y; break; } } } } }
+    // s57 : référence = EXACTEMENT le rectangle VERT sous le curseur.
+    const _gb=pickGreenBox(nx,ny,t), _rs=resolveGreenPick(_gb,t,null);
+    if(_rs&&_rs.kind!=='seed'){ const _p=_rs.pts; an.trk=_p.map(p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h})); if(_p._pid!=null)an._pid=_p._pid; const p0=trkInterp({points:_p},t)||{x:_rs.box.x,y:_rs.box.y}; px=p0.x; py=p0.y;
+      if(_rs.kind==='cand'){ const _l=an.trk[an.trk.length-1]; if(_l&&_l.t<a.out-0.3){ try{ aiRecompute(an,+(+_l.t).toFixed(3),_l.x,_l.y,_l.w||0.03,_l.h||0.08); }catch(e){} } } }
+    else if(_rs){ bbRef=_rs.box; px=bbRef.x; py=bbRef.y; }
     an.x1=px; an.y1=py; an.x2=nx; an.y2=ny;
     an.tin=a.in; an.tout=a.out; a.aiAnnos.push(an); aiwin.sel=an; aiwin.selMulti=[an];
     let moved=false;
     const mv=e=>{ const n2=toN(e.clientX,e.clientY); if(Math.hypot(n2[0]-nx,n2[1]-ny)>0.004)moved=true; an.x2=n2[0]; an.y2=n2[1]; };
     const up=()=>{ document.removeEventListener('mousemove',mv); document.removeEventListener('mouseup',up);
       if(!moved){ an.x2=an.x1+0.06; an.y2=an.y1; }   // simple clic sans glisser : léger décalage par défaut
-      if(bbRef&&!an.trk){ try{ aiRecompute(an,+t.toFixed(3),bbRef.x,bbRef.y); }catch(e){} }
+      if(bbRef&&!an.trk){ try{ aiRecompute(an,+t.toFixed(3),bbRef.x,bbRef.y,(bbRef.w||0.05),(bbRef.h||0.13)); }catch(e){} }
       save(); aiwinParams(); renderAiTimeline(); aiBar('👻 Fantôme placé — référence joueur, position libre (glisse pour la déplacer).'); setTimeout(aiBarHide,1800); };
     document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up); ev.preventDefault(); return;
   }
   // DÉPÔT SUR JOUEUR : poser un dessin de joueur LANCE son suivi automatiquement.
-  { // 0) RATTACHEMENT : si un joueur est DÉJÀ suivi ici -> le dessin réutilise SA piste (pas de nouvelle ligne, pas de recalcul)
-    const _exp=fixExistingTrackPts(nx,ny,t,null);
+  { // s57 : le joueur = EXACTEMENT le rectangle VERT sous le curseur. Ce qui est vert est ce qui est pris.
+    const _gb=pickGreenBox(nx,ny,t), _rs=resolveGreenPick(_gb,t,null);
+    // 0) RATTACHEMENT : ce joueur a DÉJÀ une piste -> le dessin la réutilise (pas de nouvelle ligne, pas de recalcul)
+    const _exp=(_rs&&_rs.kind==='ref')?_rs.pts:null;
     if(_exp){ const an=mkAnno(aiwin.tool); an.space='player'; an.follow=[{pts:_exp,_ref:true}]; if(_exp._pid!=null)an._pid=_exp._pid; const p0=trkInterp({points:_exp},t)||{x:nx,y:ny}; placeStatic(an,{x:p0.x,y:p0.y,w:p0.w||0.05,h:p0.h||0.13}); an.tin=a.in; an.tout=a.out; a.aiAnnos.push(an); aiwin.sel=an; aiwin.selMulti=[an]; save(); aiwinParams(); renderAiTimeline(); aiBar('🔗 Rattaché au même joueur (une seule ligne).'); setTimeout(aiBarHide,1500); return; }
-    // 1) priorité : le rectangle détecté qui CONTIENT le clic. PAS d'aimant vers le plus proche :
-    //    si on clique dans le vide, le dessin se pose EXACTEMENT sous le curseur (placement précis).
-    let bb=null; const dbx=(aiwin._detBoxes&&aiwin._detBoxes.length)?aiwin._detBoxes:null;
-    if(dbx){ for(const bx of dbx){ const bw=(bx.w||0.05),bh=(bx.h||0.13); if(nx>=bx.x-bw*0.85&&nx<=bx.x+bw*0.85&&ny>=bx.y-bh*1.2&&ny<=bx.y+bh*0.35){ bb=bx; break; } } }
-    // VUE DE HAUT : les boîtes affichées viennent souvent des détections IMAGE PAR IMAGE (perframe). Si le clic
-    // tombe sur l'une d'elles, on la prend comme cible -> le suivi seedé (aiFollowFullClip) part de ce joueur et
-    // le dessin RESTE COLLÉ au joueur. (Avant, perframe n'était pas reconnu ici -> dessin statique sans suivi.)
-    if(!bb){ const pfb=_perframeBoxesAt(t); for(const bx of pfb){ const bw=(bx.w||0.05),bh=(bx.h||0.13); if(nx>=bx.x-bw*0.85&&nx<=bx.x+bw*0.85&&ny>=bx.y-bh*1.2&&ny<=bx.y+bh*0.35){ bb=bx; break; } } }
-    // 2) PRIORITÉ au SUIVI COMPLET : un joueur du Suivi sous le clic -> le dessin RÉUTILISE sa piste ENTIÈRE
-    //    (robuste, ancre .follow absolue). Même comportement qu'un dessin posé depuis le début : il NE perd pas
-    //    le joueur et NE disparaît pas au bout d'1-2 s. On teste ceci AVANT la détection live et on ne lance un
-    //    suivi seedé (fragile) QUE s'il n'y a AUCUN joueur du Suivi ici.
-    let cd = nearestCandAt(nx,ny,t,null);
-    if(cd){ const pc=trkInterp(cd,t); if(pc){ const bw=(pc.w||0.05),bh=(pc.h||0.13); const inside=(nx>=pc.x-bw*0.72&&nx<=pc.x+bw*0.72&&ny>=pc.y-bh*1.1&&ny<=pc.y+bh*0.22); if(!inside)cd=null; } }
-    if(cd){ const pts=stitchTrackFrom(cd,cd.points[0].t)||followPlayerFrom(nx,ny,t); const an=mkAnno(aiwin.tool); an.space='player'; an.follow=[{pts:pts,_ref:true}]; an._pid=cd.id; const p0=trkInterp({points:pts},t)||{x:nx,y:ny}; placeStatic(an,{x:p0.x,y:p0.y,w:p0.w||0.05,h:p0.h||0.13}); an.tin=a.in; an.tout=a.out; a.aiAnnos.push(an); aiwin.sel=an; aiwin.selMulti=[an]; save(); aiwinParams(); renderAiTimeline(); aiBar('🔗 Rattaché au suivi complet du joueur (robuste, tout le clip).'); setTimeout(aiBarHide,1500); return; }
+    // 1) joueur du SUIVI ANALYSÉ (rectangle vert issu de l'analyse) -> sa piste complète, robuste.
+    const cd=(_rs&&_rs.kind==='cand')?_rs.cd:null;
+    if(cd){ const pts=((_rs.pts&&_rs.pts.length)?_rs.pts:(stitchTrackFrom(cd,cd.points[0].t)||[])).map(p=>({t:p.t,x:p.x,y:p.y,w:p.w,h:p.h})); const an=mkAnno(aiwin.tool); an.space='player'; an.follow=[{pts:pts,_ref:true}]; an._pid=cd.id; const p0=trkInterp({points:pts},t)||{x:nx,y:ny}; placeStatic(an,{x:p0.x,y:p0.y,w:p0.w||0.05,h:p0.h||0.13}); an.tin=a.in; an.tout=a.out; a.aiAnnos.push(an); aiwin.sel=an; aiwin.selMulti=[an]; save(); aiwinParams(); renderAiTimeline();
+      if(_extendIfShort(an,0,pts)){ aiBar('🔗 Collé au joueur choisi — suivi prolongé par le moteur depuis le dernier point sûr.'); } else { aiBar('🔗 Rattaché au suivi complet du joueur (robuste, tout le clip).'); setTimeout(aiBarHide,1500); } return; }
+    // 2) rectangle vert SANS piste (détection) -> on part EXACTEMENT de ce rectangle.
+    const bb=(_rs&&_rs.kind==='seed')?_rs.box:null;
     // 3) SUR un rectangle joueur -> on lance le suivi. SUR ZONE VIDE -> dessin STATIQUE (aucun calcul),
     //    à attacher ensuite via le menu « Suivi joueur n° » à droite.
     const an=mkAnno(aiwin.tool); an.t0=t; placeStatic(an, bb||{x:nx,y:ny,w:0.05,h:0.13});
@@ -9926,9 +10028,10 @@ function aiwinClick(ev){ if(aiwin._board){ return boardClick(ev); }
       // On RÉUTILISE les détections image-par-image déjà calculées pour construire la trajectoire du joueur —
       // AUCUN recalcul serveur (avant, chaque dessin relançait toute l'analyse YOLO). Repli sur le moteur seedé
       // seulement si on ne peut pas reconstruire la piste depuis les détections.
-      const _pts=_trackFromPerframe(bb.x,bb.y,+t.toFixed(3));
-      if(_pts&&_pts.length>=2){ an.follow=[{pts:_pts,_ref:true}]; try{ const p0=trkInterp({points:_pts},t)||bb; placeStatic(an,{x:p0.x,y:p0.y,w:p0.w||bb.w||0.05,h:p0.h||bb.h||0.13}); }catch(e){} save(); aiwinParams(); renderAiTimeline(); aiBar('🔗 Dessin collé au joueur (suivi réutilisé, sans recalcul).'); setTimeout(aiBarHide,1400); }
-      else { aiFollowFullClip(an,+t.toFixed(3),bb.x,bb.y); }   // repli : moteur seedé (clip entier)
+      const _pts=_trackFromPerframe(bb.x,bb.y,+t.toFixed(3),bb);   // s59 : départ = CE rectangle, jamais un voisin
+      if(_pts&&_pts.length>=2){ an.follow=[{pts:_pts,_ref:true}]; placeStatic(an,{x:bb.x,y:bb.y,w:bb.w||0.05,h:bb.h||0.13}); save(); aiwinParams(); renderAiTimeline();
+        if(_extendIfShort(an,0,_pts)){ aiBar('🔗 Collé au joueur choisi — suivi prolongé par le moteur depuis le dernier point sûr.'); } else { aiBar('🔗 Dessin collé au joueur (suivi réutilisé, sans recalcul).'); setTimeout(aiBarHide,1400); } }
+      else { an.follow=[{xy:[bb.x,bb.y]}]; if(!an._jobs)an._jobs=[]; startFollowTrack(an,0,bb.x,bb.y,+t.toFixed(3),bb.w||0.03,bb.h||0.08,true); save(); }   // s59 : moteur calé sur le rectangle EXACT (avant : rattachement au joueur analysé le plus proche = voisin)
     }
     else { aiBar('✏️ Dessin posé (zone vide). Coche « Suivi joueur n° » à droite pour l\'attacher à un joueur.'); setTimeout(aiBarHide,2400); }
     return;
@@ -10391,9 +10494,84 @@ function annoDefVWin(an){ const a=aiwin.action; if(!a)return [0,1]; const span=(
 // et on peut y accrocher un dessin, au même titre que les rectangles du suivi automatique.
 function _myTrackBoxesAt(t){ const a=aiwin.action; if(!a)return []; const out=[];
   (a.aiAnnos||[]).forEach(an=>{ if(!an.trackOnly||!an.trk||!an.trk.length||an.space==='field'||an.type==='trace')return;
+    if(!trkCovers(an.trk,t))return;   // s58 : hors de ta piste (avant/après/trou) -> plus de rectangle figé à la dernière position
     const p=trkInterp({points:an.trk},t); if(p&&p.x!=null&&p.y!=null)out.push({x:p.x,y:p.y,w:p.w||0.04,h:p.h||0.1,_mine:true,_an:an}); });
   return out; }
-function nearestPlayerBox(nx,ny,t){ let boxes=[]; if(aiwin._detBoxes&&aiwin._detBoxes.length)boxes=aiwin._detBoxes.slice(); const cb=(aiwin.cands||[]).map(cd=>_candBoxAt(cd,t)).filter(Boolean); boxes=boxes.concat(cb); boxes=boxes.concat(_perframeBoxesAt(t)); boxes=boxes.concat(_myTrackBoxesAt(t));
+// ===== s58 — UN RECTANGLE FIABLE PAR JOUEUR =====
+// Les rectangles vides venaient de boîtes PÉRIMÉES affichées à un autre instant que l'image : piste d'analyse
+// figée jusqu'à 0,34 s après sa fin ou interpolée à travers un trou, image analysée prise jusqu'à 0,5 s plus loin,
+// détection de l'image précédente gardée pendant le calcul de la suivante. Nouvelle règle : un rectangle = une VRAIE
+// détection de L'IMAGE AFFICHÉE ; la piste d'analyse ne sert qu'à donner l'identité du joueur ; doublons fusionnés.
+const _PF_TOL=0.05, _DET_TOL=0.012;
+function _curDetBoxes(t){ const d=aiwin&&aiwin._detBoxes; if(!d||!d.length)return null; if(t==null)t=vid.currentTime; if(aiwin._detT==null||Math.abs(aiwin._detT-t)>_DET_TOL)return null; return d; }
+// Boîte d'une piste d'analyse SEULEMENT si un vrai point existe tout près de t (pas d'interpolation à travers un trou,
+// pas de boîte figée après la fin de la piste).
+function _candBoxStrict(cd,t){ const ps=cd&&cd.points; if(!ps||!ps.length)return null; let lo=0,hi=ps.length-1;
+  if(t<ps[0].t-0.07||t>ps[hi].t+0.07)return null;
+  while(hi-lo>1){ const m=(lo+hi)>>1; if(ps[m].t<=t)lo=m; else hi=m; }
+  const a=ps[lo], b=ps[hi]; const da=Math.abs(a.t-t), db=Math.abs(b.t-t);
+  if(a!==b && a.t<=t && b.t>=t && (b.t-a.t)<=0.2){ const f=(t-a.t)/((b.t-a.t)||1); return {x:a.x+(b.x-a.x)*f,y:a.y+(b.y-a.y)*f,w:(a.w!=null&&b.w!=null)?a.w+(b.w-a.w)*f:(a.w||b.w),h:(a.h!=null&&b.h!=null)?a.h+(b.h-a.h)*f:(a.h||b.h),_br:(f>0.001&&f<0.999)}; }
+  const p=(da<=db)?a:b; if(Math.min(da,db)>0.07)return null; return {x:p.x,y:p.y,w:p.w,h:p.h}; }
+// MÊME JOUEUR ? (boîtes {x=centre, y=pieds, w, h} normalisées) : recouvrement suffisant OU pieds très proches.
+function _boxIoU(a,b){ const aw=a.w||0.04,ah=a.h||0.1,bw=b.w||0.04,bh=b.h||0.1; const ix=Math.max(0,Math.min(a.x+aw/2,b.x+bw/2)-Math.max(a.x-aw/2,b.x-bw/2)), iy=Math.max(0,Math.min(a.y,b.y)-Math.max(a.y-ah,b.y-bh)); const I=ix*iy; return I/((aw*ah+bw*bh-I)||1); }
+function _boxInside(a,b){ const aw=a.w||0.04,ah=a.h||0.1,bw=b.w||0.04,bh=b.h||0.1; const ix=Math.max(0,Math.min(a.x+aw/2,b.x+bw/2)-Math.max(a.x-aw/2,b.x-bw/2)), iy=Math.max(0,Math.min(a.y,b.y)-Math.max(a.y-ah,b.y-bh)); return (ix*iy)/((Math.min(aw*ah,bw*bh))||1); }
+function _sameBox(a,b,loose){ if(_boxIoU(a,b)>=(loose?0.18:0.3))return true; const w=Math.max(a.w||0.04,b.w||0.04), h=Math.max(a.h||0.1,b.h||0.1);
+  return Math.abs(a.x-b.x)<w*(loose?0.75:0.5) && Math.abs(a.y-b.y)<h*(loose?0.45:0.3); }
+// Garde UNE boîte par joueur : la 1re de la liste gagne (ordre = priorité), les recouvrantes / incluses sont retirées.
+function _nmsBoxes(list,thr){ const out=[]; for(const b of list){ if(!out.some(o=>_boxIoU(o,b)>=(thr||0.6)))out.push(b); } return out; }
+// ===== s57 — RECTANGLE VERT = CHOIX ABSOLU =====
+// Avant : le survol (rectangle vert) et le clic choisissaient le joueur avec DEUX logiques différentes (le clic
+// passait d'abord par d'autres pistes / le joueur suivi le plus proche) -> parfois un VOISIN était pris.
+// Maintenant : la MÊME liste de rectangles et la MÊME fonction servent au vert ET au clic. Ce qui est vert = ce qui est pris.
+function _shownPlayerBoxes(t){
+  // 1) BASE = vraies détections de L'IMAGE AFFICHÉE (détection exacte de cette image), complétées par l'image
+  //    analysée la plus proche (±0,05 s) pour un joueur que la détection aurait raté. Sans l'une ni l'autre :
+  //    pistes d'analyse ayant un VRAI point à cet instant.
+  const det=_curDetBoxes(t), pf=_perframeBoxesAt(t);
+  let base=[];
+  if(det) base=_nmsBoxes(det.map(b=>Object.assign({},b,{_det:true})));
+  if(pf.length){ if(!base.length) base=_nmsBoxes(pf.map(b=>Object.assign({},b,{_pf:true})));
+    else pf.forEach(b=>{ if(!base.some(o=>_sameBox(o,b,true)))base.push(Object.assign({},b,{_pf:true})); }); }
+  const cb=[]; (aiwin.cands||[]).forEach(cd=>{ const b=_candBoxStrict(cd,t); if(b){ b._cd=cd; cb.push(b); } });
+  if(!base.length){ base=_nmsBoxes(cb,0.45); }
+  else {
+    // 2) IDENTITÉ : chaque rectangle reçoit la piste d'analyse du MÊME joueur (meilleur recouvrement, 1 piste = 1 rectangle).
+    //    Une piste sans détection à cet instant (prédiction / fin de piste) n'est PAS affichée -> plus de rectangle vide.
+    const pairs=[]; base.forEach((b,i)=>cb.forEach((c,j)=>{ const s=_boxIoU(b,c); if(s>=0.3||_sameBox(b,c,false))pairs.push([s+(_sameBox(b,c,false)?0.05:0),i,j]); }));
+    pairs.sort((u,v)=>v[0]-u[0]); const ub=new Set(), uc=new Set();
+    pairs.forEach(([s,i,j])=>{ if(ub.has(i)||uc.has(j))return; ub.add(i); uc.add(j); base[i]._cd=cb[j]._cd; });
+    // joueur raté par la détection de CETTE image mais suivi juste avant ET juste après (trou < 0,2 s) -> on le garde.
+    cb.forEach((c,j)=>{ if(uc.has(j)||!c._br)return; if(!base.some(o=>_sameBox(o,c,true)))base.push(c); }); }
+  // 3) TES PISTES (rectangles jaunes) : posées sur la détection du même joueur (pas de 2e rectangle à côté).
+  //    En Correction IA, tes joueurs ont déjà leur rectangle numéroté -> on n'en remet pas un 2e.
+  if(aiwin._fixMode){ let H=[]; try{ H=fixHandles(aiwin.action,t)||[]; }catch(e){}
+    if(H.length)base=base.filter(b=>!H.some(h=>_sameBox(b,{x:h.x,y:h.y,w:h.w,h:h.h},true))); return base; }
+  _myTrackBoxesAt(t).forEach(m=>{ let bi=-1,bs=-1; base.forEach((b,i)=>{ if(b._an)return; if(_sameBox(b,m,true)){ const s=_boxIoU(b,m); if(s>bs){bs=s;bi=i;} } });
+    if(bi>=0){ base[bi]._mine=true; base[bi]._an=m._an; } else base.push(m); });
+  return base; }
+function pickGreenBox(nx,ny,t,boxes){
+  // AU CLIC : si le rectangle VERT affiché à l'écran est sous ce même point, c'est LUI, tel quel (verrou absolu).
+  if(!boxes){ const hg=aiwin._hovGreen; if(hg&&hg.b&&Math.abs((hg.t||0)-t)<0.02&&Math.hypot((hg.mx||0)-nx,(hg.my||0)-ny)<0.006)return hg.b; }
+  boxes=boxes||_shownPlayerBoxes(t); let bb=null,bd=1e9;
+  for(const b of boxes){ const w=(b.w||0.05),h=(b.h||0.13); if(nx>=b.x-w*0.52&&nx<=b.x+w*0.52&&ny>=b.y-h*1.04&&ny<=b.y+h*0.05){ const d=Math.hypot(b.x-nx,(b.y-h*0.5)-ny); if(d<bd){bd=d;bb=b;} } }
+  if(!bb){ bd=0.045; boxes.forEach(b=>{ const d=Math.hypot(b.x-nx,(b.y-(b.h||0.13)*0.5)-ny); if(d<bd){bd=d;bb=b;} }); }
+  return bb; }
+// Piste DÉJÀ existante du MÊME joueur que le rectangle vert (même position à cet instant) -> 1 joueur = 1 ligne.
+function _existingTrackForBox(gb,t,exclude,tight){ const a=aiwin.action; if(!a||!gb)return null; let best=null,bd=1e9,bestPid=null;
+  const k=tight?0.15:0.25, tolX=Math.max(0.008,(gb.w||0.05)*k), tolY=Math.max(0.01,(gb.h||0.13)*(tight?0.10:0.15));
+  const _t=(pts,pid)=>{ if(!pts||!pts.length)return; if(!trkCovers(pts,t))return; const p=trkInterp({points:pts},t); if(!p)return; const dx=Math.abs(p.x-gb.x), dy=Math.abs(p.y-gb.y); if(dx>tolX||dy>tolY)return; const d=Math.hypot(dx,dy); if(d<bd){bd=d;best=pts;bestPid=(pid!=null?pid:null);} };
+  (a.aiAnnos||[]).forEach(o=>{ if(o===exclude||o.type==='trace'||o.space==='field')return; if(o.trk)_t(o.trk,o._pid); if(o.follow)o.follow.forEach(fk=>{ if(fk&&fk.pts)_t(fk.pts,o._pid); }); });
+  (a.tracks||[]).forEach(tr=>{ if(tr&&tr.points&&tr.points.length)_t(tr.points,tr.id); });
+  if(!best)return null; const r=best.map(pp=>({t:pp.t,x:pp.x,y:pp.y,w:pp.w,h:pp.h})); if(bestPid!=null)r._pid=bestPid; return r; }
+// Transforme le rectangle vert en piste : sa propre piste (rectangle à toi / joueur analysé) ou, s'il n'en a pas,
+// une graine EXACTE sur ce rectangle (aucun autre joueur ne peut être choisi à sa place).
+function resolveGreenPick(gb,t,exclude){ if(!gb)return null;
+  if(gb._an&&gb._an.trk&&gb._an.trk.length){ const r=gb._an.trk.map(pp=>({t:pp.t,x:pp.x,y:pp.y,w:pp.w,h:pp.h})); if(gb._an._pid!=null)r._pid=gb._an._pid; return {kind:'ref',pts:r,box:gb}; }
+  const isCand=!!(gb._cd&&gb._cd.points&&gb._cd.points.length);
+  const ex=_existingTrackForBox(gb,t,exclude,isCand); if(ex)return {kind:'ref',pts:ex,box:gb};
+  if(isCand){ const pts=_fullCandPts(gb._cd); if(gb._cd.id!=null)pts._pid=gb._cd.id; return {kind:'cand',pts:pts,cd:gb._cd,box:gb}; }
+  return {kind:'seed',box:gb}; }
+function nearestPlayerBox(nx,ny,t){ const boxes=_shownPlayerBoxes(t);   /* s58 : mêmes rectangles que ceux affichés */
   // PRÉCISION : on prend d'abord les boîtes qui CONTIENNENT vraiment le curseur (zone = le rectangle réel,
   // pas élargie) ; si plusieurs se chevauchent, celle dont le CENTRE est le plus proche -> le BON joueur.
   let bb=null,bd=1e9; for(const b of boxes){ const w=(b.w||0.05),h=(b.h||0.13); if(nx>=b.x-w*0.52&&nx<=b.x+w*0.52&&ny>=b.y-h*1.04&&ny<=b.y+h*0.05){ const d=Math.hypot(b.x-nx,(b.y-h*0.5)-ny); if(d<bd){bd=d;bb=b;} } }
@@ -10414,9 +10592,9 @@ function fixExistingTrackPts(nx,ny,t,exclude){ const a=aiwin.action; if(!a)retur
   (a.tracks||[]).forEach(tr=>{ if(tr&&tr.points&&tr.points.length)_t(tr.points,tr.id); });
   if(!best)return null; const r=best.map(pp=>({t:pp.t,x:pp.x,y:pp.y,w:pp.w,h:pp.h})); if(bestPid!=null)r._pid=bestPid; return r; }
 // Rectangle de joueur DÉTECTÉ qui contient le clic (pour déclencher le suivi seulement SUR un joueur).
-function detBoxAt(nx,ny){ const dbx=(aiwin._detBoxes&&aiwin._detBoxes.length)?aiwin._detBoxes:null; if(!dbx)return null; for(const bx of dbx){ const bw=(bx.w||0.05),bh=(bx.h||0.13); if(nx>=bx.x-bw*0.85&&nx<=bx.x+bw*0.85&&ny>=bx.y-bh*1.2&&ny<=bx.y+bh*0.35)return bx; } return null; }
+function detBoxAt(nx,ny){ const dbx=_curDetBoxes(); if(!dbx)return null; for(const bx of dbx){ const bw=(bx.w||0.05),bh=(bx.h||0.13); if(nx>=bx.x-bw*0.85&&nx<=bx.x+bw*0.85&&ny>=bx.y-bh*1.2&&ny<=bx.y+bh*0.35)return bx; } return null; }
 // Boîte de joueur détectée la plus PROCHE (pour caler la taille du rectangle manuel sur l'échelle réelle).
-function nearestDetBox(nx,ny){ const dbx=(aiwin._detBoxes&&aiwin._detBoxes.length)?aiwin._detBoxes:null; if(!dbx)return null; let best=null,bd=0.2; dbx.forEach(bx=>{ const d=Math.hypot(bx.x-nx,bx.y-ny); if(d<bd){bd=d;best=bx;} }); return best; }
+function nearestDetBox(nx,ny){ const dbx=_curDetBoxes(); if(!dbx)return null; let best=null,bd=0.2; dbx.forEach(bx=>{ const d=Math.hypot(bx.x-nx,bx.y-ny); if(d<bd){bd=d;best=bx;} }); return best; }
 // Taille TYPIQUE d'un joueur à l'écran (moyenne des rectangles détectés) — sinon petit défaut serré.
 function typicalPlayerBox(){ const bx=aiwin._detBoxes; if(bx&&bx.length){ let sw=0,sh=0,n=0; bx.forEach(b=>{ if(b.w&&b.h){ sw+=b.w; sh+=b.h; n++; } }); if(n)return {w:sw/n,h:sh/n}; } return {w:0.03,h:0.075}; }
 function nearestCandAt(nx,ny,t,excl){ let best=null,bs=0.13;
@@ -10450,26 +10628,27 @@ function tjRender(){
   p.innerHTML=h; }
 function tjMaybeClear(){ if(!_followBusy && !_followQ.length && _trackJobs.length && _trackJobs.every(e=>e.state==='done'||e.state==='err')){ setTimeout(()=>{ if(!_followBusy && !_followQ.length){ _trackJobs=[]; tjRender(); } }, 2600); } }
 let _followQ=[], _followBusy=false;
-function startFollowTrack(an,slot,seedX,seedY,fromT0){ if(an&&an.manualLock){ aiBar('🔒 Suivi manuel prioritaire.'); setTimeout(aiBarHide,1800); return; }
+function startFollowTrack(an,slot,seedX,seedY,fromT0,seedBw,seedBh,exact){ if(an&&an.manualLock){ aiBar('🔒 Suivi manuel prioritaire.'); setTimeout(aiBarHide,1800); return; }
   // UN JOUEUR = UNE PISTE : si un joueur est DÉJÀ suivi à cet endroit, le dessin se RATTACHE à sa piste
   // (aucun nouveau calcul, aucune nouvelle ligne). Le suivi et les dessins restent indépendants.
-  try{ const _a=aiwin.action; const _ft=+(fromT0!=null?fromT0:vid.currentTime); let _best=null,_bd=0.06;
+  // s57 : 'exact' = graine venant du rectangle VERT (déjà vérifié) -> pas de re-rattachement à un voisin.
+  if(!exact) try{ const _a=aiwin.action; const _ft=+(fromT0!=null?fromT0:vid.currentTime); let _best=null,_bd=0.06;
     const _try=(pts)=>{ if(!pts||!pts.length)return; if(typeof trkCovers==='function'&&!trkCovers(pts,_ft))return; const p=trkInterp({points:pts},_ft); if(!p)return; const bw=(p.w||0.05),bh=(p.h||0.13); if(seedX>=p.x-bw/2&&seedX<=p.x+bw/2&&seedY>=p.y-bh&&seedY<=p.y+bh*0.1){ const d=Math.hypot(p.x-seedX,p.y-seedY); if(d<_bd){_bd=d;_best=pts;} } };
     (_a.aiAnnos||[]).forEach(o=>{ if(o===an||o.type==='trace'||o.space==='field')return; if(o.trk)_try(o.trk); if(o.follow)o.follow.forEach(fk=>{ if(fk&&fk.pts&&!fk._ref)_try(fk.pts); }); });
     if(_best){ if(!an.follow)an.follow=[]; an.follow[slot]={pts:_best.map(pp=>({t:pp.t,x:pp.x,y:pp.y,w:pp.w,h:pp.h})),_ref:true}; save(); renderAiTimeline(); aiBar('🔗 Dessin rattaché au suivi existant du joueur (pas de nouveau calcul).'); setTimeout(aiBarHide,1600); return; }
   }catch(e){}
   if(!_followBusy && !_followQ.length) _trackJobs=[];                       // nouvelle salve -> compteur repart à 1
   const _tj={an, color:(an&&an.color)||'#00e08f', label:'Joueur '+(_trackJobs.length+1), state:'wait', p:0}; _trackJobs.push(_tj); tjRender();
-  _followQ.push({an,slot,seedX,seedY,fromT0,_tj}); pumpFollowQ(); }
+  _followQ.push({an,slot,seedX,seedY,fromT0,_tj,seedBw,seedBh}); pumpFollowQ(); }
 let _pumpTimer=null;
-function pumpFollowQ(){ if(_followBusy)return; const j=_followQ.shift(); if(!j)return; _followBusy=true; _runFollowTrack(j.an,j.slot,j.seedX,j.seedY,j.fromT0,j._tj).then(()=>{_followBusy=false;setTimeout(pumpFollowQ,120);},()=>{_followBusy=false;setTimeout(pumpFollowQ,120);}); }
-function _runFollowTrack(an,slot,seedX,seedY,fromT0,_tj){ return new Promise(function(resolve){ const done=()=>{ if(_tj&&_tj.state!=='done'){_tj.state='err';tjRender();} tjMaybeClear(); resolve(); }; (async()=>{ const a=aiwin.action; const tok=aiwin._trackTok;
+function pumpFollowQ(){ if(_followBusy)return; const j=_followQ.shift(); if(!j)return; _followBusy=true; _runFollowTrack(j.an,j.slot,j.seedX,j.seedY,j.fromT0,j._tj,j.seedBw,j.seedBh).then(()=>{_followBusy=false;tjMaybeClear();setTimeout(pumpFollowQ,120);},()=>{_followBusy=false;tjMaybeClear();setTimeout(pumpFollowQ,120);}); }
+function _runFollowTrack(an,slot,seedX,seedY,fromT0,_tj,seedBw,seedBh){ return new Promise(function(resolve){ const done=()=>{ if(_tj&&_tj.state!=='done'){_tj.state='err';tjRender();} tjMaybeClear(); resolve(); }; (async()=>{ const a=aiwin.action; const tok=aiwin._trackTok;
   // suivi À PARTIR DE L'INSTANT DU CLIC (comme le faisceau) — un joueur à la fois (file) pour ne pas surcharger le moteur.
   const fromT=+(fromT0!=null?fromT0:vid.currentTime).toFixed(3), endT=a.out;
   if(an._deleted||(a.aiAnnos||[]).indexOf(an)<0){ return done(); }
   const blob=await getVideoBlob(); if(!blob){ aiBar('❌ Vidéo introuvable — clique « 🎬 Recharger la vidéo » (autorise le fichier) puis réessaie.'); setTimeout(aiBarHide,3600); return done(); } const vkey=_aiSrcVkey(blob);
   aiBar('🔄 Suivi du joueur en cours'+(_followQ.length?(' ('+_followQ.length+' en attente)'):'')+'…');
-  const fd=new FormData(); fd.append('vkey',vkey); fd.append('t0',fromT); fd.append('t1',endT); fd.append('x',seedX); fd.append('y',seedY); fd.append('model','yolo11s.pt'); fd.append('conf','0.28'); fd.append('imgsz','960'); fd.append('tracker',(window.aiTracker||'csrt')); { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); }
+  const fd=new FormData(); fd.append('vkey',vkey); fd.append('t0',fromT); fd.append('t1',endT); fd.append('x',seedX); fd.append('y',seedY); fd.append('model','yolo11s.pt'); fd.append('conf','0.28'); fd.append('imgsz','960'); fd.append('tracker',(window.aiTracker||'csrt')); if(seedBw&&seedBh){ fd.append('bw',seedBw); fd.append('bh',seedBh); fd.append('light','1'); /* s57 : rectangle exact -> moteur rapide (secondes), sans le moteur lourd 4K */ } { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); }
   let r0; try{ r0=await fetch(AI_BASE+'/track1',{method:'POST',body:fd}).then(r=>r.json()); }catch(e){ aiBar('❌ Moteur IA indisponible (lance DEMARRER.command).'); setTimeout(aiBarHide,2600); return done(); }
   if(r0&&r0.need_file){ aiBar('❌ Relance d\'abord une détection des joueurs (👤 Joueur).'); setTimeout(aiBarHide,2600); return done(); }
   const job=r0&&r0.job; if(!job){ aiBar('❌ Suivi non démarré.'); setTimeout(aiBarHide,2200); return done(); }
@@ -10535,13 +10714,13 @@ function applyRecompute(an,d,fromT,endT,seed,startT){ if(an&&(an.manualLock||an.
 // CORRECTION d'un joueur suivi via DESSIN (ancre follow) : MÊME moteur que l'analyse initiale (/upload multi
 // haute qualité) sur le seul segment [fromT, endT] ; garde l'AVANT (<fromT) ET l'APRÈS (>endT) intacts pour ne
 // JAMAIS écraser une correction déjà bonne plus loin dans le clip. endT s'arrête au prochain point de correction.
-async function aiRecomputeFollow(an,slot,fromT,seedX,seedY){ if(an&&(an.manualLock||an.manual)){ aiBar('🔒 Suivi manuel prioritaire — recalcul auto ignoré.'); setTimeout(aiBarHide,2000); return; }
+async function aiRecomputeFollow(an,slot,fromT,seedX,seedY,seedBw,seedBh){ if(an&&(an.manualLock||an.manual)){ aiBar('🔒 Suivi manuel prioritaire — recalcul auto ignoré.'); setTimeout(aiBarHide,2000); return; }
   const a=aiwin.action; if(!an||!an.follow||!an.follow[slot]){ aiBarHide(); return; } const fk=an.follow[slot];
   const nexts=(fk._cuts||[]).filter(tt=>tt>fromT+0.2).sort((x,y)=>x-y); const endT=nexts.length?nexts[0]:a.out;
   const blob=await getVideoBlob(); if(!blob){ alert('Vidéo introuvable.'); return; }
   const vkey=_aiSrcVkey(blob);
   aiBar('🔄 Recalcul du suivi de CE joueur ('+fromT.toFixed(1)+'s → '+endT.toFixed(1)+'s)…');
-  const fd=new FormData(); fd.append('vkey',vkey); fd.append('t0',fromT); fd.append('t1',endT); fd.append('x',seedX); fd.append('y',seedY); fd.append('model','yolo11s.pt'); fd.append('conf','0.28'); fd.append('imgsz','960'); fd.append('tracker',(window.aiTracker||'csrt')); { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); }
+  const fd=new FormData(); fd.append('vkey',vkey); fd.append('t0',fromT); fd.append('t1',endT); fd.append('x',seedX); fd.append('y',seedY); fd.append('model','yolo11s.pt'); fd.append('conf','0.28'); fd.append('imgsz','960'); fd.append('tracker',(window.aiTracker||'csrt')); /* s57 : TA boîte exacte (moteur rapide seedé, zéro accroche à un voisin) */ if(seedBw&&seedBh){ fd.append('light','1'); fd.append('bw',seedBw); fd.append('bh',seedBh); } { const _cc=aiFieldCals(a); if(_cc)fd.append('cals',_cc); }
   let r0; try{ r0=await fetch(AI_BASE+'/track1',{method:'POST',body:fd}).then(r=>r.json()); }catch(e){ aiBar('❌ Moteur IA indisponible (lance DEMARRER.command).'); setTimeout(aiBarHide,2600); return; }
   if(r0&&r0.need_file){ aiBar('❌ Relance d\'abord une analyse complète du clip.'); setTimeout(aiBarHide,2600); return; }
   const job=r0&&r0.job; if(!job){ aiBar('❌ Recalcul non démarré.'); setTimeout(aiBarHide,2200); return; }
@@ -10658,7 +10837,7 @@ function renderAiTimeline(){ const tl=document.getElementById('aiwTL'); if(!tl||
     const _nowP=(performance.now?performance.now():Date.now());
     _rows.forEach((h,i)=>{ const an=h.an, gi=(a.aiAnnos||[]).indexOf(an); const pts=(h.slot<0?an.trk:(h.fk&&h.fk.pts))||[];
       let tin,tout; if(pts.length){ tin=pts[0].t; tout=pts[0].t; for(const p of pts){ if(p.t<tin)tin=p.t; if(p.t>tout)tout=p.t; } } else { tin=an.tin!=null?an.tin:a.in; tout=an.tout!=null?an.tout:a.out; }
-      const l=pct(tin), w=Math.max(2,pct(tout)-pct(tin)); const fixok=(h.slot<0?an._fixok:(h.fk&&h.fk._fixok)); const green=(fixok&&_nowP<fixok); const pn=(h.pid!=null)?_playerNum(a,h.pid):pnumOf(a,an,h.slot);
+      const l=pct(tin), w=Math.max(2,pct(tout)-pct(tin)); const fixok=(h.slot<0?an._fixok:(h.fk&&h.fk._fixok)); const green=(fixok&&_nowP<fixok); const pn=jnumOf(a,an,h.slot);   /* s58 : même numéro que le badge à l'écran */
       const hd=pts.length?('<span class="hdl" data-i="'+gi+'" data-slot="'+h.slot+'" data-trim="1" data-edge="l" style="left:0"></span>'):''; const hd2=pts.length?('<span class="hdl" data-i="'+gi+'" data-slot="'+h.slot+'" data-trim="1" data-edge="r" style="right:0"></span>'):'';
       const seg='<div class="seg'+(selSet(an)?' sel':'')+'" data-i="'+gi+'" data-slot="'+h.slot+'" data-jn="'+pn+'" style="left:'+l+'%;width:'+w+'%;background:'+(green?'#00e676':'#ffce3a')+';color:#062117">'+hd+'👤 '+pn+hd2+'</div>'; rows.push({label:'Joueur '+pn,html:seg,grpEnd:true}); });
   } else if(tab==='map'){
@@ -11044,7 +11223,11 @@ function openMontage(){ if(!project){alert('Ouvre un espace de travail.');return
   try{ mstat(window._montName?('Montage « '+window._montName+' » — pense à 💾 Enregistrer.'):'Prêt. « 💾 Enregistrer » pour classer ce montage dans ta bibliothèque.'); }catch(e){}
   refreshClipDurations(project.timeline.clips).then(()=>{ save(); renderMTL(); });
   try{ montUpdateReconnectBtn(); }catch(e){} }
-$('mClose').onclick=()=>{ try{ montSyncDoc(); }catch(e){} $('montage').classList.add('hidden'); try{ montageGalleryOpen(); setNav('montage'); }catch(e){} };
+$('mClose').onclick=()=>{ try{ montSyncDoc(); }catch(e){} $('montage').classList.add('hidden'); try{ montageGalleryOpen(); setNav('montage'); }catch(e){}
+  // OPTION 2 (façon LiveTag) : en fermant le montage, on demande au moteur de supprimer le proxy « image par
+  // image » (il ne sert qu'au montage en cours) -> aucune accumulation de stockage d'un match à l'autre.
+  try{ fetch(AI_BASE+'/drop_proxies',{method:'POST'}).catch(()=>{}); }catch(e){}
+};
 $('mGen').onclick=()=>exportMontageNative();
 // ===== VIDÉOS RÉFÉRENCÉES (disque externe) : reconnexion sur clic (la permission est perdue à chaque redémarrage) =====
 function montReferencedIds(){ const ids=new Set();
@@ -11053,20 +11236,35 @@ function montReferencedIds(){ const ids=new Set();
   try{ if(project&&project.videoHandleId&&!project.videoBlobId)ids.add(project.videoHandleId); }catch(e){}
   return [...ids]; }
 async function montNeedsReconnect(){ const ids=montReferencedIds(); if(!ids.length)return false;
+  // LiveTag : si le CHEMIN disque du match est encore valide, le moteur lit le fichier DIRECTEMENT -> aucun
+  // besoin de ré-autoriser le handle navigateur -> PAS de bandeau (ex. juste après un direct normal). On ne
+  // montre le bandeau que si le fichier est vraiment introuvable à son chemin (déplacé/supprimé).
+  try{ if(window.matchlyzVideoRef && project && project.videoPath){ const ex=await window.matchlyzVideoRef.exists(project.videoPath); if(ex)return false; } }catch(e){}
   for(const id of ids){ try{ const r=await dbGet('blobs',id); const h=r&&r.handle; if(!h)continue; const p=await h.queryPermission({mode:'read'}); if(p!=='granted')return true; }catch(e){ return true; } }
   return false; }
-async function montReconnectVideos(){ const ids=montReferencedIds(); if(!ids.length){ mstat('Aucune vidéo référencée à reconnecter.'); return true; }
-  let ok=0,ko=0;
+async function montReconnectVideos(){ const ids=montReferencedIds();
+  let ok=0,ko=0,_mainLoaded=false;
   for(const id of ids){ try{ const r=await dbGet('blobs',id); const h=r&&r.handle; if(!h){ ko++; continue; } let p=await h.queryPermission({mode:'read'}); if(p!=='granted'){ try{ p=await h.requestPermission({mode:'read'}); }catch(e){} } if(p==='granted')ok++; else ko++; }catch(e){ ko++; } }
   try{ mAssetsDirty=true; mAssets=null; }catch(e){}
-  try{ if(project&&project.videoHandleId){ const rr=await dbGet('blobs',project.videoHandleId); const hh=rr&&rr.handle; if(hh){ const pp=await hh.queryPermission({mode:'read'}); if(pp==='granted'){ const f=await hh.getFile(); try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; save(); } }catch(e){}
-    // version corrigée /sdr en priorité (fichier brut HEVC = noir) ; sinon le fichier direct
-    if(project.videoConverted&&project.videoUrl){ try{ vid.src=project.videoUrl; }catch(e){} } else if(!vid.src){ vid.src=URL.createObjectURL(f); } } } } }catch(e){}
+  // 1) Chargement depuis le handle (si le fichier n'a PAS bougé). getFile() échoue si le fichier a été déplacé.
+  try{ if(project&&project.videoHandleId){ const rr=await dbGet('blobs',project.videoHandleId); const hh=rr&&rr.handle; if(hh){ let pp='prompt'; try{ pp=await hh.queryPermission({mode:'read'}); }catch(e){} if(pp!=='granted'){ try{ pp=await hh.requestPermission({mode:'read'}); }catch(e){} } if(pp==='granted'){ try{ const f=await hh.getFile(); try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; save(); } }catch(e){}
+    if(project.videoConverted&&project.videoUrl){ try{ vid.src=project.videoUrl; }catch(e){} } else { try{ vid.src=URL.createObjectURL(f); }catch(e){} } _mainLoaded=true; }catch(e){ /* fichier déplacé -> getFile échoue, on bascule sur le re-choix plus bas */ } } } } }catch(e){}
+  // 2) FICHIER DÉPLACÉ/RENOMMÉ (le handle pointe l'ancien emplacement) : on propose de RE-CHOISIR le fichier,
+  //    comme côté Tag. On met à jour le CHEMIN disque -> le moteur (montage + suivi) lit directement le nouveau
+  //    fichier, et l'aperçu se recharge. Marche aussi pour un DIRECT (fichier unique déplacé sur le disque).
+  if(!_mainLoaded && window.matchlyzVideoRef){
+    let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){}
+    if(r&&r.path){ project.videoPath=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; project.videoBlobId=null; try{ save(); }catch(e){}
+      try{ await mlzConvertPath(r.path); }catch(e){}
+      try{ mAssetsDirty=true; mAssets=null; await ensureMontageMatchVideo(); }catch(e){}
+      _mainLoaded=true; ok=Math.max(ok,1);
+    }
+  }
   try{ renderMediaLib(); renderClipsLib(); renderMTL(); drawStaticAt(mPlayT); }catch(e){}
   try{ await montUpdateReconnectBtn(); }catch(e){}
-  if(ko&&!ok){ mstat('Reconnexion impossible — vérifie que le disque est branché.'); }
-  else { mstat('Vidéo reconnectée ('+ok+' source'+(ok>1?'s':'')+'). Aperçu et export prêts.'); }
-  return ok>0; }
+  if(_mainLoaded||ok){ mstat('Vidéo reconnectée. Aperçu et export prêts.'); }
+  else { mstat('Reconnexion annulée ou impossible — vérifie que le fichier existe.'); }
+  return _mainLoaded||ok>0; }
 // ===== CHARGEMENT AUTO de la vidéo du match dans le montage (sans passer par l'onglet Tag) =====
 // On charge l'élément <video> principal depuis TOUT ce qu'on connaît : blob copié, lien disque déjà autorisé,
 // ou la source d'un clip du montage. -> à l'ouverture d'un montage, si on sait d'où vient la vidéo, elle s'ouvre seule.
@@ -11080,7 +11278,7 @@ async function ensureMontageMatchVideo(){
   // 1) blob copié du projet
   try{ if(project&&project.videoBlobId){ const r=await dbGet('blobs',project.videoBlobId); if(r&&r.blob&&await _setMainVidFromBlob(r.blob,project.videoName))return true; } }catch(e){}
   // 2) lien disque du projet (si l'autorisation est encore accordée — aucun geste requis)
-  try{ if(project&&project.videoHandleId){ const f=await _handleToBlob(project.videoHandleId); if(f){ try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; if(!project.videoSize)project.videoSize=f.size; save(); } }catch(e){} if(await _setMainVidFromBlob(f,f.name))return true; } } }catch(e){}
+  try{ if(project&&project.videoHandleId){ const f=await _handleToBlob(project.videoHandleId); if(f){ try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; if(!project.videoSize)project.videoSize=f.size; save(); try{ await _liveFinalizeInPlace(); }catch(e){} } }catch(e){} if(await _setMainVidFromBlob(f,f.name))return true; } } }catch(e){}
   // 3) sources des clips (montage indépendant) : d'abord les blobs, puis les liens disque autorisés
   try{ const cls=((project&&project.timeline&&project.timeline.clips)||[]).filter(c=>c&&(c.kind==='analytic'||c.kind==='raw'));
     for(const c of cls){ if(c.srcBlobId){ const r=await dbGet('blobs',c.srcBlobId); if(r&&r.blob&&await _setMainVidFromBlob(r.blob,c.srcName))return true; } }
@@ -11623,7 +11821,14 @@ function layoutMStage(){ try{
 window.addEventListener('resize',()=>{ try{ layoutMStage(); }catch(e){} });
 function makeClipEl(c){ const el=document.createElement('div'); el.className='mclip'+((c===mtlSel||mtlSelSet.has(c.id))?' sel':''); el.dataset.cid=c.id;
   el.style.left=(c.start*mtlPx)+'px'; el.style.width=Math.max(10,c.dur*mtlPx)+'px'; el.style.background=c.color||'#ff7a45';
-  const lbl=c.kind==='text'?('🅣 '+(c.text||'Texte').split('\n')[0]):(c.name||c.kind);
+  let lbl=c.kind==='text'?('🅣 '+(c.text||'Texte').split('\n')[0]):(c.name||c.kind); let tip=lbl;
+  // Clip d'action : on affiche en plus l'étiquette, le joueur et le commentaire (comme dans la page Actions),
+  // pour reconnaître le clip exact sur la timeline. Le texte long est coupé visuellement ; l'infobulle (survol) donne tout.
+  if(c.kind==='analytic'){ try{ const a=actionById(c.actionId); if(a){ const _et=(typeof clipEtqs==='function')?(clipEtqs(a)||[]):[];
+    let base=(a.name||(a.tags||[]).join(', ')||c.name||'Action'); let extra='';
+    if(_et.length)extra+=' · '+_et.join(' · '); if(a.playerName)extra+=' · 👤'+a.playerName;
+    lbl=base+extra+(a.note?('  💬 '+a.note):''); tip=base+extra+(a.note?('\n💬 '+a.note):''); } }catch(e){} }
+  el.title=tip;
   el.innerHTML='<div class="hh l"></div><span class="cn">'+esc(lbl)+'</span><div class="hh r"></div>';
   if(c.kind==='audio'){ audioPeaks(c.mediaId).then(wf=>{ if(!wf||!el.isConnected)return;
     const wpx=Math.max(12,Math.round(c.dur*mtlPx)), hpx=30;
@@ -12356,6 +12561,44 @@ async function ensureFastSrc(){
     v._vkey=vkey; _mSrcVid=v; return v;
   }catch(e){ return null; }
 }
+// FILIGRANE MATCHLYZ : on fabrique UNE image transparente (taille vidéo) avec le logo « MatchLyz » en bas
+// à gauche et on l'envoie au moteur pour cette session de rendu. Le moteur l'incruste à l'assemblage final
+// (standard ET turbo) -> présent sur toutes les vidéos générées. Désactivable via localStorage mlz_watermark=0.
+async function _mlzUploadWatermark(sid){
+  try{
+    if(!sid)return; if((localStorage.getItem('mlz_watermark')||'1')==='0')return;
+    const W=Math.max(2,RW||1920), H=Math.max(2,RH||1080);
+    const cv=document.createElement('canvas'); cv.width=W; cv.height=H; const g=cv.getContext('2d');
+    g.clearRect(0,0,W,H);
+    // Filigrane PETIT et DISCRET (façon « ▶ LIVETAG.PRO ») : le VRAI logo MatchLyz (double triangle
+    // « play » vert à contour blanc, sans le carré noir) + MATCHLYZ en majuscules. Semi-transparent
+    // pour ne pas gâcher la vidéo.
+    const fs=Math.round(H/32);                        // petit
+    const x=Math.round(W*0.022), yb=Math.round(H-H*0.040);   // bas-gauche
+    g.shadowColor='rgba(0,0,0,.45)'; g.shadowBlur=Math.round(fs*0.30); g.shadowOffsetY=1;
+    // ---- logo : double triangle (contour blanc derrière + triangle vert devant), comme l'icône ----
+    const ih=Math.round(fs*1.25), cy=yb-Math.round(fs*0.34);   // centre vertical ≈ milieu du texte
+    const bx=x, by=cy-ih/2, GW=Math.max(1.4,fs*0.10);
+    function _tri(px,py,s){ g.beginPath(); g.moveTo(px,py); g.lineTo(px,py+s); g.lineTo(px+s*0.84,py+s/2); g.closePath(); }
+    g.globalAlpha=0.82;
+    // triangle arrière : contour blanc seul (décalé à gauche, comme sur le logo)
+    g.lineJoin='round'; g.lineWidth=GW; g.strokeStyle='#ffffff';
+    _tri(bx, by+ih*0.06, ih*0.90); g.stroke();
+    // triangle avant : vert plein (décalé à droite) + fin liseré blanc
+    _tri(bx+ih*0.16, by, ih*0.94);
+    g.fillStyle='#16E08C'; g.fill(); g.lineWidth=Math.max(1,GW*0.7); g.strokeStyle='#ffffff'; g.stroke();
+    const markW=ih*0.16+ih*0.94*0.84;                 // largeur réelle occupée par le logo
+    // ---- texte MATCHLYZ en majuscules, espacé, gris clair ----
+    g.globalAlpha=0.62; g.textBaseline='alphabetic';
+    g.font='700 '+fs+'px Montserrat, Arial, "Helvetica Neue", sans-serif';
+    try{ g.letterSpacing=Math.round(fs*0.14)+'px'; }catch(e){}
+    g.fillStyle='#e6e6e6'; g.fillText('MATCHLYZ', bx+markW+Math.round(fs*0.55), yb);
+    const blob=await new Promise(r=>{ try{ cv.toBlob(r,'image/png'); }catch(e){ r(null); } });
+    if(!blob)return;
+    const fd=new FormData(); fd.append('sid',sid); fd.append('file',blob,'wm.png');
+    await fetch(AI_BASE+'/render_watermark',{method:'POST',body:fd}).catch(()=>{});
+  }catch(e){}
+}
 async function exportMontageServer(){
   if(window._srvBusy){ _srvCancelNow(); return; }
   const clips=project.timeline.clips;
@@ -12373,6 +12616,7 @@ async function exportMontageServer(){
     let sid=null; try{ const r=await fetch(AI_BASE+'/render_start',{method:'POST'}); const j=await r.json(); sid=j&&j.sid; }catch(e){}
     if(!sid){ alert('Moteur local injoignable. Lance le serveur (DEMARRER.command) puis réessaie.'); return; }
     window._curRenderSid=sid;   // mémorisé pour que « Stop » puisse annuler ce rendu côté moteur
+    // Le filigrane (bandeau MatchLyz) est incrusté par le MOTEUR à l'assemblage final (watermark.png fourni).
     // 2) audio (rendu hors-ligne, fiable)
     mstat('Rendu de l\'audio…'); const wav=await _renderAudioWav(clips,total);
     if(wav){ try{ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); }catch(e){} }
@@ -12523,7 +12767,7 @@ async function exportMontageTurbo(sid,clips,total,nFrames,FPS,RW,RH,vkey,mediaVk
   let url=null;
   try{ const fd=new FormData(); fd.append('sid',sid); fd.append('fps',String(FPS)); fd.append('fmt',outExt); fd.append('nframes',String(nFrames));
     const r=await fetch(AI_BASE+'/render_turbo_finish',{method:'POST',body:fd}); const j=await r.json().catch(()=>null);
-    if(j&&j.ok&&j.url){ url=j.url; window._srvVer=j.sv||null; window._encUsed=j.enc||null; } else { try{console.warn('TURBO finish',(j&&j.error)||('http '+r.status));}catch(e){} return false; }
+    if(j&&j.ok&&j.url){ url=j.url; window._srvVer=j.sv||null; window._encUsed=j.enc||null; window._wmUsed=j.wm||null; window._wmErr=j.wmerr||null; } else { try{console.warn('TURBO finish',(j&&j.error)||('http '+r.status));}catch(e){} return false; }
   }catch(e){ return false; }
   if(!url)return false;
   let blob=null;
@@ -12531,7 +12775,8 @@ async function exportMontageTurbo(sid,clips,total,nFrames,FPS,RW,RH,vkey,mediaVk
   if(!blob||!blob.size)return false;
   offerDownload(blob,outExt);
   const dt=((performance.now()-(window._turboT0||performance.now()))/1000).toFixed(1);
-  mstat('✅ Vidéo générée ('+outExt.toUpperCase()+') en '+dt+' s — fichier prêt.');
+  const _wm=(window._wmUsed==='on')?' · logo ✓':(window._wmUsed==='fail'?(' · logo ✗ : '+((window._wmErr||'')||'voir moteur')):(window._wmUsed==='none'?' · logo ✗ (non reçu)':''));
+  mstat('✅ Vidéo générée ('+outExt.toUpperCase()+') en '+dt+' s — fichier prêt.'+_wm+' [moteur '+(window._srvVer||'?')+']');
   return true;
 }
 // STOP RÉEL : coupe les boucles du navigateur ET demande au moteur de tuer le ffmpeg en cours
@@ -12568,6 +12813,7 @@ async function exportMontageNative(){
     let sid=null; try{ const r=await fetch(AI_BASE+'/render_start',{method:'POST'}); const j=await r.json(); sid=j&&j.sid; }catch(e){}
     if(!sid){ alert('Moteur local injoignable. Lance le serveur (DEMARRER.command) puis réessaie.'); return; }
     window._curRenderSid=sid;   // mémorisé pour que « Stop » puisse annuler ce rendu côté moteur
+    // Le filigrane (bandeau MatchLyz) est incrusté par le MOTEUR à l'assemblage final (turbo + standard).
     mstat('Rendu de l\'audio…'); const _ta=performance.now(); try{ const wav=await _renderAudioWav(clips,total); window._perfAudio=Math.round(performance.now()-_ta); if(wav){ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); } }catch(e){ window._perfAudio=Math.round(performance.now()-_ta); }
     const hasText=clips.some(c=>c.kind==='text');
     const mcvCtx=$('mcv').getContext('2d');
@@ -12732,13 +12978,14 @@ async function exportMontageNative(){
     // ── PASSE 4 : assemblage ffmpeg ──
     const _t4=performance.now();
     mstat('Assemblage final (ffmpeg)…'); let url=null,err='';
-    try{ const fd=new FormData(); fd.append('sid',sid); fd.append('fps',String(FPS)); fd.append('fmt',outExt); fd.append('nframes',String(nFrames)); const r=await fetch(AI_BASE+'/render_finish',{method:'POST',body:fd}); const j=await r.json(); if(j&&j.ok&&j.url){ url=j.url; window._srvVer=j.sv||null; window._encUsed=j.enc||null; } else err=(j&&j.error)||('http '+r.status); }catch(e){ err=(e&&e.message)||String(e); }
+    try{ const fd=new FormData(); fd.append('sid',sid); fd.append('fps',String(FPS)); fd.append('fmt',outExt); fd.append('nframes',String(nFrames)); const r=await fetch(AI_BASE+'/render_finish',{method:'POST',body:fd}); const j=await r.json(); if(j&&j.ok&&j.url){ url=j.url; window._srvVer=j.sv||null; window._encUsed=j.enc||null; window._wmUsed=j.wm||null; window._wmErr=j.wmerr||null; } else err=(j&&j.error)||('http '+r.status); }catch(e){ err=(e&&e.message)||String(e); }
     try{ window._perfP4=Math.round(performance.now()-_t4); }catch(e){}
     if(url){ let blob=null,ferr='';
       for(let a=0;a<4 && !blob;a++){ try{ const vb=await fetch(AI_BASE+url,{cache:'no-store'}); if(vb.ok)blob=await vb.blob(); else ferr='http '+vb.status; }catch(e){ ferr=(e&&e.message)||String(e); } if(!blob){ mstat('Récupération du fichier… (essai '+(a+1)+'/4)'); await new Promise(r=>setTimeout(r,1000)); } }
       if(blob&&blob.size){ offerDownload(blob,outExt); const dt=((performance.now()-t0perf)/1000).toFixed(1);
         let diag=''; try{ const D=window._mmDiag; if(D){ if(D.shorts&&D.shorts.length)diag=' ⚠ '+D.shorts.length+' segment(s) incomplets (ex. img '+D.shorts[0].i0+' @t='+D.shorts[0].ts0+'s : '+D.shorts[0].got+'/'+D.shorts[0].count+' · source '+(D.dur||'?')+'s) — recopie-moi ce message'; else diag=' · match '+(D.made||0)+'/'+(D.want||0)+' img (source '+(D.dur||'?')+'s)'; } }catch(e){}
-        mstat('✅ '+outExt.toUpperCase()+' — moteur serveur : '+nFrames+' images en '+dt+' s.'+diag);
+        const _wm2=(window._wmUsed==='on')?' · logo ✓':(window._wmUsed==='fail'?(' · logo ✗ : '+((window._wmErr||'')||'voir moteur')):(window._wmUsed==='none'?' · logo ✗ (non reçu)':''));
+        mstat('✅ '+outExt.toUpperCase()+' — moteur serveur : '+nFrames+' images en '+dt+' s.'+_wm2+' [moteur '+(window._srvVer||'?')+']'+diag);
         // DIAGNOSTIC LISIBLE (sans console) : où est passé le temps -> pour optimiser au bon endroit.
         try{ const P=window._perfP1||{}; const pct=P.total?Math.round((P.repli/P.total)*100):0;
           const _nv=clips.filter(c=>c.kind==='video').length,_na=clips.filter(c=>c.kind==='analytic').length,_nr=clips.filter(c=>c.kind==='raw').length,_no=clips.length-_nv-_na-_nr;
@@ -12962,13 +13209,25 @@ function buildLiveTags(){ const p=$('liveTags'); if(!p)return; p.innerHTML='';
   if(show==='tags'||show==='both'){ const h0=document.createElement('div'); h0.className='colh'; h0.textContent='Tags'; p.appendChild(h0);
     const cats=[]; TAGS.forEach(t=>{const c=t.cat||'Autre'; if(!cats.includes(c))cats.push(c);}); cats.forEach(cat=>{ const h=document.createElement('div'); h.className='cat-h'; h.style.cursor='default'; h.innerHTML='<span>'+esc(cat)+'</span>'; p.appendChild(h); TAGS.filter(t=>(t.cat||'Autre')===cat).forEach(t=>{ const d=document.createElement('div'); d.className='tag'; d.innerHTML='<span class="key">'+((t.k||'').toUpperCase())+'</span><span class="swatch" style="background:'+t.c+'"></span><span class="nm">'+esc(t.n)+'</span>'; d.onclick=()=>liveTag(t.n); p.appendChild(d); }); }); } }
 async function liveConnectDevice(){ stopLiveStream(); const id=$('liveSrc').value;
-  // On DEMANDE explicitement du 1080p @30 (sinon OBS/webcam tombe sur du 640×480 -> image floue à la relecture).
+  // On DEMANDE 1080p @30 quand c'est possible (sinon OBS/webcam tombe sur du 640×480 -> image floue).
   const _res={ width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:30} };
-  const v=id?Object.assign({deviceId:{exact:id}},_res):Object.assign({},_res);
-  try{ liveStream=await navigator.mediaDevices.getUserMedia({video:v,audio:true}); }
-  catch(e1){ try{ liveStream=await navigator.mediaDevices.getUserMedia({video:v,audio:false}); }
-    catch(e2){ liveStatus('❌ Connexion impossible : '+e2.message+' — autorise la caméra ; pour OBS, clique « Démarrer la caméra virtuelle » dans OBS puis ↻.'); return; } }
-  $('liveVid').srcObject=liveStream; refreshLiveSources(); const lbl=(liveStream.getVideoTracks()[0]||{}).label||''; liveStatus('✅ Source connectée'+(lbl?' ('+lbl+')':'')+'. Clique « ● Démarrer » pour lancer le tag en direct.'); }
+  // ESSAIS DÉGRADÉS : certaines caméras INTÉGRÉES (FaceTime) renvoient une image NOIRE si on impose 1080p ou
+  // la contrainte exacte. On tente du plus précis au plus simple, jusqu'à obtenir un flux : 1) cam choisie en
+  // 1080p, 2) cam choisie SANS résolution imposée, 3) caméra par défaut en 1080p, 4) caméra par défaut.
+  const tries=[]; if(id){ tries.push(Object.assign({deviceId:{exact:id}},_res)); tries.push({deviceId:{exact:id}}); } tries.push(Object.assign({},_res)); tries.push(true);
+  liveStream=null; let lastErr=null;
+  for(const v of tries){
+    try{ liveStream=await navigator.mediaDevices.getUserMedia({video:v,audio:true}); break; }
+    catch(e1){ try{ liveStream=await navigator.mediaDevices.getUserMedia({video:v,audio:false}); break; }catch(e2){ lastErr=e2; } }
+  }
+  if(!liveStream){ liveStatus('❌ Connexion impossible : '+((lastErr&&lastErr.message)||'')+' — autorise la caméra (Réglages Système ▸ Confidentialité ▸ Caméra) ; pour OBS, clique « Démarrer la caméra virtuelle » dans OBS puis ↻.'); return; }
+  const lv=$('liveVid'); lv.srcObject=liveStream;
+  // PLAY EXPLICITE : sous Electron, l'autoplay sur srcObject ne se déclenche pas toujours -> image noire. On force.
+  try{ await lv.play(); }catch(e){}
+  // GARDE-FOU IMAGE NOIRE : si aucune image n'arrive (~1,8 s) avec la caméra choisie, on retente la caméra
+  // par défaut sans aucune contrainte (dernier recours pour les cam intégrées récalcitrantes).
+  if(id){ setTimeout(async function(){ try{ if(lv.videoWidth===0){ const s2=await navigator.mediaDevices.getUserMedia({video:true,audio:false}).catch(()=>null); if(s2){ try{ liveStream.getTracks().forEach(t=>t.stop()); }catch(e){} liveStream=s2; lv.srcObject=s2; try{ await lv.play(); }catch(e){} } } }catch(e){} }, 1800); }
+  refreshLiveSources(); const lbl=(liveStream.getVideoTracks()[0]||{}).label||''; liveStatus('✅ Source connectée'+(lbl?' ('+lbl+')':'')+'. Clique « ● Démarrer » pour lancer le tag en direct.'); }
 async function liveConnectScreen(){
   // Dans l'app de bureau : SÉLECTEUR MAISON fiable (liste écrans + fenêtres Chrome/Safari avec aperçu).
   if(window.matchlyzScreenSources){
@@ -13374,6 +13633,23 @@ async function downloadServerMp4(url,fname){ const resp=await fetch(url); if(!re
   if(window.showSaveFilePicker){ try{ const h=await window.showSaveFilePicker({suggestedName:fname,types:[{description:'Vidéo MP4',accept:{'video/mp4':['.mp4']}}]}); const w=await h.createWritable(); await w.write(blob); await w.close(); return true; }catch(e){ if(e&&e.name==='AbortError')return false; } }
   const u=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=u; a.download=fname; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(u),9000); return true; }
 function _mp4Name(){ return ((project&&project.videoName)||'Direct').replace(/\.(webm|mkv|mts|mp4)$/i,'').replace(/[^\w \-]+/g,'_')+'.mp4'; }
+// PHASE C — finalisation SUR PLACE d'un direct pas encore finalisé (zéro copie). Idempotente : ne fait
+// rien si déjà finalisé (project._liveRaw faux) ou si le chemin n'est pas (encore) connu. Appelée au 1er
+// montage / suivi IA, dès que le chemin du fichier est résolu.
+async function _liveFinalizeInPlace(){
+  try{
+    if(!(project&&project._liveRaw&&project.videoPath))return false;
+    if(!window.matchlyzVideoRef)return false;
+    let ex=true; try{ ex=await window.matchlyzVideoRef.exists(project.videoPath); }catch(e){}
+    if(!ex)return false;
+    try{ aiBar('Finalisation de la vidéo du direct… (une seule fois)'); }catch(e){}
+    const fd=new FormData(); fd.append('path',project.videoPath);
+    const r=await fetch(AI_BASE+'/rec_remux_path',{method:'POST',body:fd}).then(x=>x.json()).catch(()=>null);
+    try{ aiBarHide(); }catch(e){}
+    if(r&&r.ok){ project._liveRaw=0; if(r.size)project.videoSize=r.size; try{save();}catch(e){} return true; }
+  }catch(e){}
+  return false;
+}
 async function finalizeLive(){
   const _end=()=>{ _stoppingLive=false; try{ _hideLiveStopOverlay(); }catch(e){} try{ const b=$('liveStopBtn'); if(b){ b.disabled=false; b.textContent='■ Arrêter le direct'; } }catch(e){} try{ clearInterval(window._rvWatch); window._rvWatch=null; }catch(e){} try{ lmTeardown(); }catch(e){} try{ _mseTeardown(); }catch(e){} try{ _rvHideMask(); }catch(e){} liveMode=false; liveReview=false; if(liveReviewUrl){try{URL.revokeObjectURL(liveReviewUrl);}catch(e){}liveReviewUrl=null;} clearInterval(liveUiInt); try{clearInterval(window._liveWatch);window._liveWatch=null;}catch(e){} try{ liveKeepAliveStop(); }catch(e){} try{ if(window._wakeLock){window._wakeLock.release();window._wakeLock=null;} }catch(e){} $('liveBanner').classList.add('hidden'); stopLiveStream(); try{vid.srcObject=null;vid.removeAttribute('src');}catch(e){} try{ dbClear('livebuf'); liveBufN=0; }catch(e){} $('live').classList.add('hidden'); };
   // CAS 1 : direct écrit dans un fichier -> on ferme le flux et on référence le fichier (aucune copie lourde en base)
@@ -13383,29 +13659,48 @@ async function finalizeLive(){
     if(liveSaveHandle){
       try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
       project.videoName=liveSaveHandle.name||('Direct '+new Date().toLocaleDateString());
-      const hid=project.videoHandleId||('vh_'+uid()); project.videoHandleId=hid; project.videoBlobId=null;
+      const hid=project.videoHandleId||('vh_'+uid()); project.videoHandleId=hid; project.videoBlobId=null; project.videoUrl=null;
       try{ await dbPut('blobs',{id:hid,handle:liveSaveHandle}); }catch(e){}
-      // PRÉPARATION AUTO : le serveur remuxe le fichier -> vidéo lisible/seekable pour le montage
-      let prepared=false;
-      try{
-        liveStatus('Préparation de la vidéo pour le montage… (ne ferme pas la fenêtre)');
-        const f=await liveSaveHandle.getFile(); project.videoSize=f.size;   // taille mémorisée -> vkey calculable après un redémarrage même sans relire le fichier
-        const rid='rec_'+((project.id||'x')+'').replace(/[^\w-]+/g,'')+'_'+Date.now();
-        const fd=new FormData(); fd.append('rid',rid); fd.append('file',f,(project.videoName||'direct.webm'));
-        const r=await fetch(AI_BASE+'/rec_remux',{method:'POST',body:fd}).then(x=>x.json()).catch(()=>null);
-        if(r&&r.ok&&r.url){ project.videoUrl=AI_BASE+r.url; prepared=true; }
-      }catch(e){}
-      // UN SEUL FICHIER, LISIBLE PARTOUT : le fichier écrit pendant l'enregistrement est un MP4 fragmenté que
-      // QuickTime refuse. Si le serveur a produit une version remuxée propre, on RÉÉCRIT le fichier choisi avec
-      // cette version (lisible QuickTime + seekable) -> plus de 2e fichier, plus de « .mp4.mp4 ».
       let clean=false;
-      if(prepared && project.videoUrl){ try{ liveStatus('Finalisation du fichier MP4 lisible…'); const _resp=await fetch(project.videoUrl); const _cb=await _resp.blob();
-          if(_cb&&_cb.size){ const _w=await liveSaveHandle.createWritable(); await _w.write(_cb); await _w.close(); project.videoSize=_cb.size; clean=true; } }catch(e){} }
+      // Taille + chemin absolu. Sur le handle FRAÎCHEMENT créé par le sélecteur d'enregistrement, _filePath
+      // est parfois vide ; en RELISANT le handle depuis la base (comme à l'ouverture), le chemin se résout.
+      let f=null, _vp='';
+      try{ f=await liveSaveHandle.getFile(); if(f)project.videoSize=f.size; _vp=(f&&_filePath(f))||''; }catch(e){}
+      if(!_vp){ try{ const rr=await dbGet('blobs',hid); const hh=rr&&rr.handle; if(hh){ const f2=await hh.getFile(); if(f2){ if(!project.videoSize)project.videoSize=f2.size; _vp=_filePath(f2)||''; } } }catch(e){} }
+      // PHASE C — MODÈLE LIVETAG (ZÉRO COPIE) : le fichier est déjà écrit sur le disque à l'emplacement choisi.
+      // S'il a un chemin absolu, on le FINALISE SUR PLACE (remux, aucune 2e copie). Sinon on NE copie RIEN :
+      // le fichier sera finalisé sur place dès que son chemin sera connu (au 1er montage/suivi, via register_local).
+      if(_vp){
+        project.videoPath=_vp;
+        try{
+          liveStatus('Finalisation du fichier (sur place, sans copie)…');
+          const fd=new FormData(); fd.append('path',_vp);
+          const r=await fetch(AI_BASE+'/rec_remux_path',{method:'POST',body:fd}).then(x=>x.json()).catch(()=>null);
+          if(r&&r.ok){ clean=true; project._liveRaw=0; if(r.size)project.videoSize=r.size; }
+          else { project._liveRaw=1; }
+        }catch(e){ project._liveRaw=1; }
+      } else { project._liveRaw=1; }
+      // REPLI FIABLE (chemin absolu indisponible au stop) : le fichier brut MediaRecorder n'est PAS lisible
+      // (QuickTime, et images malformées pour le suivi). On le rend propre via le moteur PUIS on réécrit le
+      // fichier choisi avec la version propre, et on SUPPRIME la copie intermédiaire -> un seul fichier, lisible.
+      if(!clean && f && liveSaveHandle){
+        try{
+          liveStatus('Préparation de la vidéo (lisible QuickTime)… ne ferme pas la fenêtre');
+          const rid='rec_'+((project.id||'x')+'').replace(/[^\w-]+/g,'')+'_'+Date.now();
+          const fd=new FormData(); fd.append('rid',rid); fd.append('file',f,(project.videoName||'direct.mp4'));
+          const r=await fetch(AI_BASE+'/rec_remux',{method:'POST',body:fd}).then(x=>x.json()).catch(()=>null);
+          if(r&&r.ok&&r.url){
+            const _resp=await fetch(AI_BASE+r.url); const _cb=await _resp.blob();
+            if(_cb&&_cb.size){ const _w=await liveSaveHandle.createWritable(); await _w.write(_cb); await _w.close(); project.videoSize=_cb.size; clean=true; project._liveRaw=0; }
+            // on NE garde PAS la copie moteur : zéro 2e fichier dans le cache
+            try{ const _nm=(r.url.split('/').pop()); const _fd2=new FormData(); _fd2.append('name',_nm); fetch(AI_BASE+'/rec_drop',{method:'POST',body:_fd2}).catch(()=>{}); }catch(e){}
+          }
+        }catch(e){}
+      }
       project.updated=Date.now(); try{ await dbPut('projects',project); }catch(e){}
       const nb=(project.actions||[]).length, vn=project.videoName; liveSaveHandle=null; _end();
       if(clean) alert('✅ Direct terminé : '+nb+' tag(s).\n\nTon match est dans le fichier « '+vn+' » — un seul fichier MP4, lisible partout (QuickTime inclus) et prêt pour le montage.');
-      else if(prepared) alert('✅ Direct terminé : '+nb+' tag(s). La vidéo est prête pour le montage.\n\nⓘ Le fichier sur ton disque est resté au format d\'enregistrement (MP4 fragmenté, lisible dans MatchLyz mais pas dans QuickTime).');
-      else alert('✅ Direct terminé : '+nb+' tag(s).\n\nⓘ La conversion n\'a pas pu se faire (moteur local éteint ?). Ta vidéo reste dans « '+vn+' ». Lance DEMARRER puis rouvre le match pour la convertir.');
+      else alert('✅ Direct terminé : '+nb+' tag(s).\n\nTon match est dans le fichier « '+vn+' » — un seul fichier, aucune copie. Il sera finalisé automatiquement au premier montage ou suivi IA.');
       openProject(project.id); return;
     }
   }
@@ -13438,7 +13733,12 @@ try{ (function(){
 })(); }catch(e){}
 
 (function(){ var dbReady=false;
-  openDB().then(function(){dbReady=true; try{sessionStorage.removeItem('mlz_db_retry');}catch(e){}}).then(loadTags).then(loadCodeTables).then(renderHome).catch(function(){});
+  openDB().then(function(){dbReady=true; try{sessionStorage.removeItem('mlz_db_retry');}catch(e){}}).then(loadTags).then(loadCodeTables).then(renderHome)
+    // PHASE D — La sauvegarde durable du moteur (workspace_latest.json) continue de tourner en arrière-plan
+    // (autoBackupToServer : à chaque sauvegarde + toutes les 10 min). La RÉCUPÉRATION ne se fait plus
+    // automatiquement au démarrage (plus aucune pop-up) : elle reste disponible à la demande via
+    // Réglages ▸ Sauvegarde ▸ « 📥 Restaurer une sauvegarde auto ».
+    .catch(function(){});
   // Filet: sous Electron, la 1re CRÉATION de la base peut geler. Si rien après 4 s, on recharge une fois.
   setTimeout(function(){ if(!dbReady && !DB && window.__isElectron){ try{ if(!sessionStorage.getItem('mlz_db_retry')){ sessionStorage.setItem('mlz_db_retry','1'); location.reload(); } }catch(e){ location.reload(); } } }, 4000);
 })();
