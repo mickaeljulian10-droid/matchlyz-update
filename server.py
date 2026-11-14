@@ -45,7 +45,7 @@ WORK = _pick_work_dir()
 WORK.mkdir(parents=True, exist_ok=True)
 # Version du MOTEUR : renvoyée à la fin du rendu pour vérifier que le serveur qui tourne est bien à jour
 # (dessins en parallèle). Si le popup n'affiche PAS cette version, c'est qu'un ancien moteur est resté actif.
-SERVER_VERSION = "s59-dessin-joueur-choisi"
+SERVER_VERSION = "s60-rendu-anti-blocage"
 _LAST_ENC = "?"   # dernier encodeur vidéo utilisé (h264_videotoolbox = GPU, libx264 = CPU)
 _LAST_WM = "?"    # dernier état filigrane : on=incrusté · none=aucun wm.png · fail=échec (vidéo d'origine gardée)
 _LAST_WMERR = ""  # dernière erreur ffmpeg du filigrane (diagnostic)
@@ -3767,27 +3767,86 @@ RENDER = WORK / "_render"; RENDER.mkdir(exist_ok=True)
 # global + la liste des processus ffmpeg en cours -> Stop les TUE immédiatement.
 _STOP_ALL = False
 _ALL_PROCS = []
-def _run_cancelable(cmd, timeout=36000):
-    """Lance ffmpeg de façon INTERRUPTIBLE : le processus est enregistré pour pouvoir être tué par Stop."""
-    import subprocess as _sp
+def _run_cancelable(cmd, timeout=36000, watch=None, stall=150):
+    """Lance ffmpeg de façon INTERRUPTIBLE : le processus est enregistré pour pouvoir être tué par Stop.
+    s60 — CHIEN DE GARDE : si 'watch' (le fichier de sortie) ne bouge plus pendant 'stall' secondes
+    alors que ffmpeg tourne encore, c'est un BLOCAGE (vu le 13/11 : encodeur figé en fin de rendu,
+    0 % CPU pendant 30 min). On demande alors un arrêt propre (SIGINT -> ffmpeg referme le fichier),
+    puis on force si besoin. L'appelant VALIDE ensuite la sortie et passe à l'encodeur suivant.
+    stderr va dans un fichier temporaire (un tube plein peut lui-même figer ffmpeg)."""
+    import subprocess as _sp, tempfile as _tf, time as _tm, signal as _sig
     if _STOP_ALL:
-        class _R: returncode = 255; stderr = b"stop"; stdout = b""
+        class _R: returncode = 255; stderr = b"stop"; stdout = b""; stalled = False
         return _R()
-    p = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.PIPE, stdin=_sp.DEVNULL)
+    ef = _tf.TemporaryFile()
+    p = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=ef, stdin=_sp.DEVNULL)
     try: _ALL_PROCS.append(p)
     except Exception: pass
+    t0 = _tm.time(); last = None; last_chg = t0; stalled = False; timed_out = False
     try:
-        out, err = p.communicate(timeout=timeout)
-    except Exception:
-        try: p.kill()
+        while True:
+            try:
+                p.wait(timeout=2); break
+            except _sp.TimeoutExpired:
+                pass
+            now = _tm.time()
+            if now - t0 > timeout:
+                timed_out = True
+            elif watch is not None:
+                try:
+                    st = os.stat(str(watch)); cur = (st.st_size, int(st.st_mtime))
+                except Exception:
+                    cur = None
+                if cur != last:
+                    last = cur; last_chg = now
+                elif now - last_chg > stall:
+                    stalled = True
+            if timed_out or stalled:
+                try: p.send_signal(_sig.SIGINT)
+                except Exception: pass
+                try: p.wait(timeout=20)
+                except Exception:
+                    try: p.kill()
+                    except Exception: pass
+                    try: p.wait(timeout=10)
+                    except Exception: pass
+                try:
+                    print("ffmpeg %s apres %ds -> arrete (%s)" % ("FIGE" if stalled else "TROP LONG", int(now - t0),
+                          os.path.basename(str(watch)) if watch else "?"), flush=True)
+                except Exception:
+                    pass
+                break
+    finally:
+        try: _ALL_PROCS.remove(p)
         except Exception: pass
-        try: out, err = p.communicate(timeout=5)
-        except Exception: out, err = b"", b"timeout"
-    try: _ALL_PROCS.remove(p)
-    except Exception: pass
+    err = b""
+    try:
+        ef.seek(0, 2); sz = ef.tell(); ef.seek(max(0, sz - 8000)); err = ef.read()
+        ef.close()
+    except Exception:
+        pass
+    if stalled: err = (err or b"") + b" [bloque: sortie figee]"
+    if timed_out: err = (err or b"") + b" [delai depasse]"
     class _R: pass
-    r = _R(); r.returncode = p.returncode; r.stdout = out or b""; r.stderr = err or b""
+    r = _R(); r.returncode = p.returncode; r.stdout = b""; r.stderr = err; r.stalled = stalled or timed_out
     return r
+
+def _out_ok(path, expected=0.0):
+    """s60 : une sortie n'est VALIDE que si elle se lit (moov présent -> durée lisible) et, si on connaît
+    la durée attendue, qu'elle est COMPLÈTE (>= 97 %). Avant, « taille > 0 » suffisait : un fichier figé
+    à moitié écrit passait pour un succès (vidéo illisible téléchargée)."""
+    try:
+        if not (path and os.path.exists(str(path)) and os.path.getsize(str(path)) > 1024):
+            return False
+        dur = _src_dur(str(path))
+        if dur <= 0:
+            return False
+        if expected and expected > 0 and dur < expected * 0.97 - 0.5:
+            return False
+        return True
+    except Exception:
+        return False
+
 def _render_stop_all():
     """Tue tous les ffmpeg de rendu en cours et bloque les suivants (jusqu'au prochain /render_start)."""
     global _STOP_ALL
@@ -3919,6 +3978,11 @@ def _assemble_render(d, fps, ext):
     ff = _ffexe()
     frames = str(d / "f%06d.jpg"); audio = d / "audio.wav"; out = d / ("out." + ext)
     have_audio = audio.exists()
+    try:
+        _nimg = len(list(d.glob("f[0-9]*.jpg")))
+    except Exception:
+        _nimg = 0
+    _exp = (float(_nimg) / float(fps)) if (_nimg and fps) else 0.0
     # Encodeur du PLUS RAPIDE (GPU Apple = videotoolbox) au plus compatible (CPU). Repli AUTOMATIQUE
     # si l'encodeur matériel n'existe pas dans ce ffmpeg -> on ne perd jamais le rendu.
     vcodecs = [
@@ -3938,17 +4002,21 @@ def _assemble_render(d, fps, ext):
             cmd += ["-i", str(audio)]
         cmd += vc + ["-movflags", "+faststart", "-r", str(fps)]
         if have_audio:
-            # apad : rallonge l'audio au silence -> -shortest coupe sur la vidéo (plus de fin tronquée).
-            cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+            # apad : rallonge l'audio au silence ; la fin est fixée par -t (durée EXACTE des images).
+            # s60 : plus de -shortest (avec apad, il pouvait FIGER ffmpeg en fin de long rendu).
+            cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k"]
+        if _exp > 0:
+            cmd += ["-t", "%.3f" % _exp]
         cmd += [str(out)]
         try:
-            p = _run_cancelable(cmd, timeout=1800)
+            p = _run_cancelable(cmd, timeout=3600, watch=out)
             err = (p.stderr.decode("utf-8", "ignore")[-700:] if p.stderr else "")
         except Exception as e:
             err = str(e)
-        if os.path.exists(out) and os.path.getsize(out) > 0:
+        if _out_ok(out, _exp):
             globals()["_LAST_ENC"] = vc[1]
             return out, err
+        print("assemblage : sortie invalide avec %s -> encodeur suivant" % vc[1], flush=True)
     return None, err
 
 def _overlay_seq_prepare(d, nframes):
@@ -3996,6 +4064,19 @@ def _assemble_render_overlay(d, fps, ext, nframes):
     ff = _ffexe()
     frames = str(d / "f%06d.jpg"); ovseq = str(d / "o%06d.png"); audio = d / "audio.wav"; out = d / ("out." + ext)
     have_audio = audio.exists()
+    try:
+        _nimg = int(nframes) if (nframes and int(nframes) > 0) else len(list(d.glob("f[0-9]*.jpg")))
+    except Exception:
+        _nimg = 0
+    _exp = (float(_nimg) / float(fps)) if (_nimg and fps) else 0.0
+    _bw = _bh = 0
+    try:
+        import cv2 as _cv2
+        _im0 = _cv2.imread(str(d / "f000000.jpg"))
+        if _im0 is not None:
+            _bh, _bw = int(_im0.shape[0]), int(_im0.shape[1])
+    except Exception:
+        pass
     vcodecs = [
         ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-pix_fmt", "yuv420p"],
         ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p"],
@@ -4014,8 +4095,12 @@ def _assemble_render_overlay(d, fps, ext, nframes):
                "-framerate", str(fps), "-i", ovseq]
         if have_audio:
             cmd += ["-i", str(audio)]
-        # scale2ref : agrandit la surcouche (demi-res) à la taille exacte de l'image de fond, puis overlay.
-        _fc = "[1:v][0:v]scale2ref=flags=bilinear[ovr][bg];[bg][ovr]overlay=format=auto[v]"
+        # s60 : agrandit la surcouche (demi-res) à la taille EXACTE de l'image de fond, connue d'avance.
+        # (scale2ref, déprécié dans ffmpeg 7, PERDAIT les dernières images du montage -> fin tronquée.)
+        if _bw > 0 and _bh > 0:
+            _fc = "[1:v]scale=%d:%d:flags=bilinear[ovr];[0:v][ovr]overlay=format=auto[v]" % (_bw, _bh)
+        else:
+            _fc = "[1:v][0:v]scale2ref=flags=bilinear[ovr][bg];[bg][ovr]overlay=format=auto[v]"
         if have_audio:
             # On RALLONGE l'audio avec du silence (apad) : ainsi -shortest coupe sur la VIDÉO (longueur voulue)
             # et non sur un audio plus court -> plus de fin de montage tronquée (ex. flèche en différé coupée).
@@ -4025,16 +4110,20 @@ def _assemble_render_overlay(d, fps, ext, nframes):
             cmd += ["-map", "[aout]"]
         cmd += vc + ["-threads", _nc, "-movflags", "+faststart", "-r", str(fps)]
         if have_audio:
-            cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+            # s60 : plus de -shortest (figeait ffmpeg en fin de long rendu) -> durée EXACTE par -t.
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
+        if _exp > 0:
+            cmd += ["-t", "%.3f" % _exp]
         cmd += [str(out)]
         try:
-            p = _run_cancelable(cmd, timeout=1800)
+            p = _run_cancelable(cmd, timeout=3600, watch=out)
             err = (p.stderr.decode("utf-8", "ignore")[-700:] if p.stderr else "")
         except Exception as e:
             err = str(e)
-        if os.path.exists(out) and os.path.getsize(out) > 0:
+        if _out_ok(out, _exp):
             globals()["_LAST_ENC"] = vc[1]
             return out, err
+        print("assemblage (surcouches) : sortie invalide avec %s -> encodeur suivant" % vc[1], flush=True)
     return None, err
 
 def _composite_overlays_cv2(d, nframes):
@@ -4126,6 +4215,7 @@ def _apply_watermark(d, src, ext):
             globals()["_LAST_WM"] = "none"
             return src
         outp = d / ("wm_out." + (ext or "mp4"))
+        _sd = _src_dur(str(src))      # s60 : durée de référence -> la version avec logo doit être COMPLÈTE
         # Le bandeau (851×315 transparent) est mis à l'échelle à ~22 % de la largeur vidéo, posé en bas à
         # gauche, avec une légère transparence (discret). On déduit la largeur cible via ffprobe (pas de
         # scale2ref, qui manque sur certains ffmpeg). Repli : 420 px si la sonde échoue.
@@ -4152,12 +4242,12 @@ def _apply_watermark(d, src, ext):
                        "-filter_complex", fc, "-map", "[v]", "-map", "0:a?"] + vc + \
                       ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(outp)]
                 try:
-                    p = _run_cancelable(cmd, timeout=1800)
+                    p = _run_cancelable(cmd, timeout=3600, watch=outp)
                     last_err = (p.stderr.decode("utf-8", "ignore")[-400:] if (p and p.stderr) else last_err)
                 except Exception as e:
                     last_err = str(e)
                     continue
-                if outp.exists() and outp.stat().st_size > 1000 and _probe_ok(outp):
+                if outp.exists() and outp.stat().st_size > 1000 and _probe_ok(outp) and _out_ok(outp, _sd):
                     globals()["_LAST_ENC"] = vc[1] + "+wm"
                     globals()["_LAST_WM"] = "on"
                     globals()["_LAST_WMERR"] = ""
@@ -4390,15 +4480,15 @@ def _turbo_concat(d, fps, ext, total_n=0):
         else:
             cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(fps)]
         if have_audio:
-            cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+            cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k"] + ([] if _dur > 0 else ["-shortest"])
         if _dur > 0:
             cmd += ["-t", ("%.3f" % _dur)]
         cmd += ["-movflags", "+faststart", str(out)]
         try:
-            subprocess.run(cmd, capture_output=True, timeout=36000)
+            _run_cancelable(cmd, timeout=36000, watch=out)
         except Exception as e:
             return None, str(e)
-        if os.path.exists(out) and os.path.getsize(out) > 0:
+        if _out_ok(out, _dur):
             return out, ""
     return None, "concat échoué"
 
@@ -4491,15 +4581,17 @@ def _render_turbo_build(d, vkey, w, h, fps, ext, runs):
     if have_audio:
         cmd += ["-i", str(audio)]
     cmd += ["-c:v", "copy"]
+    _tdur = (float(total_n) / float(fps)) if (total_n > 0 and fps) else 0.0
     if have_audio:
-        cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        # s60 : -shortest seulement si la durée n'est pas connue (avec apad il pouvait figer ffmpeg).
+        cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k"] + ([] if _tdur > 0 else ["-shortest"])
     if total_n > 0:
         cmd += ["-t", ("%.3f" % (float(total_n) / float(fps)))]
     cmd += ["-movflags", "+faststart", str(out)]
     ok = False
     try:
-        p = subprocess.run(cmd, capture_output=True, timeout=36000)
-        ok = os.path.exists(out) and os.path.getsize(out) > 0
+        p = _run_cancelable(cmd, timeout=36000, watch=out)
+        ok = _out_ok(out, _tdur)
         if not ok:
             err = (p.stderr.decode("utf-8", "ignore")[-300:] if p.stderr else "")
     except Exception as e:
@@ -4516,13 +4608,13 @@ def _render_turbo_build(d, vkey, w, h, fps, ext, runs):
             cmd += ["-i", str(audio)]
         cmd += chosen + ["-r", str(fps)]
         if have_audio:
-            cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+            cmd += ["-af", "apad", "-c:a", "aac", "-b:a", "192k"] + ([] if _tdur > 0 else ["-shortest"])
         if total_n > 0:
             cmd += ["-t", ("%.3f" % (float(total_n) / float(fps)))]
         cmd += ["-movflags", "+faststart", str(out)]
         try:
-            p = subprocess.run(cmd, capture_output=True, timeout=36000)
-            ok = os.path.exists(out) and os.path.getsize(out) > 0
+            p = _run_cancelable(cmd, timeout=36000, watch=out)
+            ok = _out_ok(out, _tdur)
             if not ok:
                 err = (p.stderr.decode("utf-8", "ignore")[-300:] if p.stderr else err)
         except Exception as e:
