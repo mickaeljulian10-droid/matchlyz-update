@@ -12816,6 +12816,11 @@ async function exportMontageNative(){
     // Le filigrane (bandeau MatchLyz) est incrusté par le MOTEUR à l'assemblage final (turbo + standard).
     mstat('Rendu de l\'audio…'); const _ta=performance.now(); try{ const wav=await _renderAudioWav(clips,total); window._perfAudio=Math.round(performance.now()-_ta); if(wav){ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); } }catch(e){ window._perfAudio=Math.round(performance.now()-_ta); }
     const hasText=clips.some(c=>c.kind==='text');
+    // s62 : la surcouche « texte » n'est calculée QUE quand un texte est affiché à cet instant (avant : sur
+    // TOUTES les images du match dès qu'il existait un texte quelque part -> milliers de calculs inutiles).
+    const _txtClips=clips.filter(c=>c.kind==='text'); const _txtOn=(tt)=>_txtClips.some(x=>tt>=x.start&&tt<x.start+x.dur);
+    // s62 : images composées IDENTIQUES consécutives (gel, fond, texte figé) envoyées UNE fois (liens durs côté moteur)
+    let _fbPend=null;
     const mcvCtx=$('mcv').getContext('2d');
     const _ovl=document.createElement('canvas'); _ovl.width=RW; _ovl.height=RH; const octx=_ovl.getContext('2d');
     // Encode la surcouche en RÉSOLUTION RÉDUITE (le serveur la ré-agrandit à la taille de l'image) :
@@ -12860,6 +12865,13 @@ async function exportMontageNative(){
       if(window._srvStop||mStop){ mstat('Rendu arrêté.'); return; }
       mstat('Rendu standard…');
     }
+    // s62 : envoi GROUPÉ d'une image composée répétée (repli image par image si moteur ancien)
+    async function _fbFlush(){ const P=_fbPend; _fbPend=null; if(!P)return;
+      const p=(async()=>{
+        if(P.idxs.length>1){ try{ const fd=new FormData(); fd.append('sid',sid); fd.append('idxs',JSON.stringify(P.idxs)); fd.append('file',P.jpg,'f.jpg'); const r=await fetch(AI_BASE+'/render_frame_multi',{method:'POST',body:fd}); const j=await r.json().catch(()=>null); if(j&&j.ok)return; }catch(e){} }
+        for(const ix of P.idxs){ try{ const f2=new FormData(); f2.append('sid',sid); f2.append('idx',String(ix)); f2.append('file',P.jpg,'f.jpg'); await fetch(AI_BASE+'/render_frame',{method:'POST',body:f2}); }catch(e){} }
+      })();
+      _upQ.push(p); if(_upQ.length>=_MAXQ)await _upQ.shift(); }
     // ── PASSE 1 : classification + dessins (aucun seek du match) ──
     for(let i=0;i<nFrames && !(window._srvStop||mStop);i++){
       const t=Math.min(total-1e-3, i/FPS);
@@ -12884,7 +12896,7 @@ async function exportMontageNative(){
         if(curSeg && curSeg.c===c && Math.abs(ts-(curSeg.ts0+curSeg.count*curSeg.dts))<dtsExp*0.75){ curSeg.count++; }
         else { curSeg={c:c,i0:i,count:1,ts0:ts,dts:dtsExp,vk:(curVk||'')}; segs.push(curSeg); }
         const hasDraw = aa && ((aa.aiAnnos&&aa.aiAnnos.length)||(aa.tracks&&aa.tracks.length)||(aa.links&&aa.links.length));
-        if(hasDraw || hasText){
+        if(hasDraw || (hasText && _txtOn(t))){
           octx.clearRect(0,0,RW,RH); rctx=octx;
           // DIFFÉRÉ : la surcouche doit utiliser le MÊME temps de déploiement (phV) que l'aperçu du montage
           // (drawFrame), sinon la flèche/zone en différé ne se déploie pas pareil et peut rester inachevée en fin de clip.
@@ -12912,14 +12924,52 @@ async function exportMontageNative(){
         let jpg=null;
         if(fbKey && fbKey===_lastFbKey && _lastFbJpg){ jpg=_lastFbJpg; }
         else { try{ await drawStaticAt(t); }catch(e){} jpg=await new Promise(res=>{ try{ $('mcv').toBlob(res,'image/jpeg',0.92); }catch(e){ res(null); } }); if(fbKey){ _lastFbKey=fbKey; _lastFbJpg=jpg; } else { _lastFbKey=null; _lastFbJpg=null; } }
-        if(jpg&&jpg.size){ const fd=new FormData(); fd.append('sid',sid); fd.append('idx',String(i)); fd.append('file',jpg,'f.jpg'); const p=fetch(AI_BASE+'/render_frame',{method:'POST',body:fd}).catch(()=>{}); _upQ.push(p); if(_upQ.length>=_MAXQ)await _upQ.shift(); }
+        if(jpg&&jpg.size){ if(_fbPend && _fbPend.jpg===jpg){ _fbPend.idxs.push(i); } else { await _fbFlush(); _fbPend={jpg:jpg,idxs:[i]}; } }
       }
-      if(i%10===0){ mstat('Analyse du montage '+Math.round(i/nFrames*100)+'% ('+i+'/'+nFrames+')…'); mPlayT=t; try{drawMPh();}catch(e){} }
+      if(i%24===0){ mstat('Analyse du montage '+Math.round(i/nFrames*100)+'% ('+i+'/'+nFrames+')…'); mPlayT=t; try{drawMPh();}catch(e){} }
     }
+    try{ await _fbFlush(); }catch(e){}
     try{ await Promise.all(_upQ); }catch(e){}
     try{ window._perfP1={total:nFrames,repli:_fb,natif:(nFrames-_fb),segs:segs.length,dessins:_ovlGroups.size,ms:Math.round(performance.now()-t0perf)}; }catch(e){}
     try{ console.warn('PERF export PASS1 total='+nFrames+' repli(drawStaticAt)='+_fb+' natif='+(nFrames-_fb)+' segs='+segs.length+' dessins='+_ovlGroups.size+' ms='+(performance.now()-t0perf).toFixed(0)); }catch(e){}
     if(window._srvStop||mStop){ mstat('Rendu arrêté.'); return; }
+    // ── s62 : RENDU RAPIDE PAR SEGMENTS PARALLÈLES ──
+    // Le moteur encode chaque bout (match + dessins + logo) directement depuis la vidéo source, plusieurs à la
+    // fois, puis colle tout par copie. Plus de 21 000 JPEG intermédiaires ni de 2e passe pour le logo.
+    // En cas d'échec -> repli AUTOMATIQUE sur l'assemblage classique ci-dessous (rien n'est perdu).
+    let _ovStored=false;
+    try{
+      const _ts=performance.now(); let stOk=true;
+      if(_ovlGroups.size){ const groups=[..._ovlGroups.values()].filter(g=>g&&g.blob&&g.idxs.length); const q=[];
+        mstat('Préparation des dessins… ('+groups.length+')');
+        for(const g of groups){ if(window._srvStop||mStop){ stOk=false; break; }
+          const p=(async()=>{ try{ const fdS=new FormData(); fdS.append('sid',sid); fdS.append('idxs',JSON.stringify(g.idxs)); fdS.append('file',g.blob,'o.png'); const r=await fetch(AI_BASE+'/render_overlay_store',{method:'POST',body:fdS}); const jj=await r.json().catch(()=>null); if(!(jj&&jj.ok))stOk=false; }catch(e){ stOk=false; } })();
+          q.push(p); if(q.length>=16)await q.shift(); }
+        try{ await Promise.all(q); }catch(e){}
+        _ovStored=stOk; }
+      if(stOk && !(window._srvStop||mStop)){
+        mstat('⚡ Rendu rapide par segments…');
+        const payloadS=segs.map(s=>({i0:s.i0,count:s.count,ts0:s.ts0,dts:s.dts,vk:(s.vk||'')}));
+        const fdG=new FormData(); fdG.append('sid',sid); fdG.append('vkey',vkey||''); fdG.append('w',String(RW)); fdG.append('h',String(RH)); fdG.append('fps',String(FPS)); fdG.append('fmt',outExt); fdG.append('nframes',String(nFrames)); fdG.append('segs',JSON.stringify(payloadS));
+        const _tick=setInterval(()=>{ try{ mstat('⚡ Rendu rapide par segments… '+Math.round((performance.now()-_ts)/1000)+' s'); }catch(e){} },1000);
+        let jg=null, rsg=0;
+        try{ const r=await fetch(AI_BASE+'/render_seg_finish',{method:'POST',body:fdG}); rsg=r.status; jg=await r.json().catch(()=>null); }catch(e){} finally{ clearInterval(_tick); }
+        if(window._srvStop||mStop){ mstat('Rendu arrêté.'); return; }
+        if(jg&&jg.ok&&jg.url){
+          window._srvVer=jg.sv||null; window._encUsed=jg.enc||null; window._wmUsed=jg.wm||null; window._wmErr=jg.wmerr||null;
+          const _tSeg=performance.now()-_ts; let blob=null, ferr='';
+          for(let a=0;a<4 && !blob;a++){ try{ const vb=await fetch(AI_BASE+jg.url,{cache:'no-store'}); if(vb.ok)blob=await vb.blob(); else ferr='http '+vb.status; }catch(e){ ferr=(e&&e.message)||String(e); } if(!blob){ mstat('Récupération du fichier… (essai '+(a+1)+'/4)'); await new Promise(r=>setTimeout(r,1000)); } }
+          if(blob&&blob.size){ offerDownload(blob,outExt);
+            const dt=((performance.now()-t0perf)/1000).toFixed(1); const _P=window._perfP1||{};
+            const _wm=(window._wmUsed==='on')?' · logo ✓':(window._wmUsed==='none'?' · logo ✗':'');
+            mstat('✅ Généré en '+dt+' s — AUDIO '+(((window._perfAudio||0)/1000).toFixed(1))+'s · images '+(((_P.ms||0)/1000).toFixed(1))+'s · rendu segments '+(_tSeg/1000).toFixed(1)+'s'+_wm+' [moteur '+(window._srvVer||'?')+']');
+            return; }
+          mstat('❌ '+ferr); alert('La vidéo est assemblée sur le serveur mais le téléchargement a échoué ('+ferr+') :\n'+AI_BASE+jg.url); return;
+        }
+        try{ console.warn('SEGMENTS -> repli assemblage classique', rsg, jg&&jg.error); }catch(e){}
+        mstat('Rendu rapide indisponible -> assemblage classique…');
+      }
+    }catch(e){ try{ console.warn('SEGMENTS exception', e); }catch(_){} }
     // ── PASSE 2 : décodage NATIF des segments du match (serveur) ──
     const _t2=performance.now();
     if(segs.length){ mstat('Décodage natif du match (serveur)…');
@@ -12934,7 +12984,7 @@ async function exportMontageNative(){
     try{ window._perfP2=Math.round(performance.now()-_t2); }catch(e){}
     // ── PASSE 3 : application des dessins PAR-DESSUS les images de base (déduplication) ──
     const _t3=performance.now();
-    if(_ovlGroups.size){ const groups=[..._ovlGroups.values()].filter(g=>g&&g.blob&&g.idxs.length);
+    if(_ovlGroups.size && !_ovStored){ const groups=[..._ovlGroups.values()].filter(g=>g&&g.blob&&g.idxs.length);
       let nImg=0; groups.forEach(g=>nImg+=g.idxs.length);
       mstat('Application des dessins… ('+groups.length+' dessin(s) → '+nImg+' images)');
       const q=[]; let done=0;
@@ -13667,6 +13717,10 @@ async function finalizeLive(){
       let f=null, _vp='';
       try{ f=await liveSaveHandle.getFile(); if(f)project.videoSize=f.size; _vp=(f&&_filePath(f))||''; }catch(e){}
       if(!_vp){ try{ const rr=await dbGet('blobs',hid); const hh=rr&&rr.handle; if(hh){ const f2=await hh.getFile(); if(f2){ if(!project.videoSize)project.videoSize=f2.size; _vp=_filePath(f2)||''; } } }catch(e){} }
+      // s61 — FINALISATION INSTANTANÉE : si le chemin du fichier reste inconnu (fréquent sur disque externe), le moteur
+      // le RETROUVE par son nom + sa taille -> finalisation SUR PLACE en quelques secondes (au lieu de tout renvoyer
+      // au moteur, tout ré-encoder puis tout réécrire : plusieurs minutes pour un match).
+      if(!_vp && (f||project.videoSize)){ try{ liveStatus('Finalisation du fichier…'); const _fdl=new FormData(); _fdl.append('name',(liveSaveHandle&&liveSaveHandle.name)||(f&&f.name)||''); _fdl.append('size',String((f&&f.size)||project.videoSize||0)); _fdl.append('mime',String(liveMime||'')+(window._wcMode?' +webcodecs':'')); const _lr=await fetch(AI_BASE+'/locate_file',{method:'POST',body:_fdl}).then(x=>x.json()).catch(()=>null); if(_lr&&_lr.ok&&_lr.path)_vp=_lr.path; }catch(e){} }
       // PHASE C — MODÈLE LIVETAG (ZÉRO COPIE) : le fichier est déjà écrit sur le disque à l'emplacement choisi.
       // S'il a un chemin absolu, on le FINALISE SUR PLACE (remux, aucune 2e copie). Sinon on NE copie RIEN :
       // le fichier sera finalisé sur place dès que son chemin sera connu (au 1er montage/suivi, via register_local).

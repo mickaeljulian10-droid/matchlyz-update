@@ -45,7 +45,7 @@ WORK = _pick_work_dir()
 WORK.mkdir(parents=True, exist_ok=True)
 # Version du MOTEUR : renvoyée à la fin du rendu pour vérifier que le serveur qui tourne est bien à jour
 # (dessins en parallèle). Si le popup n'affiche PAS cette version, c'est qu'un ancien moteur est resté actif.
-SERVER_VERSION = "s60-rendu-anti-blocage"
+SERVER_VERSION = "s62-rendu-segments"
 _LAST_ENC = "?"   # dernier encodeur vidéo utilisé (h264_videotoolbox = GPU, libx264 = CPU)
 _LAST_WM = "?"    # dernier état filigrane : on=incrusté · none=aucun wm.png · fail=échec (vidéo d'origine gardée)
 _LAST_WMERR = ""  # dernière erreur ffmpeg du filigrane (diagnostic)
@@ -2826,6 +2826,214 @@ def _copy_to_mp4(src, out):
         pass
     return os.path.exists(out) and os.path.getsize(out) > 0 and _mp4_ok(out)
 
+def _frame_luma(path, t):
+    """Luminosité moyenne (0-255) d'une image à l'instant t (vignette 64x36 en gris). -1 si illisible."""
+    try:
+        r = subprocess.run([_ffexe(), "-v", "error", "-ss", "%.2f" % max(0.0, t), "-i", str(path), "-frames:v", "1",
+                            "-vf", "scale=64:36,format=gray", "-f", "rawvideo", "-"], capture_output=True, timeout=60)
+        b = r.stdout or b""
+        return (sum(b) / float(len(b))) if b else -1.0
+    except Exception:
+        return -1.0
+
+def _copy_valid(src, out, sd=None):
+    """s61b : une « remise en conteneur » n'est acceptée que si elle est VRAIMENT complète : lisible, même durée,
+    taille comparable à l'original (sinon la vidéo a été perdue -> écran noir, vu le 14/11 : 38 Mo -> 1 Mo),
+    et des images décodables au début, au milieu et à la fin, non noires là où l'original ne l'est pas."""
+    try:
+        if sd is None:
+            sd = _src_dur(str(src))
+        si = os.path.getsize(str(src)); so = os.path.getsize(str(out)) if os.path.exists(str(out)) else 0
+        if so < 0.6 * si:
+            print("contrôle copie : taille %.1f Mo pour %.1f Mo d'origine -> REFUSÉE" % (so / 1048576.0, si / 1048576.0), flush=True)
+            return False
+        if not (_mp4_ok(str(out)) and _out_ok(out, sd)):
+            print("contrôle copie : illisible ou durée incomplète -> REFUSÉE", flush=True)
+            return False
+        if sd and sd > 2:
+            for frac in (0.1, 0.5, 0.9):
+                b = _frame_luma(out, sd * frac)
+                if b < 0:
+                    print("contrôle copie : aucune image lisible à %d%% -> REFUSÉE" % int(frac * 100), flush=True)
+                    return False
+                if b < 6 and _frame_luma(src, sd * frac) > 20:
+                    print("contrôle copie : image NOIRE à %d%% -> REFUSÉE" % int(frac * 100), flush=True)
+                    return False
+        return True
+    except Exception as e:
+        print("contrôle copie : erreur %s -> REFUSÉE" % e, flush=True)
+        return False
+
+def _dbg_keep_raw(src):
+    """s61b (diagnostic) : garde une copie du direct BRUT quand la remise en conteneur échoue, pour comprendre
+    pourquoi (uniquement les petits fichiers de test, < 400 Mo)."""
+    try:
+        if os.path.getsize(str(src)) < 400 * 1048576:
+            dst = os.path.join(os.path.expanduser("~"), "Downloads", "_DEBUG-DIRECT-BRUT" + (os.path.splitext(str(src))[1] or ".mp4"))
+            shutil.copyfile(str(src), str(dst))
+            print("diagnostic : direct brut conservé -> %s" % dst, flush=True)
+    except Exception:
+        pass
+
+def _audio_codec(path):
+    try:
+        for ff in _ffmpeg_bins() + [_ffexe()]:
+            pr = (ff[:-6] + "ffprobe") if ff.endswith("ffmpeg") else None
+            if not pr or not os.path.exists(pr):
+                continue
+            o = subprocess.run([pr, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name",
+                                "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True, timeout=60).stdout.strip()
+            return o.lower()
+        o = subprocess.run([_ffexe(), "-hide_banner", "-i", str(path)], capture_output=True, text=True, timeout=60).stderr
+        m = re.search(r"Audio: (\w+)", o or "")
+        return (m.group(1).lower() if m else "")
+    except Exception:
+        return ""
+
+def _ts_remux(ff, src, out, timeout=7200, stall=120):
+    """s61b — REMISE EN CONTENEUR VIA MPEG-TS (comme le .mts de LiveTag), SANS ré-encoder l'image.
+    Pourquoi : le MP4 écrit par l'enregistreur de Chrome ne marque pas ses images clés ; une copie MP4->MP4
+    jette alors TOUTE la vidéo (test du 14/11 : 38 Mo -> 1 Mo, écran noir). En passant par un flux TS,
+    ffmpeg ré-analyse le H.264 et retrouve les images clés -> MP4 complet, seekable, horodatage intact.
+    Le son AAC est copié tel quel (le ré-encoder coûtait ~2 min sur un match de 2 h)."""
+    import tempfile, time as _tm
+    ac = _audio_codec(src)
+    ca = ["-c:a", "copy"] if ac == "aac" else ["-c:a", "aac", "-b:a", "160k"]
+    c1 = [ff, "-v", "error", "-y", "-fflags", "+genpts", "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?",
+          "-c", "copy", "-copyinkf", "-f", "mpegts", "pipe:1"]
+    c2 = [ff, "-v", "error", "-y", "-f", "mpegts", "-i", "pipe:0", "-map", "0:v:0", "-map", "0:a:0?",
+          "-c:v", "copy"] + ca + ["-movflags", "+faststart", "-f", "mp4", str(out)]
+    e1 = tempfile.TemporaryFile(); e2 = tempfile.TemporaryFile()
+    p1 = subprocess.Popen(c1, stdout=subprocess.PIPE, stderr=e1)
+    p2 = subprocess.Popen(c2, stdin=p1.stdout, stderr=e2)
+    try: p1.stdout.close()
+    except Exception: pass
+    t0 = _tm.time(); last = None; chg = t0; why = ""
+    while p2.poll() is None:
+        _tm.sleep(1)
+        try:
+            st = os.stat(str(out)); cur = (st.st_size, st.st_mtime)
+        except Exception:
+            cur = None
+        if cur != last:
+            last = cur; chg = _tm.time()
+        if _tm.time() - t0 > timeout or _tm.time() - chg > stall:
+            why = "BLOQUÉ" if _tm.time() - chg > stall else "trop long"
+            for p in (p1, p2):
+                try: p.kill()
+                except Exception: pass
+            break
+    try: p1.wait(timeout=30)
+    except Exception:
+        try: p1.kill()
+        except Exception: pass
+    try: p2.wait(timeout=30)
+    except Exception: pass
+    err = b""
+    for e in (e1, e2):
+        try: e.seek(0); err += e.read()[-3000:]
+        except Exception: pass
+    print("remux TS : audio=%s -> %s, %.1f s%s" % (ac or "?", "copie" if ac == "aac" else "AAC", _tm.time() - t0,
+          (" (" + why + ")") if why else ""), flush=True)
+    return (p2.returncode == 0 and not why), err
+
+def _fast_mp4(src, out):
+    """s61 — FINALISATION INSTANTANÉE DU DIRECT (principe LiveTag) : si la vidéo est DÉJÀ en H.264 (enregistrée
+    par l'encodeur matériel), on la remet seulement en conteneur MP4 propre (index + faststart) SANS ré-encoder
+    l'image : quelques secondes au lieu de plusieurs minutes. Le son est simplement converti en AAC (léger).
+    Garde-fous (l'ancienne « copie » avait donné une vidéo noire sur certains fichiers) : la sortie doit se lire,
+    avoir la MÊME durée que la source, et ne pas être noire là où la source ne l'est pas. Sinon -> False
+    (on retombe sur le ré-encodage complet, comme avant)."""
+    try:
+        info = _probe_vinfo(str(src)) or {}
+        vc = (info.get("codec_name") or "").lower()
+        if vc not in ("h264", "avc1"):
+            print("finalisation rapide : codec %s -> ré-encodage nécessaire" % (vc or "?"), flush=True)
+            return False
+        sd = _src_dur(str(src))
+        try:
+            if os.path.exists(out): os.remove(out)
+        except Exception:
+            pass
+        import time as _tm
+        t0 = _tm.time()
+        _ok, _err = False, b""
+        for ff in (_ffmpeg_bins() or [_ffexe()])[:2]:
+            try:
+                if os.path.exists(out): os.remove(out)
+            except Exception: pass
+            _rc, _err = _ts_remux(ff, src, out)
+            if _copy_valid(src, out, sd):
+                _ok = True; break
+        if not _ok:
+            try: print("finalisation rapide : ffmpeg -> " + (_err or b"").decode("utf-8", "ignore")[-700:].replace("\n", " | "), flush=True)
+            except Exception: pass
+            _dbg_keep_raw(src)
+            print("finalisation rapide : sortie invalide -> ré-encodage", flush=True)
+            return False
+        print("finalisation rapide : ✅ OK en %.1f s (sans ré-encodage)" % (_tm.time() - t0), flush=True)
+        return True
+    except Exception as e:
+        print("finalisation rapide : erreur %s -> ré-encodage" % e, flush=True)
+        return False
+
+_LOC_SKIP = {"Library", "node_modules", ".git", ".Trash", "System", "Applications", "private", "jobs", "_render",
+             "miniforge", "dist", "__pycache__"}
+
+def _locate_file(name, size, max_depth=6, budget=25.0):
+    """s61 : retrouve le fichier d'un direct par son NOM + sa TAILLE exacte (Bureau, Téléchargements, Vidéos,
+    Documents, dossier perso, disques externes). Sert quand l'app n'a pas pu lire le chemin du fichier choisi
+    -> on peut alors le finaliser SUR PLACE en quelques secondes au lieu de tout recopier + ré-encoder."""
+    import time as _tm
+    home = os.path.expanduser("~")
+    roots = []
+    try:   # s61b : le dossier du DERNIER direct retrouvé d'abord (instantané les fois suivantes)
+        _ld = (BASE / "jobs" / "_last_live_dir.txt").read_text(encoding="utf-8").strip()
+        if _ld and os.path.isfile(os.path.join(_ld, name)) and (int(size) <= 0 or os.path.getsize(os.path.join(_ld, name)) == int(size)):
+            return os.path.join(_ld, name)
+    except Exception:
+        pass
+    try:
+        roots += [os.path.join("/Volumes", v) for v in sorted(os.listdir("/Volumes"))]
+    except Exception:
+        pass
+    roots += [os.path.join(home, d) for d in ("Desktop", "Movies", "Documents", "Downloads")]
+    roots.append(home)
+    t0 = _tm.time(); seen = set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        base_depth = root.rstrip("/").count("/")
+        for dp, dns, fns in os.walk(root):
+            if _tm.time() - t0 > budget:
+                return None
+            if dp in seen:
+                dns[:] = []; continue
+            seen.add(dp)
+            if dp.count("/") - base_depth >= max_depth:
+                dns[:] = []
+            dns[:] = [d for d in dns if not d.startswith(".") and d not in _LOC_SKIP]
+            if name in fns:
+                fp = os.path.join(dp, name)
+                try:
+                    if int(size) <= 0 or os.path.getsize(fp) == int(size):
+                        return fp
+                except Exception:
+                    pass
+    return None
+
+@app.post("/locate_file")
+def locate_file(name: str = Form(...), size: int = Form(0), mime: str = Form("")):
+    import time as _tm
+    t0 = _tm.time()
+    p = _locate_file(os.path.basename(name or ""), size)
+    if p:
+        try: (BASE / "jobs" / "_last_live_dir.txt").write_text(os.path.dirname(p), encoding="utf-8")
+        except Exception: pass
+    print("locate_file : %s (%.0f Mo, enregistré en %s) -> %s en %.1f s" % (name, (size or 0) / 1048576.0, mime or "?",
+          p or "INTROUVABLE", _tm.time() - t0), flush=True)
+    return {"ok": bool(p), "path": p or ""}
+
 def _reencode_mp4(src, out):
     """Ré-encode le direct en MP4 H.264 SEEKABLE (durée + index + faststart), framerate CONSTANT 30.
     1) accélération matérielle Apple (videotoolbox) = rapide ; 2) repli logiciel libx264."""
@@ -2870,9 +3078,15 @@ async def rec_remux(file: UploadFile = File(...), rid: str = Form(...)):
     except Exception as e:
         return JSONResponse({"ok": False, "error": "upload: " + str(e)}, status_code=500)
     url = None
-    # MP4 H.264 FIABLE : ré-encodage (matériel videotoolbox, rapide) -> vidéo toujours lisible. La « copie
-    # instantanée » a été retirée du chemin : sur certains fichiers elle produisait une vidéo noire.
-    if await asyncio.to_thread(_reencode_mp4, src, outm):
+    try:
+        print("rec_remux : DÉBUT (%.0f Mo reçus)" % (os.path.getsize(src) / 1048576.0), flush=True)
+    except Exception:
+        pass
+    # s61 : d'abord la finalisation INSTANTANÉE si le direct est déjà en H.264 (contrôlée : durée + pas d'image
+    # noire) ; sinon ré-encodage complet (matériel videotoolbox) -> vidéo toujours lisible.
+    if await asyncio.to_thread(_fast_mp4, src, outm):
+        url = "/rec/" + safe + ".mp4"
+    elif await asyncio.to_thread(_reencode_mp4, src, outm):
         url = "/rec/" + safe + ".mp4"
     elif await asyncio.to_thread(_remux_copy, src, outw):
         url = "/rec/" + safe + ".webm"
@@ -2919,8 +3133,7 @@ def rec_remux_path(path: str = Form(...)):
             pass
         bins = _ffmpeg_bins()
         # 1) remux rapide SANS ré-encodage (copie des flux) : marche si déjà H.264/AAC (MP4 fragmenté).
-        copy_cmd = lambda ff: [ff, "-y", "-fflags", "+genpts", "-i", path, "-c", "copy",
-                               "-movflags", "+faststart", "-f", "mp4", tmp]
+        _sd0 = _src_dur(path)
         # 2) ré-encodage propre (VP8/VP9/WebM, ou flux non copiables) : H.264 + AAC, faststart.
         enc_variants = [
             ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-pix_fmt", "yuv420p"],
@@ -2928,16 +3141,25 @@ def rec_remux_path(path: str = Form(...)):
             ["-c:v", "mpeg4", "-q:v", "3"],
         ]
         ok = False; last = b""
-        for ff in bins:
-            try:
-                if os.path.exists(tmp): os.remove(tmp)
-            except Exception: pass
-            try:
-                r = subprocess.run(copy_cmd(ff), capture_output=True, timeout=3600); last = r.stderr or b""
-            except Exception as e:
-                last = str(e).encode(); continue
-            if os.path.exists(tmp) and os.path.getsize(tmp) > 0 and _mp4_ok(tmp):
-                ok = True; print("rec_remux_path : remux COPIE OK (%s)" % os.path.basename(ff), flush=True); break
+        import time as _tm
+        _t0 = _tm.time()
+        if str(_vc).lower() in ("h264", "avc1"):
+            for ff in bins[:2]:
+                try:
+                    if os.path.exists(tmp): os.remove(tmp)
+                except Exception: pass
+                try:
+                    _rc, last = _ts_remux(ff, path, tmp)
+                except Exception as e:
+                    last = str(e).encode(); continue
+                if os.path.exists(tmp) and os.path.getsize(tmp) > 0 and _copy_valid(path, tmp, _sd0):
+                    ok = True
+                    print("rec_remux_path : remux COPIE OK (%s, via TS) en %.1f s" % (os.path.basename(ff), _tm.time() - _t0), flush=True)
+                    break
+                try: print("rec_remux_path : copie refusée, ffmpeg -> " + (last or b"").decode("utf-8", "ignore")[-700:].replace("\n", " | "), flush=True)
+                except Exception: pass
+            if not ok:
+                _dbg_keep_raw(path)
         if not ok:
             print("rec_remux_path : copie impossible -> ré-encodage… (dernier msg: %s)" % (last[-200:] if last else b""), flush=True)
             for ff in bins:
@@ -4263,6 +4485,302 @@ def _apply_watermark(d, src, ext):
         globals()["_LAST_WM"] = "fail"
         globals()["_LAST_WMERR"] = str(e)[-300:]
         return src
+
+# ===================== s62 — RENDU PAR SEGMENTS PARALLÈLES (dessins compris) =====================
+# Avant (moteur standard) : chaque image du match était décodée en JPEG (21 000 fichiers / 5 Go pour 14 min),
+# puis relue + surcouches + encodage en UNE file, puis le logo dans une 2e passe complète -> 16 min d'assemblage.
+# Maintenant : le montage est découpé en PIÈCES (bout de match + ses dessins, arrêt sur image tenu, suite
+# d'images animées). Chaque pièce est encodée DIRECTEMENT depuis la vidéo source (décodage GPU), dessins ET logo
+# incrustés dans la même passe, plusieurs pièces EN PARALLÈLE ; puis collage instantané (copie) + son.
+_SEG_ENCODERS = [
+    ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-realtime", "1", "-pix_fmt", "yuv420p"],
+    ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-pix_fmt", "yuv420p"],
+    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"],
+]
+
+def _seg_wm(d):
+    wm = str(d / "wm.png")
+    if not os.path.exists(wm):
+        wm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watermark.png")
+    return wm if os.path.exists(wm) else None
+
+def _seg_plan(d, segs, nframes):
+    """Découpe 0..nframes-1 en pièces ordonnées. segs = bouts de match natifs (i0,count,ts0,dts,vk).
+    Le reste = images composées par l'app (f%06d.jpg) : suites de liens durs identiques = gel tenu."""
+    n = int(nframes)
+    cover = [None] * n
+    for s in segs:
+        i0 = int(s["i0"]); c = int(s["count"])
+        for i in range(max(0, i0), min(n, i0 + c)):
+            cover[i] = s
+    real_ov = set()
+    for i in range(n):
+        p = d / ("o%06d.png" % i)
+        if p.exists():
+            real_ov.add(i)
+    pieces = []; i = 0
+    while i < n:
+        s = cover[i]
+        if s is not None:
+            i0 = int(s["i0"]); j = i
+            while j < n and cover[j] is s:
+                j += 1
+            off = i - i0
+            dts = float(s.get("dts") or (1.0 / 24.0))
+            pieces.append({"t": "match", "i0": i, "n": j - i, "ts0": float(s["ts0"]) + off * dts, "dts": dts,
+                           "vk": str(s.get("vk") or ""), "ov": any((k in real_ov) for k in range(i, j))})
+            i = j
+        else:
+            j = i
+            while j < n and cover[j] is None:
+                j += 1
+            # continuité : une image manquante reprend la précédente (comme l'assembleur standard)
+            for k in range(i, j):
+                fp = d / ("f%06d.jpg" % k)
+                if not fp.exists():
+                    prev = d / ("f%06d.jpg" % (k - 1))
+                    if prev.exists():
+                        try: os.link(str(prev), str(fp))
+                        except Exception:
+                            try: shutil.copy(str(prev), str(fp))
+                            except Exception: pass
+            k = i
+            while k < j:
+                fk = d / ("f%06d.jpg" % k)
+                try: ino = os.stat(str(fk)).st_ino
+                except Exception: ino = None
+                m = k + 1
+                while m < j and ino is not None:
+                    try:
+                        if os.stat(str(d / ("f%06d.jpg" % m))).st_ino != ino: break
+                    except Exception: break
+                    m += 1
+                if m - k >= 3 and ino is not None:
+                    pieces.append({"t": "still", "i0": k, "n": m - k, "file": str(fk)}); k = m
+                else:
+                    # suite d'images différentes (gel animé) : on avance jusqu'au prochain gel tenu
+                    m2 = k + 1; run_ino = ino
+                    while m2 < j:
+                        try: ino2 = os.stat(str(d / ("f%06d.jpg" % m2))).st_ino
+                        except Exception: ino2 = None
+                        same = 1; q = m2 + 1
+                        while q < j and same < 3:
+                            try:
+                                if os.stat(str(d / ("f%06d.jpg" % q))).st_ino != ino2: break
+                            except Exception: break
+                            same += 1; q += 1
+                        if same >= 3: break
+                        m2 += 1
+                    pieces.append({"t": "seq", "i0": k, "n": m2 - k}); k = m2
+            i = j
+    return pieces, len(real_ov)
+
+def _seg_cmd(ff, pc, d, w, h, fps, vc, wm, hw, vkey):
+    out = str(d / ("q_%05d.mp4" % pc["k"]))
+    n = int(pc["n"])
+    fit = ("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+           % (w, h, w, h))
+    inputs = []; fc = []
+    if pc["t"] == "match":
+        src = _export_src((pc.get("vk") or "").strip() or vkey)
+        if not (src and os.path.exists(src)):
+            return None, out, "source absente"
+        ts0 = max(0.0, float(pc["ts0"])); dts = float(pc["dts"]) or (1.0 / fps)
+        pre = max(0.0, ts0 - 1.0); fine = ts0 - pre
+        span = n * dts + fine + 0.5
+        inputs += (["-hwaccel", "videotoolbox"] if hw else []) + ["-ss", "%.4f" % pre, "-t", "%.4f" % span, "-i", src]
+        sp = (1.0 / fps) / dts
+        fc.append("[0:v]trim=start=%.4f,setpts=(PTS-STARTPTS)*%.6f,fps=%d,%s,tpad=stop_mode=clone:stop_duration=3[b0]"
+                  % (fine, sp, fps, fit))
+        cur = "b0"; nin = 1
+        if pc.get("ov"):
+            inputs += ["-framerate", str(fps), "-start_number", str(int(pc["i0"])), "-i", str(d / "o%06d.png")]
+            fc.append("[%d:v]scale=%d:%d:flags=bilinear[o1];[%s][o1]overlay=format=auto:eof_action=pass[b1]" % (nin, w, h, cur))
+            cur = "b1"; nin += 1
+    elif pc["t"] == "still":
+        inputs += ["-loop", "1", "-framerate", str(fps), "-i", pc["file"]]
+        fc.append("[0:v]%s[b0]" % fit); cur = "b0"; nin = 1
+    else:
+        inputs += ["-framerate", str(fps), "-start_number", str(int(pc["i0"])), "-i", str(d / "f%06d.jpg")]
+        fc.append("[0:v]%s,tpad=stop_mode=clone:stop_duration=3[b0]" % fit); cur = "b0"; nin = 1
+    if wm:
+        th = max(48, int(h * 0.080))
+        inputs += ["-loop", "1", "-i", wm]
+        fc.append("[%d:v]scale=-1:%d,format=rgba,colorchannelmixer=aa=0.78[wm];[%s][wm]overlay=x=(W*0.022):y=(H-h-H*0.045)[bw]"
+                  % (nin, th, cur))
+        cur = "bw"
+    fc.append("[%s]format=yuv420p[v]" % cur)
+    cmd = [ff, "-nostdin", "-y"] + inputs + ["-filter_complex", ";".join(fc), "-map", "[v]"] + vc + \
+          ["-r", str(fps), "-frames:v", str(n), "-an", "-movflags", "+faststart", out]
+    return cmd, out, ""
+
+def _seg_piece_run(ff, pc, d, w, h, fps, vc, wm, vkey):
+    n = int(pc["n"]); exp = n / float(fps)
+    last = ""
+    for hw in ((True, False) if pc["t"] == "match" else (False,)):
+        cmd, out, err = _seg_cmd(ff, pc, d, w, h, fps, vc, wm, hw, vkey)
+        if not cmd:
+            return False, err
+        try:
+            if os.path.exists(out): os.remove(out)
+        except Exception: pass
+        r = _run_cancelable(cmd, timeout=1800, watch=out, stall=90)
+        if _STOP_ALL:
+            return False, "stop"
+        if os.path.exists(out) and os.path.getsize(out) > 500 and _out_ok(out, exp):
+            return True, ""
+        last = (r.stderr.decode("utf-8", "ignore")[-400:] if getattr(r, "stderr", None) else "?")
+    return False, last
+
+def _seg_proxy_pause(stop):
+    """Met en PAUSE le proxy d'aperçu (_seekI3, encodé en CPU) pendant le rendu, pour qu'il ne vole pas le
+    processeur ; il reprend juste après (rien n'est perdu)."""
+    try:
+        subprocess.run(["pkill", "-STOP" if stop else "-CONT", "-f", "_seekI3.mp4.part"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+def _render_segments(d, vkey, w, h, fps, ext, nframes, segs):
+    import time as _tm
+    from concurrent.futures import ThreadPoolExecutor
+    t0 = _tm.time()
+    ff = _ffexe()
+    pieces, nov = _seg_plan(d, segs, nframes)
+    if not pieces:
+        return None, "rien à rendre"
+    for k, pc in enumerate(pieces):
+        pc["k"] = k
+    if nov:
+        _overlay_seq_prepare(d, nframes)   # les images sans dessin d'un bout de match = PNG transparent (lien dur)
+    wm = _seg_wm(d)
+    nm = sum(1 for p in pieces if p["t"] == "match"); ns = sum(1 for p in pieces if p["t"] == "still")
+    nq = len(pieces) - nm - ns
+    print("rendu segments : %d pièces (match %d dont %d avec dessins, gels %d, suites %d), logo=%s" %
+          (len(pieces), nm, sum(1 for p in pieces if p.get("ov")), ns, nq, "oui" if wm else "non"), flush=True)
+    # encodeur : on le choisit sur la 1re pièce puis on le GARDE (pièces homogènes -> collage par copie)
+    # test de l'encodeur sur une PETITE pièce (rapide), puis tout le reste en parallèle (les plus longues d'abord)
+    _cands = [k for k in range(len(pieces)) if pieces[k]["n"] >= 12] or list(range(len(pieces)))
+    k1 = min(_cands, key=lambda k: pieces[k]["n"])
+    first = pieces[k1]
+    order = [k1] + sorted([k for k in range(len(pieces)) if k != k1], key=lambda k: -pieces[k]["n"])
+    vc = None; err = ""
+    for cand in _SEG_ENCODERS:
+        ok, err = _seg_piece_run(ff, first, d, w, h, fps, cand, wm, vkey)
+        if ok:
+            vc = cand; break
+        if _STOP_ALL:
+            return None, "stop"
+    if vc is None:
+        return None, "pièce 1 : " + (err or "?")
+    globals()["_LAST_ENC"] = vc[1] + ("+wm" if wm else "")
+    rest = [pieces[k] for k in order[1:]]
+    fails = []
+    def _job(pc):
+        if _STOP_ALL or fails:
+            return
+        ok, e = _seg_piece_run(ff, pc, d, w, h, fps, vc, wm, vkey)
+        if not ok:
+            fails.append("pièce %d (%s) : %s" % (pc["k"], pc["t"], e))
+    nw = 3 if vc[1] == "h264_videotoolbox" else max(2, min(4, (os.cpu_count() or 4) // 2))
+    with ThreadPoolExecutor(max_workers=nw) as ex:
+        list(ex.map(_job, rest))
+    if _STOP_ALL:
+        return None, "stop"
+    if fails:
+        return None, fails[0][-400:]
+    t1 = _tm.time()
+    lst = d / "segs.txt"
+    with open(lst, "w") as f:
+        for pc in pieces:
+            f.write("file '%s'\n" % os.path.abspath(str(d / ("q_%05d.mp4" % pc["k"]))).replace("'", "'\\''"))
+    out = d / ("seg_out." + ext)
+    dur = int(nframes) / float(fps)
+    audio = d / "audio.wav"
+    cmd = [ff, "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
+    if audio.exists():
+        cmd += ["-i", str(audio), "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-af", "apad", "-c:a", "aac", "-b:a", "192k"]
+    else:
+        cmd += ["-map", "0:v", "-c:v", "copy"]
+    cmd += ["-t", "%.3f" % dur, "-movflags", "+faststart", str(out)]
+    r = _run_cancelable(cmd, timeout=3600, watch=out, stall=90)
+    if not _out_ok(out, dur):
+        return None, "collage : " + ((r.stderr.decode("utf-8", "ignore")[-300:]) if getattr(r, "stderr", None) else "?")
+    globals()["_LAST_WM"] = "on" if wm else "none"; globals()["_LAST_WMERR"] = ""
+    print("rendu segments : ✅ pièces %.1f s + collage %.1f s = %.1f s (%d images)" %
+          (t1 - t0, _tm.time() - t1, _tm.time() - t0, int(nframes)), flush=True)
+    return out, ""
+
+@app.post("/render_seg_finish")
+async def render_seg_finish(sid: str = Form(...), vkey: str = Form(""), w: int = Form(...), h: int = Form(...),
+                            fps: int = Form(24), fmt: str = Form("mov"), nframes: int = Form(0), segs: str = Form("[]")):
+    """s62 — assemblage RAPIDE par segments parallèles (voir _render_segments). En cas d'échec, la session
+    est laissée intacte : l'app repart automatiquement sur l'ancien assemblage image par image."""
+    safe, d = _sid_dir(sid)
+    if not d or not d.exists():
+        return JSONResponse({"ok": False, "error": "session inconnue"}, status_code=400)
+    try:
+        segments = json.loads(segs or "[]")
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "segments: " + str(e)}, status_code=400)
+    ext = "mov" if (fmt or "mov") == "mov" else "mp4"
+    _seg_proxy_pause(True)
+    try:
+        out, err = await asyncio.to_thread(_render_segments, d, vkey, int(w), int(h), int(fps), ext, int(nframes), segments)
+    except Exception as e:
+        out, err = None, "exception : " + str(e)
+    finally:
+        _seg_proxy_pause(False)
+    if not out:
+        print("rendu segments : ÉCHEC -> repli assemblage classique (%s)" % err, flush=True)
+        return JSONResponse({"ok": False, "error": err or "échec"}, status_code=500)
+    dest = REC / (safe + "." + ext)
+    try:
+        shutil.move(str(out), str(dest))
+        shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        dest = out
+    return {"ok": True, "url": "/rec/" + dest.name, "sv": SERVER_VERSION, "mode": "segments",
+            "enc": globals().get("_LAST_ENC", "?"), "wm": globals().get("_LAST_WM", "?"),
+            "wmerr": globals().get("_LAST_WMERR", "")}
+
+@app.post("/render_frame_multi")
+async def render_frame_multi(sid: str = Form(...), idxs: str = Form(...), file: UploadFile = File(...)):
+    """s62 — une image composée IDENTIQUE pour plusieurs positions (arrêt sur image, fond, texte figé) :
+    envoyée UNE fois, puis liée en dur -> plus de milliers d'envois identiques, et le rendu par segments
+    la reconnaît comme un gel tenu (encodé quasi gratuitement)."""
+    safe, d = _sid_dir(sid)
+    if not d or not d.exists():
+        return JSONResponse({"ok": False, "error": "session inconnue"}, status_code=400)
+    try:
+        ids = [int(x) for x in json.loads(idxs or "[]")]
+        data = await file.read()
+        first = None
+        for i in ids:
+            p = d / ("f%06d.jpg" % i)
+            try:
+                if p.exists(): p.unlink()
+            except Exception:
+                pass
+            if first is None:
+                with open(p, "wb") as f:
+                    f.write(data)
+                first = p
+            else:
+                try:
+                    os.link(str(first), str(p))
+                except Exception:
+                    with open(p, "wb") as f:
+                        f.write(data)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    return {"ok": True, "n": len(ids)}
+
+# si le moteur a été relancé pendant un rendu, le proxy d'aperçu ne doit pas rester en pause
+try:
+    _seg_proxy_pause(False)
+except Exception:
+    pass
+
 
 @app.post("/render_finish")
 async def render_finish(sid: str = Form(...), fps: int = Form(24), fmt: str = Form("mov"), nframes: int = Form(0)):
