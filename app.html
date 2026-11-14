@@ -11097,7 +11097,7 @@ let _mAssetsBuild=null; let mAssets=null, mAssetsDirty=true, mPlaying=false, mSt
 const mstat=s=>{ try{ const el=$('mstatus'); if(el)el.textContent=s; }catch(e){} try{ renderProgUpdate(s); }catch(e){} };
 // Barre de progression FLOTTANTE, visible sur N'IMPORTE QUEL écran pendant un rendu (avant, le rendu d'un clip
 // depuis l'onglet Tag n'affichait rien car la progression allait dans la barre du Montage, invisible ici).
-function renderProgUpdate(s){ const montVis=(()=>{ try{ const m=document.getElementById('montage'); return m&&!m.classList.contains('hidden'); }catch(e){ return false; } })();
+function renderProgUpdate(s){ if(window._gpOn){ renderProgHide(); return; } const montVis=(()=>{ try{ const m=document.getElementById('montage'); return m&&!m.classList.contains('hidden'); }catch(e){ return false; } })();
   if(!window._srvBusy || montVis){ renderProgHide(); return; }   // dans le Montage, la barre du montage suffit
   let box=document.getElementById('renderProg');
   if(!box){ box=document.createElement('div'); box.id='renderProg'; box.style.cssText='position:fixed;left:50%;top:20px;transform:translateX(-50%);z-index:100001;background:#12181c;border:1px solid #2b3640;border-radius:12px;padding:14px 18px;min-width:340px;max-width:90vw;box-shadow:0 16px 44px rgba(0,0,0,.6);font-family:Montserrat,Arial,sans-serif';
@@ -11107,6 +11107,30 @@ function renderProgUpdate(s){ const montVis=(()=>{ try{ const m=document.getElem
   if(msg)msg.textContent=s; if(pct!=null){ if(bar)bar.style.width=pct+'%'; if(pc)pc.textContent=pct+'%'; } else if(pc)pc.textContent='…';
 }
 function renderProgHide(){ const b=document.getElementById('renderProg'); if(b)b.remove(); }
+// s64 — BARRE DE PROGRESSION 0 → 100 % de la génération du montage, toujours visible, avec bouton « Arrêter ».
+const _gp={on:false,t0:0,pct:0,doneFlag:false,_iv:null,_cv:null,
+  el(){ let b=document.getElementById('genProg'); if(!b){ b=document.createElement('div'); b.id='genProg';
+    b.style.cssText='position:fixed;left:50%;top:18px;transform:translateX(-50%);z-index:100002;background:#12181c;border:1px solid #2b3640;border-radius:14px;padding:16px 20px 14px;width:min(470px,92vw);box-shadow:0 18px 48px rgba(0,0,0,.65);font-family:Montserrat,Arial,sans-serif';
+    b.innerHTML='<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><b style="color:var(--accent);font-size:15px">🎬 Génération de la vidéo</b><span style="flex:1"></span><span id="gpPct" style="color:#fff;font-size:22px;font-weight:800">0 %</span></div>'
+      +'<div style="height:14px;background:#0a0f13;border-radius:7px;overflow:hidden;border:1px solid #1f2a31"><div id="gpBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .35s ease"></div></div>'
+      +'<div id="gpMsg" style="color:#cfe0e8;font-size:12px;margin-top:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Préparation…</div>'
+      +'<div style="display:flex;align-items:center;gap:10px;margin-top:11px"><span id="gpTime" style="color:#8fa3ad;font-size:11px"></span><span style="flex:1"></span><button id="gpStop" style="background:#e5484d;color:#fff;border:0;border-radius:9px;padding:8px 14px;font-weight:700;font-size:12px;cursor:pointer">⏹ Arrêter la génération</button></div>';
+    document.body.appendChild(b);
+    b.querySelector('#gpStop').onclick=()=>{ const bt=b.querySelector('#gpStop'); bt.disabled=true; bt.textContent='Arrêt en cours…'; bt.style.opacity='.6'; try{ b.querySelector('#gpMsg').textContent='Arrêt de la génération…'; }catch(e){} try{ _srvCancelNow(); }catch(e){} }; }
+    return b; },
+  start(){ this.on=true; window._gpOn=true; this.t0=performance.now(); this.pct=0; this.doneFlag=false; try{ renderProgHide(); }catch(e){}
+    const b=this.el(); const bt=b.querySelector('#gpStop'); bt.disabled=false; bt.textContent='⏹ Arrêter la génération'; bt.style.opacity='1'; bt.style.display='';
+    this.set(0,'Préparation…'); clearInterval(this._iv); this._iv=setInterval(()=>this._time(),1000); },
+  set(p,msg){ if(!this.on)return; p=Math.max(this.pct,Math.min(100,+p||0)); this.pct=p; const b=this.el();
+    b.querySelector('#gpBar').style.width=p.toFixed(1)+'%'; b.querySelector('#gpPct').textContent=Math.floor(p)+' %'; if(msg!=null)b.querySelector('#gpMsg').textContent=msg; this._time(); },
+  creep(a,z,msg){ this.set(a,msg); clearInterval(this._cv); const t0=performance.now(); this._cv=setInterval(()=>{ const sec=(performance.now()-t0)/1000; this.set(a+(z-a)*(1-Math.exp(-sec/90))); },1000); },
+  stopCreep(){ clearInterval(this._cv); },
+  _time(){ if(!this.on)return; const b=document.getElementById('genProg'); if(!b)return; const el=(performance.now()-this.t0)/1000;
+    const f=x=>{ x=Math.max(0,Math.round(x)); return Math.floor(x/60)+':'+String(x%60).padStart(2,'0'); };
+    let t='Écoulé '+f(el); if(this.pct>=8 && this.pct<100 && el>10){ t+=' · reste ≈ '+f(el*(100-this.pct)/this.pct); } b.querySelector('#gpTime').textContent=t; },
+  done(msg){ if(!this.on)return; this.stopCreep(); this.set(100,msg||'✅ Vidéo prête'); this.doneFlag=true; const b=this.el(); b.querySelector('#gpStop').style.display='none'; clearInterval(this._iv); this._time(); setTimeout(()=>this.end(true),4000); },
+  end(force){ if(this.doneFlag && !force)return; this.on=false; window._gpOn=false; clearInterval(this._iv); clearInterval(this._cv); const b=document.getElementById('genProg'); if(b)b.remove(); }
+};
 // Carte de RÉSULTAT flottante (aperçu du clip rendu) — visible partout, pas seulement dans le Montage.
 function showRenderResult(url,fname,ext,saved,blob){ document.querySelectorAll('#renderRes').forEach(x=>x.remove());
   // APERÇU PAR CANVAS : dans Electron, un <video> dans une fenêtre peut s'afficher NOIR (la vidéo part sur une
@@ -12750,7 +12774,7 @@ async function exportMontageTurbo(sid,clips,total,nFrames,FPS,RW,RH,vkey,mediaVk
     try{ const fd=new FormData(); fd.append('sid',sid); fd.append('img',r.img); fd.append('file',jpg,'s.jpg');
       const rr=await fetch(AI_BASE+'/render_still',{method:'POST',body:fd}); const jj=await rr.json().catch(()=>null);
       if(!(jj&&jj.ok))return false; }catch(e){ return false; }
-    if((++nStill)%3===0)mstat('⚡ Préparation turbo des arrêts sur image '+nStill+'…');
+    if((++nStill)%3===0){ mstat('⚡ Préparation turbo des arrêts sur image '+nStill+'…'); try{ _gp.set(6,'Préparation des arrêts sur image ('+nStill+')…'); }catch(e){} }
   }
   // Construit chaque pièce SÉPARÉMENT (une requête par segment) : progression visible + Stop possible +
   // délai de sécurité côté serveur -> si une pièce coince, on échoue vite et on repart sur l'ancien moteur.
@@ -12759,11 +12783,11 @@ async function exportMontageTurbo(sid,clips,total,nFrames,FPS,RW,RH,vkey,mediaVk
     const fd=new FormData(); fd.append('sid',sid); fd.append('k',String(k)); fd.append('run',JSON.stringify(rr)); fd.append('vkey',vkey||''); fd.append('w',String(RW)); fd.append('h',String(RH)); fd.append('fps',String(FPS));
     const resp=await fetch(AI_BASE+'/render_turbo_piece',{method:'POST',body:fd}); const j=await resp.json().catch(()=>null); return !!(j&&j.ok); };
   let ki=0, ndone=0, failed=false;
-  const worker=async()=>{ while(ki<runs.length && !failed){ if(window._srvStop||mStop){ failed=true; break; } const k=ki++; let ok=false; try{ ok=await buildOne(k); }catch(e){ ok=false; } if(!ok){ failed=true; break; } ndone++; if(ndone%2===0||ndone===runs.length)mstat('⚡ Turbo — segment '+ndone+'/'+runs.length+'…'); } };
+  const worker=async()=>{ while(ki<runs.length && !failed){ if(window._srvStop||mStop){ failed=true; break; } const k=ki++; let ok=false; try{ ok=await buildOne(k); }catch(e){ ok=false; } if(!ok){ failed=true; break; } ndone++; try{ _gp.set(10+85*ndone/runs.length,'Rendu de la vidéo — morceau '+ndone+'/'+runs.length); }catch(e){} if(ndone%2===0||ndone===runs.length)mstat('⚡ Turbo — segment '+ndone+'/'+runs.length+'…'); } };
   const workers=[]; for(let w2=0; w2<Math.min(4,runs.length); w2++)workers.push(worker());
   await Promise.all(workers);
   if(failed||window._srvStop||mStop) return false;   // Stop => l'appelant affiche « Rendu arrêté » ; échec => repli moteur standard
-  mstat('⚡ Collage final turbo…');
+  mstat('⚡ Collage final turbo…'); try{ _gp.set(96,'Assemblage final…'); }catch(e){}
   let url=null;
   try{ const fd=new FormData(); fd.append('sid',sid); fd.append('fps',String(FPS)); fd.append('fmt',outExt); fd.append('nframes',String(nFrames));
     const r=await fetch(AI_BASE+'/render_turbo_finish',{method:'POST',body:fd}); const j=await r.json().catch(()=>null);
@@ -12775,6 +12799,7 @@ async function exportMontageTurbo(sid,clips,total,nFrames,FPS,RW,RH,vkey,mediaVk
   if(!blob||!blob.size)return false;
   offerDownload(blob,outExt);
   const dt=((performance.now()-(window._turboT0||performance.now()))/1000).toFixed(1);
+  try{ _gp.done('✅ Vidéo prête — générée en '+dt+' s'); }catch(e){}
   const _wm=(window._wmUsed==='on')?' · logo ✓':(window._wmUsed==='fail'?(' · logo ✗ : '+((window._wmErr||'')||'voir moteur')):(window._wmUsed==='none'?' · logo ✗ (non reçu)':''));
   mstat('✅ Vidéo générée ('+outExt.toUpperCase()+') en '+dt+' s — fichier prêt.'+_wm+' [moteur '+(window._srvVer||'?')+']');
   return true;
@@ -12804,8 +12829,9 @@ async function exportMontageNative(){
   const fmtSel=$('mFormat').value; const outExt=(fmtSel==='mov')?'mov':(fmtSel==='webm'?'webm':'mp4'); const FPS=24;
   window._srvBusy=true; window._srvStop=false; mStop=false; montageMode=true; engineClips=clips; renderState={key:null}; $('mGen').textContent='⏹ Stop';
   const t0perf=performance.now();
+  try{ _gp.start(); }catch(e){}
   try{
-    mstat('Préparation…'); try{ await refreshClipDurations(clips); }catch(e){}
+    mstat('Préparation…'); try{ _gp.set(1,'Préparation du montage…'); }catch(e){} try{ await refreshClipDurations(clips); }catch(e){}
     mAssetsDirty=true; setRenderDims();
     try{ mAssets=await prepareAssets(clips); mAssetsDirty=false; }catch(e){}
     let total=0; clips.forEach(c=>total=Math.max(total,c.start+c.dur)); if(total<=0.01){ mstat('Rien à rendre.'); return; }
@@ -12814,7 +12840,7 @@ async function exportMontageNative(){
     if(!sid){ alert('Moteur local injoignable. Lance le serveur (DEMARRER.command) puis réessaie.'); return; }
     window._curRenderSid=sid;   // mémorisé pour que « Stop » puisse annuler ce rendu côté moteur
     // Le filigrane (bandeau MatchLyz) est incrusté par le MOTEUR à l'assemblage final (turbo + standard).
-    mstat('Rendu de l\'audio…'); const _ta=performance.now(); try{ const wav=await _renderAudioWav(clips,total); window._perfAudio=Math.round(performance.now()-_ta); if(wav){ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); } }catch(e){ window._perfAudio=Math.round(performance.now()-_ta); }
+    try{ _gp.set(2,'Préparation du son…'); }catch(e){} mstat('Rendu de l\'audio…'); const _ta=performance.now(); try{ const wav=await _renderAudioWav(clips,total); window._perfAudio=Math.round(performance.now()-_ta); if(wav){ const fd=new FormData(); fd.append('sid',sid); fd.append('file',wav,'audio.wav'); await fetch(AI_BASE+'/render_audio',{method:'POST',body:fd}); } }catch(e){ window._perfAudio=Math.round(performance.now()-_ta); }
     const hasText=clips.some(c=>c.kind==='text');
     // s62 : la surcouche « texte » n'est calculée QUE quand un texte est affiché à cet instant (avant : sur
     // TOUTES les images du match dès qu'il existait un texte quelque part -> milliers de calculs inutiles).
@@ -12846,7 +12872,7 @@ async function exportMontageNative(){
         else if((c.kind==='analytic'||c.kind==='raw') && c.mediaId) uniq[c.mediaId]=true; });   // clip importé passé en analytique : sa vidéo aussi
       const ids=Object.keys(uniq);
       for(let k=0;k<ids.length && !(window._srvStop||mStop);k++){
-        mstat('Préparation des vidéos importées '+(k+1)+'/'+ids.length+'… (une seule fois)');
+        mstat('Préparation des vidéos importées '+(k+1)+'/'+ids.length+'… (une seule fois)'); try{ _gp.set(3,'Préparation des vidéos ('+(k+1)+'/'+ids.length+')…'); }catch(e){}
         window._upProg=p=>{ try{ mstat('📤 Envoi vidéo importée '+(k+1)+'/'+ids.length+' au moteur… '+Math.round(p*100)+'%'); }catch(e){} };
         try{ const vk=await ensureMediaUploaded(ids[k]); if(vk) mediaVk[ids[k]]=vk; }catch(e){}
         window._upProg=null;
@@ -12926,7 +12952,7 @@ async function exportMontageNative(){
         else { try{ await drawStaticAt(t); }catch(e){} jpg=await new Promise(res=>{ try{ $('mcv').toBlob(res,'image/jpeg',0.92); }catch(e){ res(null); } }); if(fbKey){ _lastFbKey=fbKey; _lastFbJpg=jpg; } else { _lastFbKey=null; _lastFbJpg=null; } }
         if(jpg&&jpg.size){ if(_fbPend && _fbPend.jpg===jpg){ _fbPend.idxs.push(i); } else { await _fbFlush(); _fbPend={jpg:jpg,idxs:[i]}; } }
       }
-      if(i%24===0){ mstat('Analyse du montage '+Math.round(i/nFrames*100)+'% ('+i+'/'+nFrames+')…'); mPlayT=t; try{drawMPh();}catch(e){} }
+      if(i%24===0){ mstat('Analyse du montage '+Math.round(i/nFrames*100)+'% ('+i+'/'+nFrames+')…'); try{ _gp.set(4+20*i/nFrames,'Analyse du montage et des dessins… '+Math.round(i/nFrames*100)+' %'); }catch(e){} mPlayT=t; try{drawMPh();}catch(e){} }
     }
     try{ await _fbFlush(); }catch(e){}
     try{ await Promise.all(_upQ); }catch(e){}
@@ -12941,7 +12967,7 @@ async function exportMontageNative(){
     try{
       const _ts=performance.now(); let stOk=true;
       if(_ovlGroups.size){ const groups=[..._ovlGroups.values()].filter(g=>g&&g.blob&&g.idxs.length); const q=[];
-        mstat('Préparation des dessins… ('+groups.length+')');
+        mstat('Préparation des dessins… ('+groups.length+')'); try{ _gp.set(24,'Préparation des dessins…'); }catch(e){}
         for(const g of groups){ if(window._srvStop||mStop){ stOk=false; break; }
           const p=(async()=>{ try{ const fdS=new FormData(); fdS.append('sid',sid); fdS.append('idxs',JSON.stringify(g.idxs)); fdS.append('file',g.blob,'o.png'); const r=await fetch(AI_BASE+'/render_overlay_store',{method:'POST',body:fdS}); const jj=await r.json().catch(()=>null); if(!(jj&&jj.ok))stOk=false; }catch(e){ stOk=false; } })();
           q.push(p); if(q.length>=16)await q.shift(); }
@@ -12951,18 +12977,22 @@ async function exportMontageNative(){
         mstat('⚡ Rendu rapide par segments…');
         const payloadS=segs.map(s=>({i0:s.i0,count:s.count,ts0:s.ts0,dts:s.dts,vk:(s.vk||'')}));
         const fdG=new FormData(); fdG.append('sid',sid); fdG.append('vkey',vkey||''); fdG.append('w',String(RW)); fdG.append('h',String(RH)); fdG.append('fps',String(FPS)); fdG.append('fmt',outExt); fdG.append('nframes',String(nFrames)); fdG.append('segs',JSON.stringify(payloadS));
-        const _tick=setInterval(()=>{ try{ mstat('⚡ Rendu rapide par segments… '+Math.round((performance.now()-_ts)/1000)+' s'); }catch(e){} },1000);
+        try{ _gp.set(26,'Rendu de la vidéo…'); }catch(e){}
+        const _tick=setInterval(async()=>{ try{ mstat('⚡ Rendu rapide par segments… '+Math.round((performance.now()-_ts)/1000)+' s');
+            const fp=new FormData(); fp.append('sid',sid); const pr=await fetch(AI_BASE+'/render_progress',{method:'POST',body:fp}).then(x=>x.json()).catch(()=>null);
+            if(pr&&pr.ok){ if(pr.phase==='collage') _gp.set(96,'Assemblage final et son…'); else if(pr.phase==='pieces') _gp.set(26+70*(pr.frac||0),'Rendu de la vidéo… '+Math.round((pr.frac||0)*100)+' %'+(pr.n?(' ('+(pr.pieces||0)+'/'+pr.n+' morceaux)'):'')); } }catch(e){} },700);
         let jg=null, rsg=0;
         try{ const r=await fetch(AI_BASE+'/render_seg_finish',{method:'POST',body:fdG}); rsg=r.status; jg=await r.json().catch(()=>null); }catch(e){} finally{ clearInterval(_tick); }
         if(window._srvStop||mStop){ mstat('Rendu arrêté.'); return; }
         if(jg&&jg.ok&&jg.url){
           window._srvVer=jg.sv||null; window._encUsed=jg.enc||null; window._wmUsed=jg.wm||null; window._wmErr=jg.wmerr||null;
-          const _tSeg=performance.now()-_ts; let blob=null, ferr='';
+          const _tSeg=performance.now()-_ts; let blob=null, ferr=''; try{ _gp.set(98,'Récupération du fichier…'); }catch(e){}
           for(let a=0;a<4 && !blob;a++){ try{ const vb=await fetch(AI_BASE+jg.url,{cache:'no-store'}); if(vb.ok)blob=await vb.blob(); else ferr='http '+vb.status; }catch(e){ ferr=(e&&e.message)||String(e); } if(!blob){ mstat('Récupération du fichier… (essai '+(a+1)+'/4)'); await new Promise(r=>setTimeout(r,1000)); } }
           if(blob&&blob.size){ offerDownload(blob,outExt);
             const dt=((performance.now()-t0perf)/1000).toFixed(1); const _P=window._perfP1||{};
             const _wm=(window._wmUsed==='on')?' · logo ✓':(window._wmUsed==='none'?' · logo ✗':'');
             mstat('✅ Généré en '+dt+' s — AUDIO '+(((window._perfAudio||0)/1000).toFixed(1))+'s · images '+(((_P.ms||0)/1000).toFixed(1))+'s · rendu segments '+(_tSeg/1000).toFixed(1)+'s'+_wm+' [moteur '+(window._srvVer||'?')+']');
+            try{ _gp.done('✅ Vidéo prête — générée en '+dt+' s'); }catch(e){}
             return; }
           mstat('❌ '+ferr); alert('La vidéo est assemblée sur le serveur mais le téléchargement a échoué ('+ferr+') :\n'+AI_BASE+jg.url); return;
         }
@@ -12972,7 +13002,7 @@ async function exportMontageNative(){
     }catch(e){ try{ console.warn('SEGMENTS exception', e); }catch(_){} }
     // ── PASSE 2 : décodage NATIF des segments du match (serveur) ──
     const _t2=performance.now();
-    if(segs.length){ mstat('Décodage natif du match (serveur)…');
+    if(segs.length){ mstat('Décodage natif du match (serveur)…'); try{ _gp.creep(26,55,'Décodage du match…'); }catch(e){}
       const payload=segs.map(s=>({i0:s.i0,count:s.count,ts0:s.ts0,dts:s.dts,vk:(s.vk||'')}));
       const fd=new FormData(); fd.append('sid',sid); fd.append('vkey',vkey||''); fd.append('w',String(RW)); fd.append('h',String(RH)); fd.append('segs',JSON.stringify(payload));
       let mmOk=false, mmErr='';
@@ -12981,7 +13011,7 @@ async function exportMontageNative(){
       if(!mmOk){ mstat('❌ Décodage natif échoué : '+mmErr); alert('Le décodage natif du match a échoué :\n\n'+mmErr+'\n\nAstuce : la 1re fois, le serveur crée une version optimisée de la vidéo (quelques minutes). Attends que ce soit fini, puis relance « Générer ».'); return; }
       try{ console.warn('PERF export render_match ok='+mmOk+' diag='+JSON.stringify(window._mmDiag||{})); }catch(e){}
     }
-    try{ window._perfP2=Math.round(performance.now()-_t2); }catch(e){}
+    try{ window._perfP2=Math.round(performance.now()-_t2); }catch(e){} try{ _gp.stopCreep(); _gp.set(56,'Application des dessins…'); }catch(e){}
     // ── PASSE 3 : application des dessins PAR-DESSUS les images de base (déduplication) ──
     const _t3=performance.now();
     if(_ovlGroups.size && !_ovStored){ const groups=[..._ovlGroups.values()].filter(g=>g&&g.blob&&g.idxs.length);
@@ -13027,12 +13057,12 @@ async function exportMontageNative(){
     }catch(e){}
     // ── PASSE 4 : assemblage ffmpeg ──
     const _t4=performance.now();
-    mstat('Assemblage final (ffmpeg)…'); let url=null,err='';
+    mstat('Assemblage final (ffmpeg)…'); let url=null,err=''; try{ _gp.creep(58,97,'Assemblage final…'); }catch(e){}
     try{ const fd=new FormData(); fd.append('sid',sid); fd.append('fps',String(FPS)); fd.append('fmt',outExt); fd.append('nframes',String(nFrames)); const r=await fetch(AI_BASE+'/render_finish',{method:'POST',body:fd}); const j=await r.json(); if(j&&j.ok&&j.url){ url=j.url; window._srvVer=j.sv||null; window._encUsed=j.enc||null; window._wmUsed=j.wm||null; window._wmErr=j.wmerr||null; } else err=(j&&j.error)||('http '+r.status); }catch(e){ err=(e&&e.message)||String(e); }
-    try{ window._perfP4=Math.round(performance.now()-_t4); }catch(e){}
+    try{ window._perfP4=Math.round(performance.now()-_t4); }catch(e){} try{ _gp.stopCreep(); _gp.set(98,'Récupération du fichier…'); }catch(e){}
     if(url){ let blob=null,ferr='';
       for(let a=0;a<4 && !blob;a++){ try{ const vb=await fetch(AI_BASE+url,{cache:'no-store'}); if(vb.ok)blob=await vb.blob(); else ferr='http '+vb.status; }catch(e){ ferr=(e&&e.message)||String(e); } if(!blob){ mstat('Récupération du fichier… (essai '+(a+1)+'/4)'); await new Promise(r=>setTimeout(r,1000)); } }
-      if(blob&&blob.size){ offerDownload(blob,outExt); const dt=((performance.now()-t0perf)/1000).toFixed(1);
+      if(blob&&blob.size){ offerDownload(blob,outExt); const dt=((performance.now()-t0perf)/1000).toFixed(1); try{ _gp.done('✅ Vidéo prête — générée en '+dt+' s'); }catch(e){}
         let diag=''; try{ const D=window._mmDiag; if(D){ if(D.shorts&&D.shorts.length)diag=' ⚠ '+D.shorts.length+' segment(s) incomplets (ex. img '+D.shorts[0].i0+' @t='+D.shorts[0].ts0+'s : '+D.shorts[0].got+'/'+D.shorts[0].count+' · source '+(D.dur||'?')+'s) — recopie-moi ce message'; else diag=' · match '+(D.made||0)+'/'+(D.want||0)+' img (source '+(D.dur||'?')+'s)'; } }catch(e){}
         const _wm2=(window._wmUsed==='on')?' · logo ✓':(window._wmUsed==='fail'?(' · logo ✗ : '+((window._wmErr||'')||'voir moteur')):(window._wmUsed==='none'?' · logo ✗ (non reçu)':''));
         mstat('✅ '+outExt.toUpperCase()+' — moteur serveur : '+nFrames+' images en '+dt+' s.'+_wm2+' [moteur '+(window._srvVer||'?')+']'+diag);
@@ -13057,9 +13087,10 @@ async function exportMontageNative(){
             +'👉 Recopie‑moi TOUT ça : je saurai exactement quoi corriger.'); try{ console.log(_diag); }catch(e){}
           try{ const _P=window._perfP1||{}; mstat('✅ Généré en '+dt+' s — AUDIO '+(((window._perfAudio||0)/1000).toFixed(1))+'s · images '+(((_P.ms||0)/1000).toFixed(1))+'s · décodage '+(((window._perfP2||0)/1000).toFixed(1))+'s · assemblage '+(((window._perfP4||0)/1000).toFixed(1))+'s'); }catch(e){ try{ mstat('✅ Vidéo générée en '+dt+' s — fichier prêt.'); }catch(_){} } }catch(e){} }
       else { mstat('❌ '+ferr); alert('La vidéo est assemblée sur le serveur mais le téléchargement a échoué ('+ferr+') :\n'+AI_BASE+url); } }
+    else if(window._srvStop||mStop){ mstat('Rendu arrêté.'); }
     else { mstat('❌ Assemblage échoué : '+err); alert('L\'assemblage a échoué côté serveur :\n'+err); }
   }catch(e){ mstat('❌ Erreur moteur serveur : '+((e&&e.message)||e)); alert('Erreur du moteur serveur : '+((e&&e.message)||e)+'\n\nTu peux réessayer.'); }
-  finally { try{ vid.pause(); vid.playbackRate=1; }catch(e){} window._srvBusy=false; window._srvStop=false; montageMode=false; engineClips=null; mAssetsDirty=true; $('mGen').textContent='🎬 Générer la vidéo'; }
+  finally { try{ vid.pause(); vid.playbackRate=1; }catch(e){} try{ _gp.end(); }catch(e){} window._srvBusy=false; window._srvStop=false; montageMode=false; engineClips=null; mAssetsDirty=true; $('mGen').textContent='🎬 Générer la vidéo'; }
 }
 // Coupe IMMÉDIATEMENT le son du montage (sources Web Audio programmées) — utilisé quand on quitte la lecture
 // ou qu'on ouvre le Suivi IA, sinon les voix/sons déjà lancés continuent jusqu'à leur fin.

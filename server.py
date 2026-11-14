@@ -45,7 +45,7 @@ WORK = _pick_work_dir()
 WORK.mkdir(parents=True, exist_ok=True)
 # Version du MOTEUR : renvoyée à la fin du rendu pour vérifier que le serveur qui tourne est bien à jour
 # (dessins en parallèle). Si le popup n'affiche PAS cette version, c'est qu'un ancien moteur est resté actif.
-SERVER_VERSION = "s62-rendu-segments"
+SERVER_VERSION = "s64-rendu-progression"
 _LAST_ENC = "?"   # dernier encodeur vidéo utilisé (h264_videotoolbox = GPU, libx264 = CPU)
 _LAST_WM = "?"    # dernier état filigrane : on=incrusté · none=aucun wm.png · fail=échec (vidéo d'origine gardée)
 _LAST_WMERR = ""  # dernière erreur ffmpeg du filigrane (diagnostic)
@@ -4575,6 +4575,64 @@ def _seg_plan(d, segs, nframes):
             i = j
     return pieces, len(real_ov)
 
+_SEG_STATE = {"gpu_bad": False, "hw_bad": False}
+_SEG_PROG = {}   # s64 : progression du rendu par segments (par dossier de session) -> barre 0-100 % dans l'app
+
+def _seg_ov_list(d, i0, n, fps, k):
+    """s64 : liste ffconcat des surcouches d'un bout de match, où les images IDENTIQUES consécutives (même
+    dessin figé, ou aucun dessin) ne forment qu'UNE entrée avec sa durée -> chaque dessin distinct n'est
+    décodé et agrandi qu'une fois (avant : 1 PNG décodé + agrandi pour CHAQUE image)."""
+    ents = []; i = i0; end = i0 + n
+    while i < end:
+        try: ino = os.stat(str(d / ("o%06d.png" % i))).st_ino
+        except Exception: ino = None
+        j = i + 1
+        while j < end and ino is not None:
+            try:
+                if os.stat(str(d / ("o%06d.png" % j))).st_ino != ino: break
+            except Exception: break
+            j += 1
+        ents.append(("o%06d.png" % i, (j - i) / float(fps))); i = j
+    lst = d / ("ov_%05d.txt" % k)
+    with open(lst, "w") as f:
+        f.write("ffconcat version 1.0\n")
+        for nm, du in ents:
+            f.write("file '%s'\nduration %.6f\n" % (nm, du))
+        f.write("file '%s'\n" % ents[-1][0])   # (ffconcat : la dernière durée n'est prise en compte qu'ainsi)
+    return lst, len(ents)
+_SEG_SRCINFO = {}
+_SEG_SCALEVT = {}
+
+def _seg_has_scale_vt(ff):
+    """scale_vt = redimensionnement PAR LA PUCE GRAPHIQUE (ffmpeg 7+ sur Mac). Testé une fois par ffmpeg."""
+    if ff in _SEG_SCALEVT:
+        return _SEG_SCALEVT[ff]
+    ok = False
+    try:
+        r = subprocess.run([ff, "-hide_banner", "-h", "filter=scale_vt"], capture_output=True, timeout=20)
+        txt = (r.stdout or b"") + (r.stderr or b"")
+        ok = (b"Filter scale_vt" in txt) and (b"Unknown filter" not in txt)
+    except Exception:
+        ok = False
+    _SEG_SCALEVT[ff] = ok
+    return ok
+
+def _seg_srcinfo(src):
+    """(largeur, hauteur, 10 bits ?, texte) de la vidéo source — mis en cache."""
+    if src in _SEG_SRCINFO:
+        return _SEG_SRCINFO[src]
+    sw = sh = 0; ten = False; txt = "?"
+    try:
+        info = _probe_vinfo(src) or {}
+        sw = int(info.get("width") or 0); sh = int(info.get("height") or 0)
+        pf = (info.get("pix_fmt") or "")
+        ten = ("10" in pf) or ("12" in pf)
+        txt = "%s %dx%d %s %s fps" % (info.get("codec_name") or "?", sw, sh, pf or "?", info.get("r_frame_rate") or "?")
+    except Exception:
+        pass
+    _SEG_SRCINFO[src] = (sw, sh, ten, txt)
+    return _SEG_SRCINFO[src]
+
 def _seg_cmd(ff, pc, d, w, h, fps, vc, wm, hw, vkey):
     out = str(d / ("q_%05d.mp4" % pc["k"]))
     n = int(pc["n"])
@@ -4588,17 +4646,36 @@ def _seg_cmd(ff, pc, d, w, h, fps, vc, wm, hw, vkey):
         ts0 = max(0.0, float(pc["ts0"])); dts = float(pc["dts"]) or (1.0 / fps)
         pre = max(0.0, ts0 - 1.0); fine = ts0 - pre
         span = n * dts + fine + 0.5
-        inputs += (["-hwaccel", "videotoolbox"] if hw else []) + ["-ss", "%.4f" % pre, "-t", "%.4f" % span, "-i", src]
         sp = (1.0 / fps) / dts
-        fc.append("[0:v]trim=start=%.4f,setpts=(PTS-STARTPTS)*%.6f,fps=%d,%s,tpad=stop_mode=clone:stop_duration=3[b0]"
-                  % (fine, sp, fps, fit))
+        mode = hw if isinstance(hw, str) else ("hw" if hw else "sw")
+        if mode == "gpu":
+            # s63 : décodage + RÉDUCTION à la taille de sortie sur la PUCE GRAPHIQUE ; seules les images gardées
+            # (24/s) et déjà réduites repassent en mémoire -> le processeur ne manipule plus d'images 4K.
+            sw_, sh_, ten, _t = _seg_srcinfo(src)
+            f_ = min(w / float(sw_), h / float(sh_))
+            tw = max(2, int(sw_ * f_) // 2 * 2); th_ = max(2, int(sh_ * f_) // 2 * 2)
+            inputs += ["-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld",
+                       "-ss", "%.4f" % pre, "-t", "%.4f" % span, "-i", src]
+            fc.append(("[0:v]trim=start=%.4f,setpts=(PTS-STARTPTS)*%.6f,fps=%d,scale_vt=w=%d:h=%d,hwdownload,format=%s,"
+                       "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black,setsar=1,tpad=stop_mode=clone:stop_duration=3[b0]")
+                      % (fine, sp, fps, tw, th_, ("p010le" if ten else "nv12"), w, h))
+        else:
+            inputs += (["-hwaccel", "videotoolbox"] if mode == "hw" else []) + ["-ss", "%.4f" % pre, "-t", "%.4f" % span, "-i", src]
+            fc.append("[0:v]trim=start=%.4f,setpts=(PTS-STARTPTS)*%.6f,fps=%d,%s,tpad=stop_mode=clone:stop_duration=3[b0]"
+                      % (fine, sp, fps, fit))
         cur = "b0"; nin = 1
         if pc.get("ov"):
-            inputs += ["-framerate", str(fps), "-start_number", str(int(pc["i0"])), "-i", str(d / "o%06d.png")]
-            fc.append("[%d:v]scale=%d:%d:flags=bilinear[o1];[%s][o1]overlay=format=auto:eof_action=pass[b1]" % (nin, w, h, cur))
+            lst, _ne = _seg_ov_list(d, int(pc["i0"]), n, fps, pc["k"])
+            inputs += ["-f", "concat", "-safe", "0", "-i", str(lst)]
+            # Horodatage EXACT : ffconcat arrondit au 1/25 s -> on recale chaque surcouche sur son image k/fps
+            # (erreur < 1/2 image, donc l'arrondi retombe pile), puis -1 ms pour qu'elle soit prise dès l'image k.
+            fc.append(("[%d:v]settb=AVTB,setpts=(round(T*%d)/%d-0.001)/TB,scale=%d:%d:flags=bilinear[o1];"
+                       "[%s][o1]overlay=format=auto:eof_action=repeat[b1]") % (nin, fps, fps, w, h, cur))
             cur = "b1"; nin += 1
     elif pc["t"] == "still":
-        inputs += ["-loop", "1", "-framerate", str(fps), "-i", pc["file"]]
+        # s64 : l'image du gel n'est traitée QU'UNE fois puis dupliquée (tpad) ; avant, elle était relue,
+        # redimensionnée et recomposée pour chaque image (gels = 229 s cumulés sur le montage de 14 min).
+        inputs += ["-framerate", str(fps), "-i", pc["file"]]
         fc.append("[0:v]%s[b0]" % fit); cur = "b0"; nin = 1
     else:
         inputs += ["-framerate", str(fps), "-start_number", str(int(pc["i0"])), "-i", str(d / "f%06d.jpg")]
@@ -4606,19 +4683,45 @@ def _seg_cmd(ff, pc, d, w, h, fps, vc, wm, hw, vkey):
     if wm:
         th = max(48, int(h * 0.080))
         inputs += ["-loop", "1", "-i", wm]
-        fc.append("[%d:v]scale=-1:%d,format=rgba,colorchannelmixer=aa=0.78[wm];[%s][wm]overlay=x=(W*0.022):y=(H-h-H*0.045)[bw]"
-                  % (nin, th, cur))
+        if os.path.basename(wm) == "_wm_ready.png":   # logo déjà mis à la bonne taille + transparence (une fois)
+            fc.append("[%d:v]format=rgba[wm];[%s][wm]overlay=x=(W*0.022):y=(H-h-H*0.045)[bw]" % (nin, cur))
+        else:
+            fc.append("[%d:v]scale=-1:%d,format=rgba,colorchannelmixer=aa=0.78[wm];[%s][wm]overlay=x=(W*0.022):y=(H-h-H*0.045)[bw]"
+                      % (nin, th, cur))
         cur = "bw"
-    fc.append("[%s]format=yuv420p[v]" % cur)
+    if pc["t"] == "still":
+        fc.append("[%s]format=yuv420p,tpad=stop_mode=clone:stop=%d[v]" % (cur, n + int(fps)))
+    else:
+        fc.append("[%s]format=yuv420p[v]" % cur)
     cmd = [ff, "-nostdin", "-y"] + inputs + ["-filter_complex", ";".join(fc), "-map", "[v]"] + vc + \
-          ["-r", str(fps), "-frames:v", str(n), "-an", "-movflags", "+faststart", out]
+          ["-r", str(fps), "-frames:v", str(n), "-an", "-progress", str(d / ("prog_%05d.txt" % pc["k"])),
+           "-movflags", "+faststart", out]
     return cmd, out, ""
 
 def _seg_piece_run(ff, pc, d, w, h, fps, vc, wm, vkey):
+    P = _SEG_PROG.get(str(d))
+    if P is not None:
+        P["running"][pc["k"]] = int(pc["n"])
+    ok, e = _seg_piece_run1(ff, pc, d, w, h, fps, vc, wm, vkey)
+    if P is not None:
+        P["running"].pop(pc["k"], None)
+        if ok:
+            P["done"] += int(pc["n"]); P["ok"] += 1
+    return ok, e
+
+def _seg_piece_run1(ff, pc, d, w, h, fps, vc, wm, vkey):
     n = int(pc["n"]); exp = n / float(fps)
     last = ""
-    for hw in ((True, False) if pc["t"] == "match" else (False,)):
-        cmd, out, err = _seg_cmd(ff, pc, d, w, h, fps, vc, wm, hw, vkey)
+    modes = ["sw"]
+    if pc["t"] == "match":
+        modes = []
+        if pc.get("gpu") and not _SEG_STATE["gpu_bad"]:
+            modes.append("gpu")
+        if not _SEG_STATE["hw_bad"]:
+            modes.append("hw")
+        modes.append("sw")
+    for mode in modes:
+        cmd, out, err = _seg_cmd(ff, pc, d, w, h, fps, vc, wm, mode, vkey)
         if not cmd:
             return False, err
         try:
@@ -4630,6 +4733,11 @@ def _seg_piece_run(ff, pc, d, w, h, fps, vc, wm, vkey):
         if os.path.exists(out) and os.path.getsize(out) > 500 and _out_ok(out, exp):
             return True, ""
         last = (r.stderr.decode("utf-8", "ignore")[-400:] if getattr(r, "stderr", None) else "?")
+        if mode == "gpu" and not _SEG_STATE["gpu_bad"]:
+            _SEG_STATE["gpu_bad"] = True   # on n'insiste pas : les autres pièces passent direct au mode suivant
+            print("rendu segments : réduction GPU refusée -> mode classique (%s)" % last[-160:].replace("\n", " "), flush=True)
+        elif mode == "hw" and not _SEG_STATE["hw_bad"]:
+            _SEG_STATE["hw_bad"] = True
     return False, last
 
 def _seg_proxy_pause(stop):
@@ -4650,13 +4758,57 @@ def _render_segments(d, vkey, w, h, fps, ext, nframes, segs):
         return None, "rien à rendre"
     for k, pc in enumerate(pieces):
         pc["k"] = k
+    _SEG_PROG[str(d)] = {"total": int(nframes), "done": 0, "ok": 0, "n": len(pieces), "running": {}, "phase": "pieces"}
     if nov:
         _overlay_seq_prepare(d, nframes)   # les images sans dessin d'un bout de match = PNG transparent (lien dur)
     wm = _seg_wm(d)
+    # s63 : logo mis à la bonne taille + transparence UNE fois (au lieu de le recalculer sur chaque image)
+    if wm:
+        try:
+            import cv2 as _cv, numpy as _np
+            _im = _cv.imread(wm, _cv.IMREAD_UNCHANGED)
+            if _im is not None and _im.ndim == 3:
+                if _im.shape[2] == 3:
+                    _im = _np.dstack([_im, _np.full(_im.shape[:2], 255, _np.uint8)])
+                _th = max(48, int(h * 0.080)); _tw = max(2, int(round(_im.shape[1] * _th / float(_im.shape[0]))))
+                _im = _cv.resize(_im, (_tw, _th), interpolation=_cv.INTER_AREA)
+                _im[:, :, 3] = (_im[:, :, 3].astype(_np.float32) * 0.78).astype(_np.uint8)
+                _wr = str(d / "_wm_ready.png")
+                if _cv.imwrite(_wr, _im):
+                    wm = _wr
+        except Exception:
+            pass
+    # s63 : son encodé EN PARALLÈLE des pièces (avant : pendant le collage, ~15-20 s de plus à la fin)
+    audio = d / "audio.wav"; apre = d / "audio_pre.m4a"; _ath = None
+    if audio.exists():
+        import threading as _thr
+        def _aenc():
+            try:
+                subprocess.run([ff, "-nostdin", "-y", "-i", str(audio), "-c:a", "aac", "-b:a", "192k", str(apre)],
+                               capture_output=True, timeout=1800)
+            except Exception:
+                pass
+        _ath = _thr.Thread(target=_aenc, daemon=True); _ath.start()
+    # s63 : réduction GPU si la source est plus grande que la sortie (ex. 4K -> 1080p)
+    _SEG_STATE["gpu_bad"] = False; _SEG_STATE["hw_bad"] = False
+    _gpu_ok = _seg_has_scale_vt(ff)
+    _srcs_txt = set()
+    for pc in pieces:
+        if pc["t"] != "match":
+            continue
+        try:
+            _src = _export_src((pc.get("vk") or "").strip() or vkey)
+            sw_, sh_, _ten, _txt = _seg_srcinfo(_src) if _src else (0, 0, False, "?")
+            _srcs_txt.add(_txt)
+            pc["gpu"] = bool(_gpu_ok and sw_ > 0 and sh_ > 0 and (sh_ > h * 1.1 or sw_ > w * 1.1))
+        except Exception:
+            pc["gpu"] = False
     nm = sum(1 for p in pieces if p["t"] == "match"); ns = sum(1 for p in pieces if p["t"] == "still")
     nq = len(pieces) - nm - ns
     print("rendu segments : %d pièces (match %d dont %d avec dessins, gels %d, suites %d), logo=%s" %
           (len(pieces), nm, sum(1 for p in pieces if p.get("ov")), ns, nq, "oui" if wm else "non"), flush=True)
+    print("rendu segments : source %s · réduction GPU %s" % (" | ".join(sorted(_srcs_txt)) or "-",
+          "oui" if any(p.get("gpu") for p in pieces) else ("non (filtre absent)" if not _gpu_ok else "non (inutile)")), flush=True)
     # encodeur : on le choisit sur la 1re pièce puis on le GARDE (pièces homogènes -> collage par copie)
     # test de l'encodeur sur une PETITE pièce (rapide), puis tout le reste en parallèle (les plus longues d'abord)
     _cands = [k for k in range(len(pieces)) if pieces[k]["n"] >= 12] or list(range(len(pieces)))
@@ -4674,14 +4826,16 @@ def _render_segments(d, vkey, w, h, fps, ext, nframes, segs):
         return None, "pièce 1 : " + (err or "?")
     globals()["_LAST_ENC"] = vc[1] + ("+wm" if wm else "")
     rest = [pieces[k] for k in order[1:]]
-    fails = []
+    fails = []; _tt = {"match": 0.0, "still": 0.0, "seq": 0.0}
     def _job(pc):
         if _STOP_ALL or fails:
             return
+        _t0 = _tm.time()
         ok, e = _seg_piece_run(ff, pc, d, w, h, fps, vc, wm, vkey)
+        _tt[pc["t"]] = _tt.get(pc["t"], 0.0) + (_tm.time() - _t0)
         if not ok:
             fails.append("pièce %d (%s) : %s" % (pc["k"], pc["t"], e))
-    nw = 3 if vc[1] == "h264_videotoolbox" else max(2, min(4, (os.cpu_count() or 4) // 2))
+    nw = 4 if vc[1] == "h264_videotoolbox" else max(2, min(4, (os.cpu_count() or 4) // 2))
     with ThreadPoolExecutor(max_workers=nw) as ex:
         list(ex.map(_job, rest))
     if _STOP_ALL:
@@ -4689,15 +4843,23 @@ def _render_segments(d, vkey, w, h, fps, ext, nframes, segs):
     if fails:
         return None, fails[0][-400:]
     t1 = _tm.time()
+    print("rendu segments : temps cumulés match %.0f s · gels %.0f s · suites %.0f s (%d en parallèle)%s" %
+          (_tt.get("match", 0), _tt.get("still", 0), _tt.get("seq", 0), nw,
+           " · GPU refusé" if _SEG_STATE["gpu_bad"] else ""), flush=True)
     lst = d / "segs.txt"
     with open(lst, "w") as f:
         for pc in pieces:
             f.write("file '%s'\n" % os.path.abspath(str(d / ("q_%05d.mp4" % pc["k"]))).replace("'", "'\\''"))
     out = d / ("seg_out." + ext)
     dur = int(nframes) / float(fps)
-    audio = d / "audio.wav"
+    try: _SEG_PROG[str(d)]["phase"] = "collage"
+    except Exception: pass
+    if _ath is not None:
+        _ath.join(timeout=600)
     cmd = [ff, "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
-    if audio.exists():
+    if apre.exists() and apre.stat().st_size > 1000 and _src_dur(str(apre)) > 0:
+        cmd += ["-i", str(apre), "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "copy"]
+    elif audio.exists():
         cmd += ["-i", str(audio), "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-af", "apad", "-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-map", "0:v", "-c:v", "copy"]
@@ -4706,6 +4868,8 @@ def _render_segments(d, vkey, w, h, fps, ext, nframes, segs):
     if not _out_ok(out, dur):
         return None, "collage : " + ((r.stderr.decode("utf-8", "ignore")[-300:]) if getattr(r, "stderr", None) else "?")
     globals()["_LAST_WM"] = "on" if wm else "none"; globals()["_LAST_WMERR"] = ""
+    try: _SEG_PROG[str(d)]["phase"] = "fini"
+    except Exception: pass
     print("rendu segments : ✅ pièces %.1f s + collage %.1f s = %.1f s (%d images)" %
           (t1 - t0, _tm.time() - t1, _tm.time() - t0, int(nframes)), flush=True)
     return out, ""
@@ -4742,6 +4906,29 @@ async def render_seg_finish(sid: str = Form(...), vkey: str = Form(""), w: int =
     return {"ok": True, "url": "/rec/" + dest.name, "sv": SERVER_VERSION, "mode": "segments",
             "enc": globals().get("_LAST_ENC", "?"), "wm": globals().get("_LAST_WM", "?"),
             "wmerr": globals().get("_LAST_WMERR", "")}
+
+@app.post("/render_progress")
+def render_progress(sid: str = Form(...)):
+    """s64 : avancement du rendu par segments (0..1) -> barre de progression de l'app."""
+    try:
+        safe, d = _sid_dir(sid)
+        P = _SEG_PROG.get(str(d)) if d else None
+        if not P:
+            return {"ok": True, "phase": "attente", "frac": 0.0}
+        done = P["done"]
+        for k, n in list(P["running"].items()):
+            try:
+                with open(str(d / ("prog_%05d.txt" % k)), "rb") as f:
+                    f.seek(0, 2); sz = f.tell(); f.seek(max(0, sz - 600)); txt = f.read().decode("utf-8", "ignore")
+                m = re.findall(r"frame=(\d+)", txt)
+                if m:
+                    done += min(int(n), int(m[-1]))
+            except Exception:
+                pass
+        return {"ok": True, "phase": P["phase"], "frac": min(1.0, done / float(max(1, P["total"]))),
+                "pieces": P["ok"], "n": P["n"]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/render_frame_multi")
 async def render_frame_multi(sid: str = Form(...), idxs: str = Form(...), file: UploadFile = File(...)):
