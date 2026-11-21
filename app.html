@@ -2279,6 +2279,7 @@ else document.addEventListener('DOMContentLoaded',function(){ buildLangSel(); se
     <button class="btn" id="backHome">← Espaces</button>
     <span class="title" id="projName">Projet</span>
     <button class="btn" id="loadVid">🎬 Choisir la vidéo</button>
+    <button class="btn hidden" id="fixVid" title="La vidéo n'affiche pas d'image (iPhone) ? Crée une version lisible en 1 clic" style="background:#1d3b2c;border-color:#1bd47a;color:#c8ffe2">🔧 Image noire ? Réparer</button>
     <button class="btn" id="expTags" title="Sauvegarder tous tes tags dans un fichier (à garder / réimporter)">⤓ Sauver tags</button>
     <label class="btn" id="impTagsLbl" title="Réimporter des tags depuis un fichier" style="cursor:pointer">⤒ Charger tags<input type="file" id="impTags" accept=".json,application/json" class="hidden"></label>
     <input type="file" id="fileFallback" accept="video/*" class="hidden">
@@ -2576,6 +2577,38 @@ function fixInfiniteDuration(){ if(_fixing)return; _fixing=true; const ondc=()=>
   try{ const _fallback=(liveMode&&liveReview&&window._rvT>0)?Math.min(window._rvT,vid.duration-0.3):0; const _t=(_reviewSeek==='end')?Math.max(0,vid.duration-0.3):(_reviewSeek!=null?Math.max(0,Math.min(_reviewSeek,vid.duration)):_fallback); vid.currentTime=Math.max(0,_t); }catch(e){} _reviewSeek=null; _fixing=false; if(window._rvResume){ window._rvResume=false; try{ vid.play().catch(()=>{}); }catch(e){} } renderTimeline(); if(!liveMode)fitZoom(); } }; vid.addEventListener('durationchange',ondc); try{ vid.currentTime=1e7; }catch(e){} setTimeout(()=>{_fixing=false;},4000); }
 function blobToImg(blob){return new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.src=URL.createObjectURL(blob);});}
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+// s66 : FENÊTRE DE SAISIE DANS L'APP (remplace la boîte macOS du prompt(), dont le champ de texte était
+// invisible : on ne savait pas qu'on pouvait écrire). Champ bien visible, curseur déjà dedans,
+// Entrée = champ suivant / valider, Échap = annuler. Renvoie {clé:valeur} ou null si annulé.
+function mlzForm(title,fields,okLabel){ return new Promise(res=>{
+  try{ const old=document.getElementById('mlzFormOv'); if(old)old.remove(); }catch(e){}
+  const ov=document.createElement('div'); ov.id='mlzFormOv';
+  ov.style.cssText='position:fixed;inset:0;z-index:2147483600;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center';
+  const box=document.createElement('div');
+  box.style.cssText='background:#12181c;border:1px solid #2a3a33;border-radius:16px;padding:22px 24px;width:min(460px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.6);color:#e8f2ee;font-family:inherit';
+  let h='<div style="font-weight:800;font-size:19px;margin-bottom:6px">'+esc(title)+'</div>';
+  (fields||[]).forEach(f=>{ h+='<label style="display:block;font-size:13px;color:#9fb5ac;margin:12px 0 6px">'+esc(f.label||'')+'</label>'+
+    '<input data-k="'+esc(f.key)+'" type="text" autocomplete="off" spellcheck="false" value="'+esc(f.value||'')+'" placeholder="'+esc(f.placeholder||'')+'" '+
+    'style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;border:2px solid #2f8f63;background:#0b1013;color:#fff;font-size:16px;outline:none">'; });
+  h+='<div style="display:flex;gap:10px;justify-content:flex-end;margin-top:20px">'+
+     '<button data-a="cancel" style="padding:10px 16px;border-radius:10px;border:1px solid #33433c;background:#1a2227;color:#cfe;cursor:pointer;font-weight:700">Annuler</button>'+
+     '<button data-a="ok" style="padding:10px 18px;border-radius:10px;border:0;background:#1bd47a;color:#042;cursor:pointer;font-weight:800">'+esc(okLabel||'OK')+'</button></div>';
+  box.innerHTML=h; ov.appendChild(box); document.body.appendChild(ov);
+  const inputs=[...box.querySelectorAll('input')];
+  let fin=false;
+  const done=ok=>{ if(fin)return; fin=true; const out={}; inputs.forEach(i=>out[i.dataset.k]=i.value); try{ov.remove();}catch(e){} res(ok?out:null); };
+  inputs.forEach(i=>{ i.onfocus=()=>{ i.style.borderColor='#1bd47a'; i.style.boxShadow='0 0 0 3px rgba(27,212,122,.25)'; }; i.onblur=()=>{ i.style.borderColor='#2f8f63'; i.style.boxShadow='none'; }; });
+  box.addEventListener('keydown',e=>{ e.stopPropagation();   // aucune touche ne déclenche les raccourcis de l'app pendant la saisie
+    if(e.key==='Escape'){ e.preventDefault(); done(false); }
+    else if(e.key==='Enter'){ e.preventDefault(); const k=inputs.indexOf(document.activeElement); if(k>=0&&k<inputs.length-1)inputs[k+1].focus(); else done(true); } });
+  box.addEventListener('keyup',e=>e.stopPropagation()); box.addEventListener('keypress',e=>e.stopPropagation());
+  box.querySelector('[data-a="ok"]').onclick=()=>done(true);
+  box.querySelector('[data-a="cancel"]').onclick=()=>done(false);
+  ov.addEventListener('mousedown',e=>{ if(e.target===ov)done(false); });
+  setTimeout(()=>{ try{ if(inputs[0]){ inputs[0].focus(); inputs[0].select(); } }catch(e){} },30);
+}); }
+// Équivalent ASYNCHRONE de prompt() : renvoie le texte saisi, ou null si annulé.
+async function mlzPrompt(msg,def){ const r=await mlzForm(String(msg||'').replace(/\s*:\s*$/,''),[{key:'v',label:'',value:def==null?'':String(def)}]); return r?r.v:null; }
 
 // ===== HOME =====
 let currentPlayerId=null; window._playerQuery=''; window._folderCur=null;
@@ -2587,7 +2620,7 @@ function folderById(folders,id){ return folders.find(f=>f.id===id)||null; }
 function folderPathArr(folders,id){ const path=[]; let cur=folderById(folders,id),g=0; while(cur&&g++<80){ path.unshift(cur); cur=cur.parentId?folderById(folders,cur.parentId):null; } return path; }
 function isDescFolder(folders,id,anc){ let cur=folderById(folders,id),g=0; while(cur&&g++<80){ if(cur.id===anc)return true; cur=cur.parentId?folderById(folders,cur.parentId):null; } return false; }
 function countFolderItems(folders,projs,fid){ return folders.filter(f=>(f.parentId||null)===fid).length + projs.filter(p=>!p.playerId&&(p.folderId||null)===fid).length; }
-async function newFolder(){ const name=prompt('Nom du dossier :'); if(name===null)return; const n=name.trim(); if(!n)return; await dbPut('folders',{id:uid(),name:n,parentId:window._folderCur||null,created:Date.now()}); renderHome(); }
+async function newFolder(){ const name=await mlzPrompt('Nom du dossier :'); if(name===null)return; const n=name.trim(); if(!n)return; await dbPut('folders',{id:uid(),name:n,parentId:window._folderCur||null,created:Date.now()}); renderHome(); }
 async function moveMenu(kind,id,x,y){ const folders=await dbAll('folders');
   const withPath=folders.map(f=>({f,p:folderPathArr(folders,f.id).map(z=>z.name).join(' / ')})).sort((a,b)=>a.p.localeCompare(b.p));
   const items=[{label:'🏠 Accueil (racine)', fn:()=>doMove(kind,id,null)}];
@@ -2597,7 +2630,7 @@ async function moveMenu(kind,id,x,y){ const folders=await dbAll('folders');
 async function doMove(kind,id,dest){ if(kind==='folder'){ const f=await dbGet('folders',id); if(f){ f.parentId=dest; await dbPut('folders',f);} } else { const p=await dbGet('projects',id); if(p){ p.folderId=dest; p.playerId=null; p.updated=Date.now(); await dbPut('projects',p);} } window._folderCur=(kind==='folder')?window._folderCur:dest; renderHome(); }
 async function folderMenuFor(id,x,y){ const f=await dbGet('folders',id); if(!f)return; showMenu(x,y,[
   {label:'📂 Ouvrir', fn:()=>{ window._folderCur=id; renderHome(); }},
-  {label:'✏️ Renommer', fn:async()=>{ const n=prompt('Nom du dossier :',f.name); if(n!==null&&n.trim()){ f.name=n.trim(); await dbPut('folders',f); renderHome(); } }},
+  {label:'✏️ Renommer', fn:async()=>{ const n=await mlzPrompt('Nom du dossier :',f.name); if(n!==null&&n.trim()){ f.name=n.trim(); await dbPut('folders',f); renderHome(); } }},
   {label:'📦 Déplacer ▸', sub:true, fn:()=>moveMenu('folder',id,x,y)},
   {label:'💾 Enregistrer le dossier (fichier)', fn:()=>exportFolder(id)},
   {sep:true},
@@ -2613,7 +2646,7 @@ async function deleteFolder(id){ const folders=await dbAll('folders'); const f=f
 function refreshList(){ if(currentPlayerId) renderPlayer(currentPlayerId); else renderHome(); }
 async function projMenuFor(id,x,y){ const p=await dbGet('projects',id); if(!p)return; const players=(await dbAll('players')).sort((a,b)=>(a.nom||'').localeCompare(b.nom||'')); showMenu(x,y,[
   {label:'▶ Ouvrir', fn:()=>openProject(id)},
-  {label:'✏️ Renommer', fn:async()=>{ const n=prompt('Nom du match :',p.name); if(n!==null&&n.trim()){ p.name=n.trim(); p.updated=Date.now(); await dbPut('projects',p); refreshList(); } }},
+  {label:'✏️ Renommer', fn:async()=>{ const n=await mlzPrompt('Nom du match :',p.name); if(n!==null&&n.trim()){ p.name=n.trim(); p.updated=Date.now(); await dbPut('projects',p); refreshList(); } }},
   {label:'📦 Déplacer (dossier) ▸', sub:true, fn:()=>moveMenu('project',id,x,y)},
   {label:'👤 Changer de joueur ▸', sub:true, fn:()=>showMenu(x,y, [{label:'(aucun — sans joueur)',fn:async()=>{ p.playerId=null; p.updated=Date.now(); await dbPut('projects',p); refreshList(); }}].concat(players.length?players.map(pl=>({label:(pl.id===p.playerId?'✓ ':'')+playerName(pl),fn:async()=>{ p.playerId=pl.id; p.updated=Date.now(); await dbPut('projects',p); refreshList(); }})):[{label:'(aucun joueur créé)',fn:()=>{}}]).concat([{label:'← retour',sub:true,fn:()=>projMenuFor(id,x,y)}])) },
   {label:'💾 Enregistrer dans un fichier', fn:()=>exportOneProject(id)},
@@ -2792,9 +2825,9 @@ async function renderHome(){ currentPlayerId=null; try{ homeFxStart(); }catch(e)
   try{applyI18n(document.body);}catch(e){}
   setNav('home');
 }
-async function newPlayer(){ const nom=prompt('Nom du joueur :'); if(nom===null)return; const prenom=prompt('Prénom :'); const p={id:uid(),nom:(nom||'').trim(),prenom:(prenom||'').trim(),dob:'',poste:'',club:'',pied:'',taille:'',poids:'',created:Date.now()}; await dbPut('players',p); renderPlayer(p.id); }
-async function newTeam(){ const nom=prompt('Nom de l\'équipe :'); if(nom===null)return; const n=(nom||'').trim(); if(!n)return; const info=prompt('Informations complémentaires sur l\'équipe (facultatif) :')||''; const p={id:uid(),kind:'team',nom:n,prenom:'',info:(info||'').trim(),club:'',poste:'',created:Date.now()}; await dbPut('players',p); renderPlayer(p.id); }
-async function newSimple(){ const name=prompt('Nom de l\'analyse :','Analyse '+(new Date().toLocaleDateString())); if(!name)return; const p={id:uid(),name:name.trim(),playerId:null,folderId:window._folderCur||null,created:Date.now(),updated:Date.now(),videoName:'',videoBlobId:null,actions:[]}; await dbPut('projects',p); openProject(p.id); }
+async function newPlayer(){ const _r=await mlzForm('Ajouter un joueur',[{key:'nom',label:'Nom du joueur',placeholder:'ex. Martin'},{key:'prenom',label:'Prénom',placeholder:'ex. Roméo'}],'Ajouter'); if(!_r)return; const nom=_r.nom, prenom=_r.prenom; const p={id:uid(),nom:(nom||'').trim(),prenom:(prenom||'').trim(),dob:'',poste:'',club:'',pied:'',taille:'',poids:'',created:Date.now()}; await dbPut('players',p); renderPlayer(p.id); }
+async function newTeam(){ const _r=await mlzForm('Ajouter une équipe',[{key:'nom',label:'Nom de l\'équipe',placeholder:'ex. U15 R1'},{key:'info',label:'Informations complémentaires (facultatif)'}],'Ajouter'); if(!_r)return; const nom=_r.nom; const n=(nom||'').trim(); if(!n)return; const info=_r.info||''; const p={id:uid(),kind:'team',nom:n,prenom:'',info:(info||'').trim(),club:'',poste:'',created:Date.now()}; await dbPut('players',p); renderPlayer(p.id); }
+async function newSimple(){ const name=await mlzPrompt('Nom de l\'analyse :','Analyse '+(new Date().toLocaleDateString())); if(!name)return; const p={id:uid(),name:name.trim(),playerId:null,folderId:window._folderCur||null,created:Date.now(),updated:Date.now(),videoName:'',videoBlobId:null,actions:[]}; await dbPut('projects',p); openProject(p.id); }
 async function renderPlayer(pid){ currentPlayerId=pid; const p=await dbGet('players',pid); if(!p){ renderHome(); return; }
   const projs=(await dbAll('projects')).filter(x=>x.playerId===pid).sort(matchSort);
   const fld=(k,lbl,ph)=>`<div class="setrow" style="margin:3px 0"><label style="width:130px;font-size:12px;color:var(--mut)">${lbl}</label><input data-pf="${k}" value="${esc(p[k]||'')}" placeholder="${ph||''}" style="flex:1;background:#1d1d22;border:1px solid var(--line);color:#fff;border-radius:6px;padding:6px"></div>`;
@@ -2822,11 +2855,11 @@ async function renderPlayer(pid){ currentPlayerId=pid; const p=await dbGet('play
   setNav('home');
 }
 async function gearMenu(id,backPid){ const p=await dbGet('projects',id); if(!p)return;
-  const c=prompt('Renommer le match (ou tape SUPPR pour le supprimer) :',p.name); if(c===null)return;
+  const c=await mlzPrompt('Renommer le match (ou tape SUPPR pour le supprimer) :',p.name); if(c===null)return;
   if(c.trim().toUpperCase()==='SUPPR'){ if(confirm('Supprimer « '+p.name+' » ?')){await dbDel('projects',id); const _f=await gcSweepSilent(id); try{ if(_f>1048576)alert('🗑 Match supprimé — '+_fmtGo(_f)+' libéré(s) directement.'); }catch(e){} backPid?renderPlayer(backPid):renderHome();} return; }
   p.name=c.trim()||p.name; p.updated=Date.now(); await dbPut('projects',p); backPid?renderPlayer(backPid):renderHome();
 }
-async function newProject(pid){ const name=prompt('Nom du match :','Match '+(new Date().toLocaleDateString())); if(!name)return;
+async function newProject(pid){ const name=await mlzPrompt('Nom du match :','Match '+(new Date().toLocaleDateString())); if(!name)return;
   const p={id:uid(),name,playerId:pid||currentPlayerId||null,created:Date.now(),updated:Date.now(),videoName:'',videoBlobId:null,actions:[]};
   await dbPut('projects',p); openProject(p.id); }
 function openAggStats(player,matches){ if(!matches.length){ alert('Aucun match pour ce joueur.'); return; }
@@ -2953,7 +2986,9 @@ function navTo(n){
   else if(n==='stats'){ openStats(); setNav('stats'); }
   else if(n==='settings'){ openSettings(); setNav('settings'); }
 }
-function openOvrl(title,html,kind){ window._ovrlKind=kind||''; $('ovrlTitle').textContent=title; $('ovrlBody').innerHTML=html; $('ovrl').classList.remove('hidden'); }
+function openOvrl(title,html,kind){ window._ovrlKind=kind||''; $('ovrlTitle').textContent=title; $('ovrlBody').innerHTML=html; $('ovrl').classList.remove('hidden');
+  // s65 : la bannière « Relier la vidéo » appartient à la vue vidéo -> jamais par-dessus les Statistiques / panneaux
+  try{ if(document.getElementById('mlzRelink')){ aiBarHide(); if(window._mlzRelinkShown){ window._mlzRelinkShown=false; window._mlzRelinkPending=true; _mlzRelinkWatch(); } } }catch(e){} }
 $('ovrlClose').onclick=()=>{ $('ovrl').classList.add('hidden'); if(typeof liveMode!=='undefined'&&liveMode){ try{restoreLiveEditor();}catch(e){} return; }
   // Fermer les STATISTIQUES ne renvoie plus dans le Tag : retour à l'Accueil (là d'où on ouvre les stats).
   if(window._ovrlKind==='stats'){ window._ovrlKind=''; try{navTo('home');}catch(e){} return; }
@@ -4506,7 +4541,7 @@ document.addEventListener('keydown',ev=>{ if($('montage').classList.contains('hi
 },true);
 
 // video
-function refreshVidBtn(){ $('loadVid').textContent = project&&project.videoName ? ('🎬 '+project.videoName) : '🎬 Choisir la vidéo'; }
+function refreshVidBtn(){ $('loadVid').textContent = project&&project.videoName ? ('🎬 '+project.videoName) : '🎬 Choisir la vidéo'; try{ _mlzFixBtnRefresh(); }catch(e){} }
 let _seekOnce=null;
 async function loadVideoFile(f){ if(!f)return;
   if(projectMode()==='live'){
@@ -4516,6 +4551,7 @@ async function loadVideoFile(f){ if(!f)return;
   try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
   setProjectMode('file');
   project.videoConverted=false; project.videoUrl='';   // nouvelle vidéo -> on oublie l'éventuelle conversion de l'ancienne
+  project.videoPath=''; project.videoConvKind=''; project.videoIsHevc=false; window._mlzNeedRelinkHevc=false; window._mlzForceTried=false;   // s66 : pas de chemin périmé de l'ancienne vidéo
   vid.src=URL.createObjectURL(f); try{ vid.load(); }catch(e){}   // load() -> l'image s'affiche DÈS le 1er chargement (sinon il fallait re-sélectionner)
   project.videoName=f.name; project.videoSize=f.size;   // taille mémorisée -> vkey calculable même sans relire le fichier
   // MODÈLE LIVETAG : si on tourne dans l'app MatchLyz ET qu'on connaît le CHEMIN du fichier, on NE COPIE PAS la
@@ -4561,6 +4597,7 @@ async function loadVideoHandle(h,f){ if(!h||!f)return;
   try{ if(navigator.storage&&navigator.storage.persist)navigator.storage.persist(); }catch(e){}
   setProjectMode('file');
   project.videoConverted=false; project.videoUrl='';   // nouvelle vidéo -> on oublie l'éventuelle conversion de l'ancienne
+  project.videoPath=''; project.videoConvKind=''; project.videoIsHevc=false; window._mlzNeedRelinkHevc=false; window._mlzForceTried=false;   // s66 : pas de chemin périmé de l'ancienne vidéo
   vid.src=URL.createObjectURL(f); try{ vid.load(); }catch(e){}   // load() -> l'image s'affiche DÈS le 1er chargement (sinon il fallait re-sélectionner)
   project.videoName=f.name; project.videoSize=f.size;
   try{ const _p=_filePath(f); if(_p)project.videoPath=_p; }catch(e){}   // chemin absolu -> lecture directe moteur (aucun envoi)
@@ -4580,28 +4617,109 @@ async function mlzAutoConvert(f){
     let path=''; try{ path=_filePath(f)||''; }catch(e){}
     if(!path && project && project.videoPath) path=project.videoPath;   // chemin déjà connu (lecture directe)
     if(path) return await mlzConvertPath(path);
-    // PAS DE CHEMIN : on ne montre AUCUNE bannière ici. Si la vidéo s'affiche normalement (cas général,
-    // ex. un MP4), il ne faut rien afficher. La bannière « Relier » n'apparaît QUE si l'image est réellement
-    // absente (écran noir) -> c'est le détecteur plus bas (videoWidth===0) qui la déclenche alors.
+    // s66 : PAS DE CHEMIN (sélecteur moderne). Avant, on attendait un « écran noir » détecté par le canvas,
+    // mais pour une vidéo iPhone HEVC le canvas voit l'image alors que l'écran reste NOIR -> rien ne se
+    // passait (ni conversion, ni bouton « Relier »). Maintenant on regarde DANS le fichier : si c'est du
+    // HEVC (iPhone), le moteur retrouve le fichier (nom + taille) et le rend lisible ; s'il ne le trouve
+    // pas, la bannière « Relier la vidéo » s'affiche pour le désigner une fois.
+    const hevc=await _mlzSniffHevc(f);
+    if(!hevc) return false;   // MP4 classique (H.264) : il s'affiche normalement, on ne montre rien
+    try{ project.videoIsHevc=true; _mlzFixBtnRefresh(); }catch(e){}
+    const lp=await _mlzLocate(f&&f.name, f&&f.size);
+    if(lp){ try{ project.videoPath=lp; save(); }catch(e){} return await mlzConvertPath(lp); }
+    window._mlzNeedRelinkHevc=true;
+    try{ mlzShowRelinkBanner(); }catch(e){}
     return false;
   }catch(e){ try{aiBarHide();}catch(_){} return false; }
 }
+// s66 : le fichier est-il du HEVC (vidéo iPhone) ? On lit seulement le début et la fin du fichier (là où se trouve
+// l'index 'moov' qui décrit le codec) et on y cherche les codes HEVC / Dolby Vision. Quelques Mo lus, < 1 s.
+async function _mlzSniffHevc(f){ try{
+  if(!f||!f.size||!f.slice) return false;
+  if(/\.(webm|mkv|avi)$/i.test(f.name||'')) return false;
+  const H=4*1024*1024, T=16*1024*1024;
+  const scan=async(a,b)=>{ const u=new Uint8Array(await f.slice(a,b).arrayBuffer()); const n=u.length-4;
+    for(let i=0;i<=n;i++){ const c=u[i];
+      if(c===104){ const a1=u[i+1],a2=u[i+2],a3=u[i+3];   // 'h' : hvc1 / hev1 / hvcC
+        if((a1===118&&a2===99&&(a3===49||a3===67))||(a1===101&&a2===118&&a3===49)) return true; }
+      else if(c===100){ const a1=u[i+1],a2=u[i+2],a3=u[i+3];   // 'd' : dvh1 / dvhe (Dolby Vision)
+        if(a1===118&&a2===104&&(a3===49||a3===101)) return true; } }
+    return false; };
+  if(f.size<=H+T) return await scan(0,f.size);
+  return (await scan(0,H)) || (await scan(f.size-T,f.size));
+}catch(e){ return false; } }
+// s66 : demande au moteur de retrouver le fichier sur le disque (nom + taille). Renvoie le chemin ou ''.
+async function _mlzLocate(name,size){ try{
+  if(!name) return '';
+  const fd=new FormData(); fd.append('name',name); fd.append('size',String(size||0)); fd.append('mime','import');
+  const lr=await fetch(AI_BASE+'/locate_file',{method:'POST',body:fd}).then(x=>x.json()).catch(()=>null);
+  return (lr&&lr.ok&&lr.path)?lr.path:'';
+}catch(e){ return ''; } }
+// s66 : bouton « 🔧 Image noire ? Réparer » : visible pour une vidéo iPhone/HEVC (ou sans image) tant qu'elle n'a pas
+// été transformée en version H.264. Un clic = version lisible garantie (quelques minutes pour un long match).
+function _mlzFixBtnRefresh(){ try{
+  const b=document.getElementById('fixVid'); if(!b) return;
+  const has=!!(project && vid && (vid.currentSrc||vid.src));
+  const live=(typeof projectMode==='function' && projectMode()==='live');
+  const susp=!!(project && (project.videoIsHevc || /\.(mov|hevc)$/i.test(project.videoName||'') || (vid && vid.readyState>=1 && vid.videoWidth===0)));
+  const show=has && !live && susp && project.videoConvKind!=='h264' && !window._mlzConvRunning;
+  b.classList.toggle('hidden',!show);
+}catch(e){} }
+// s66 : « Réparer l'image » : retrouve le fichier (chemin connu, sinon recherche auto, sinon on le désigne) puis
+// crée un VRAI proxy H.264 (lisible partout : tag, montage, export). L'original n'est jamais modifié.
+async function mlzRepairDisplay(){
+  if(window._mlzConvRunning){ aiBar('⏳ Une conversion est déjà en cours…'); setTimeout(aiBarHide,2500); return; }
+  let path=(project&&project.videoPath)||'';
+  if(!path && project && project.videoName){ aiBar('🔎 Recherche du fichier « '+project.videoName+' »…'); path=await _mlzLocate(project.videoName, project.videoSize||0); }
+  if(!path && window.matchlyzVideoRef){
+    aiBar('📂 Désigne le fichier vidéo du match (une seule fois)…');
+    let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){}
+    if(r&&r.path){ path=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; }
+  }
+  if(!path){ aiBar('⚠️ Fichier introuvable — clique sur « 🎬 » pour re-sélectionner la vidéo du match.'); setTimeout(aiBarHide,6000); return; }
+  try{ project.videoPath=path; save(); }catch(e){}
+  window._mlzNeedRelinkHevc=false; window._mlzRelinkShown=false; window._mlzRelinkPending=false;
+  await mlzConvertPath(path,{force:true});
+  try{ _mlzFixBtnRefresh(); }catch(e){}
+}
+try{ document.getElementById('fixVid').onclick=()=>mlzRepairDisplay(); }catch(e){}
 // Bannière « Relier » : affichée UNIQUEMENT quand l'image est noire et qu'on n'a pas le chemin disque
 // (vidéo iPhone HEVC sélectionnée via le sélecteur moderne, qui ne donne pas le chemin au moteur).
+// s65 : la vidéo de l'éditeur est-elle VRAIMENT visible (pas recouverte par les Statistiques, le Montage…) ?
+function _mlzVideoOnScreen(){ try{
+    const ed=document.getElementById('editor'); if(!vid||!ed||ed.classList.contains('hidden'))return false;
+    const r=vid.getBoundingClientRect(); if(r.width<40||r.height<40)return false;
+    const x=r.left+r.width/2, y=r.top+r.height/2; if(x<0||y<0||x>innerWidth||y>innerHeight)return false;
+    const el=document.elementFromPoint(x,y); return !!(el && ed.contains(el));
+  }catch(e){ return false; } }
+// s65 : surveille la bannière « Relier » : masquée dès qu'on quitte la vue vidéo (Stats, Montage, Accueil…),
+// ré-affichée seulement si on revient sur la vidéo ET qu'elle est toujours vraiment noire.
+function _mlzRelinkWatch(){ if(window._mlzRelinkIv)return;
+  window._mlzRelinkIv=setInterval(()=>{ try{
+    if(!window._mlzRelinkShown && !window._mlzRelinkPending){ clearInterval(window._mlzRelinkIv); window._mlzRelinkIv=null; return; }
+    const still=!!(project && !project.videoConverted && !project.videoPath && vid && (window._mlzNeedRelinkHevc || vid.videoWidth===0 || _mlzFrameIsBlank()));
+    if(!still){ if(window._mlzRelinkShown && document.getElementById('mlzRelink')){ try{aiBarHide();}catch(e){} } window._mlzRelinkShown=false; window._mlzRelinkPending=false; return; }
+    const on=_mlzVideoOnScreen();
+    if(window._mlzRelinkShown && !on){ if(document.getElementById('mlzRelink')){ try{aiBarHide();}catch(e){} } window._mlzRelinkShown=false; window._mlzRelinkPending=true; }
+    else if(window._mlzRelinkPending && on){ window._mlzRelinkPending=false; mlzShowRelinkBanner(); }
+  }catch(e){} },1000); }
 function mlzShowRelinkBanner(){
+  if(!_mlzVideoOnScreen()){ window._mlzRelinkPending=true; _mlzRelinkWatch(); return; }   // pas sur la vidéo -> plus tard
   window._mlzRelinkShown=true;   // permet l'auto-masquage dès qu'une vraie image s'affiche
+  _mlzRelinkWatch();
   if(window.matchlyzVideoRef){
     aiBar('🎬 Vidéo introuvable ou déplacée : clique pour retrouver le fichier. <button id="mlzRelink" style="margin-left:8px;padding:5px 11px;border-radius:8px;border:0;background:#1bd47a;color:#042;font-weight:800;cursor:pointer">🔗 Relier la vidéo</button>');
-    try{ const btn=document.getElementById('mlzRelink'); if(btn)btn.onclick=async()=>{ let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){} if(r&&r.path){ project.videoPath=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; project.videoBlobId=null; project.videoConverted=false; project.videoUrl=''; try{save();}catch(e){} try{ aiBarHide(); window._mlzRelinkShown=false; }catch(e){} await mlzConvertPath(r.path); } }; }catch(e){}
+    try{ const btn=document.getElementById('mlzRelink'); if(btn)btn.onclick=async()=>{ let r=null; try{ r=await window.matchlyzVideoRef.pick(); }catch(e){} if(r&&r.path){ project.videoPath=r.path; if(r.name)project.videoName=r.name; if(r.size)project.videoSize=r.size; project.videoBlobId=null; project.videoConverted=false; project.videoUrl=''; project.videoConvKind=''; window._mlzNeedRelinkHevc=false; try{save();}catch(e){} try{ aiBarHide(); window._mlzRelinkShown=false; }catch(e){} await mlzConvertPath(r.path); } }; }catch(e){}
   } else {
     aiBar('ℹ️ La vidéo de ce match n\'est plus trouvée à son emplacement — ouvre le match dans l\'app MatchLyz pour la re-relier.'); setTimeout(aiBarHide,8000);
   }
 }
 // Convertit la vidéo au CHEMIN donné (HEVC/HDR -> H.264 lisible) avec barre de progression, puis bascule l'affichage.
-async function mlzConvertPath(path){
+async function mlzConvertPath(path,opts){
   if(!path)return false;
+  const force=!!(opts&&opts.force);
   if(window._mlzConvRunning) return false;   // anti-chevauchement : une seule conversion à la fois
-  window._mlzConvRunning=true;
+  window._mlzConvRunning=true; try{ _mlzFixBtnRefresh(); }catch(e){}
   try{
     let chk=null;
     for(let i=0;i<8;i++){   // le moteur met un peu à démarrer : on réessaie ~12s au lieu d'abandonner
@@ -4610,14 +4728,16 @@ async function mlzConvertPath(path){
     }
     if(!chk){ aiBar('⚠️ Moteur injoignable — vérifie qu\'il est démarré, puis réessaie.'); setTimeout(aiBarHide,6000); return false; }
     if(!chk.ok){ aiBar('⚠️ Le moteur ne trouve pas le fichier à convertir.<br><span class="hint">'+(path||'')+'</span>'); setTimeout(aiBarHide,8000); return false; }
-    if(!chk.needs) return false;   // déjà lisible (H.264/VP9 8 bits) -> rien à faire
+    try{ if(/^(hevc|h265)$/i.test(chk.codec||'')){ project.videoIsHevc=true; } }catch(e){}
+    if(!chk.needs && !force) return false;   // déjà lisible (H.264/VP9 8 bits) -> rien à faire
     const pid='conv_'+Date.now(); let polling=true;
     window._mlzConvPid=pid; window._mlzConvCancelled=false;
     const STOP=' <button onclick="mlzCancelConv()" style="margin-left:8px;padding:4px 10px;border-radius:8px;border:0;background:#c6414f;color:#fff;font-weight:800;cursor:pointer">⏹ Arrêter</button>';
-    (async()=>{ while(polling){ try{ const s=await fetch(AI_BASE+'/calib_progress?pid='+pid).then(r=>r.json()); if(polling&&s&&s.p!=null) aiBar('🎬 Conversion de la vidéo iPhone (HEVC/HDR) '+pctBar(s.p)+' <span class="hint">'+(s.msg||'')+' — c\'est fait une seule fois</span>'+STOP); }catch(e){} await new Promise(r=>setTimeout(r,500)); } })();
-    aiBar('🎬 Préparation de la vidéo iPhone (HEVC/HDR)… <span class="hint">quasi instantané</span>'+STOP);
+    const _lbl=force?'🔧 Création d\'une version lisible de la vidéo (H.264) ':'🎬 Conversion de la vidéo iPhone (HEVC/HDR) ';
+    (async()=>{ while(polling){ try{ const s=await fetch(AI_BASE+'/calib_progress?pid='+pid).then(r=>r.json()); if(polling&&s&&s.p!=null) aiBar(_lbl+pctBar(s.p)+' <span class="hint">'+(s.msg||'')+' — c\'est fait une seule fois</span>'+STOP); }catch(e){} await new Promise(r=>setTimeout(r,500)); } })();
+    aiBar(force?'🔧 Création d\'une version lisible de la vidéo… <span class="hint">quelques minutes pour un long match, une seule fois</span>'+STOP:'🎬 Préparation de la vidéo iPhone (HEVC/HDR)… <span class="hint">quasi instantané</span>'+STOP);
     let res=null;
-    try{ const d=new FormData(); d.append('path',path); d.append('pid',pid); res=await fetch(AI_BASE+'/import_convert',{method:'POST',body:d}).then(r=>r.json()); }catch(e){ res=null; }
+    try{ const d=new FormData(); d.append('path',path); d.append('pid',pid); if(force)d.append('force','1'); res=await fetch(AI_BASE+'/import_convert',{method:'POST',body:d}).then(r=>r.json()); }catch(e){ res=null; }
     polling=false; window._mlzConvPid=null;
     if(window._mlzConvCancelled){ return false; }   // arrêté par l'utilisateur -> message déjà affiché
     if(res&&res.ok&&res.url){
@@ -4626,12 +4746,13 @@ async function mlzConvertPath(path){
       // qui doit rester le fichier D'ORIGINE pleine résolution -> l'IA de calibrage/suivi lit toujours le 4K
       // d'origine (sinon elle lisait le proxy 1080p et la calibration se dégradait/figeait sur les HEVC).
       project.videoUrl=AI_BASE+res.url; if(res.path)project.videoConvPath=res.path; project.videoConverted=true;
+      project.videoConvKind=res.kind||(res.instant?'sdr':'conv'); window._mlzNeedRelinkHevc=false;
       try{ save(); }catch(e){}
-      aiBar('✅ Vidéo convertie — l\'image s\'affiche.'); setTimeout(aiBarHide,2600); return true;
+      aiBar(force?'✅ Version lisible prête — l\'image s\'affiche.':'✅ Vidéo convertie — l\'image s\'affiche. <span class="hint">Toujours noire ? Clique sur « 🔧 Image noire ? Réparer » en haut.</span>'); setTimeout(aiBarHide,force?2600:6000); return true;
     }
     aiBar('⚠️ Conversion impossible (moteur éteint ?). Sur ce format iPhone, le son marche mais pas l\'image.'); setTimeout(aiBarHide,6500); return false;
   }catch(e){ try{aiBarHide();}catch(_){} return false; }
-  finally{ window._mlzConvRunning=false; }
+  finally{ window._mlzConvRunning=false; try{ _mlzFixBtnRefresh(); }catch(e){} }
 }
 // Arrête la conversion en cours (bouton « Arrêter » ou changement de page).
 function mlzCancelConv(){
@@ -4655,18 +4776,35 @@ function _mlzFrameIsBlank(){
 // FILET : si la vidéo chargée a une DURÉE mais AUCUNE image (codec non décodable, ou iPhone HEVC/HDR qui
 // décode mais s'affiche NOIR), on déclenche la conversion (ou on propose de relier le fichier).
 try{ if(vid && !vid._mlzDecCheck){ vid._mlzDecCheck=true; vid.addEventListener('loadeddata',()=>{ try{
+  try{ _mlzFixBtnRefresh(); }catch(e){}
+  // s66 : déjà passée par la voie rapide (/sdr ou remux HEVC) mais le décodeur ne donne AUCUNE image -> on
+  // fabrique automatiquement le vrai proxy H.264 (une seule tentative par session et par vidéo).
+  if(vid.duration>0 && project && project.videoConverted && project.videoConvKind && project.videoConvKind!=='h264' && project.videoPath && !window._mlzForceTried){
+    setTimeout(()=>{ try{ if(vid.videoWidth===0 && !window._mlzConvRunning && !window._mlzForceTried){ window._mlzForceTried=true; mlzConvertPath(project.videoPath,{force:true}); } }catch(e){} },1500);
+  }
   if(vid.duration>0 && project && !project.videoConverted && !window._mlzConvBusy && (vid.videoWidth===0 || _mlzFrameIsBlank())){
     window._mlzConvBusy=true;
     const p=(project&&project.videoPath)||'';
     const done=()=>{ window._mlzConvBusy=false; };
     // Image réellement absente (écran noir) : si on a le chemin -> conversion ; sinon -> bannière « Relier ».
-    if(p){ mlzConvertPath(p).then(done,done); } else { try{ mlzShowRelinkBanner(); }catch(e){} done(); }
+    // s65 : (1) on CONFIRME après 1,5 s (la 1re image n'est pas toujours peinte à « loadeddata » -> fausses
+    // alertes au rechargement d'une vidéo iPhone) ; (2) sans chemin, le moteur RETROUVE le fichier tout seul
+    // (nom + taille) et le convertit ; la bannière n'apparaît que s'il est vraiment introuvable.
+    setTimeout(async()=>{ try{
+      if(!(vid.videoWidth===0 || _mlzFrameIsBlank()) || (project&&project.videoConverted)){ done(); return; }
+      if(p){ mlzConvertPath(p).then(done,done); return; }
+      let lp='';
+      try{ if(project&&project.videoName){ const fd=new FormData(); fd.append('name',project.videoName); fd.append('size',String(project.videoSize||0)); fd.append('mime','import');
+          const lr=await fetch(AI_BASE+'/locate_file',{method:'POST',body:fd}).then(x=>x.json()).catch(()=>null); if(lr&&lr.ok&&lr.path)lp=lr.path; } }catch(e){}
+      if(lp){ try{ project.videoPath=lp; save(); }catch(e){} mlzConvertPath(lp).then(done,done); return; }
+      try{ mlzShowRelinkBanner(); }catch(e){} done();
+    }catch(e){ done(); } },1500);
   }
 }catch(e){} });
   // MASQUAGE AUTO du bandeau « Relier » : dès qu'une VRAIE image s'affiche (non noire), on le retire.
   // -> pour un fichier qui s'affiche bien (ex. Veo), le bandeau déclenché sur une 1re image noire DISPARAÎT
   //    tout seul au lieu de rester collé sur la timeline. S'il reste vraiment noir (iPhone sans chemin), il reste.
-  const _mlzHideRelinkIfVisible=()=>{ try{ if(window._mlzRelinkShown && vid.videoWidth>0 && !_mlzFrameIsBlank()){ try{aiBarHide();}catch(e){} window._mlzRelinkShown=false; } }catch(e){} };
+  const _mlzHideRelinkIfVisible=()=>{ try{ if(window._mlzRelinkShown && !window._mlzNeedRelinkHevc && vid.videoWidth>0 && !_mlzFrameIsBlank()){ try{aiBarHide();}catch(e){} window._mlzRelinkShown=false; } }catch(e){} };
   vid.addEventListener('timeupdate',_mlzHideRelinkIfVisible);
   vid.addEventListener('playing',_mlzHideRelinkIfVisible);
   vid.addEventListener('seeked',_mlzHideRelinkIfVisible);
@@ -4684,10 +4822,24 @@ async function reconnectMainVideoHandle(viaGesture){
   if(p==='denied')return 'denied';
   if(p!=='granted')return 'prompt';
   let f=null; try{ f=await h.getFile(); }catch(e){ return 'moved'; }
-  try{ vid.src=URL.createObjectURL(f); project.videoName=f.name; project.videoSize=f.size; _seekOnce=project.lastTime||0; refreshVidBtn(); }catch(e){ return 'moved'; }
+  let _conv=false;
+  try{ _conv=_mlzSetMainSrc(f); project.videoName=f.name; project.videoSize=f.size; _seekOnce=project.lastTime||0; refreshVidBtn(); }catch(e){ return 'moved'; }
   try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; save(); } }catch(e){}   // lecture directe moteur (pas d'envoi)
-  mlzAutoConvert(f);
+  if(!_conv) mlzAutoConvert(f);
   return true;
+}
+// s65 : vidéo déjà convertie (iPhone HEVC/HDR) -> on affiche DIRECTEMENT la version convertie au lieu de
+// recharger l'original (écran noir le temps de reconvertir = cause du faux « Vidéo introuvable »). Si la
+// version convertie a été nettoyée du cache, repli automatique sur l'original + reconversion.
+function _mlzSetMainSrc(f){
+  if(project && project.videoConverted && project.videoUrl){
+    const onErr=()=>{ try{ vid.removeEventListener('loadeddata',onOk); }catch(e){} try{ project.videoConverted=false; project.videoUrl=''; save(); }catch(e){} try{ vid.src=URL.createObjectURL(f); vid.load(); }catch(e){} try{ mlzAutoConvert(f); }catch(e){} };
+    const onOk=()=>{ try{ vid.removeEventListener('error',onErr); }catch(e){} };
+    vid.addEventListener('error',onErr,{once:true}); vid.addEventListener('loadeddata',onOk,{once:true});
+    try{ vid.src=project.videoUrl; vid.load(); }catch(e){ onErr(); }
+    return true;
+  }
+  vid.src=URL.createObjectURL(f); return false;
 }
 // Au redémarrage, l'autorisation du fichier est perdue ; on la ré-obtient au PREMIER clic/touche dans l'app,
 // puis on charge la vidéo automatiquement — l'utilisateur n'a rien à re-sélectionner.
@@ -4712,7 +4864,7 @@ async function tryAutoVideo(){
   // par rapport au WebM que calibre le serveur, ce qui faisait « glisser » les points (bug Essai/Sénégal).
   if(project.videoBlobId){ const rec=await dbGet('blobs',project.videoBlobId); if(rec&&rec.blob){ vid.src=URL.createObjectURL(rec.blob); _seekOnce=project.lastTime||0; refreshVidBtn(); return; } }
   if(project.videoHandleId){ const rec=await dbGet('blobs',project.videoHandleId); const h=rec&&rec.handle; if(h){ let perm='prompt'; try{ perm=await h.queryPermission({mode:'read'}); }catch(e){}
-      if(perm==='granted'){ try{ const f=await h.getFile(); vid.src=URL.createObjectURL(f); _seekOnce=project.lastTime||0; refreshVidBtn(); try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; save(); } }catch(e){} mlzAutoConvert(f); return; }catch(e){ $('loadVid').textContent='🎬 Retrouver «'+(project.videoName||'')+'»'; } }
+      if(perm==='granted'){ try{ const f=await h.getFile(); const _conv=_mlzSetMainSrc(f); _seekOnce=project.lastTime||0; refreshVidBtn(); try{ const _p=_filePath(f); if(_p){ project.videoPath=_p; save(); } }catch(e){} if(!_conv) mlzAutoConvert(f); return; }catch(e){ $('loadVid').textContent='🎬 Retrouver «'+(project.videoName||'')+'»'; } }
       else { // autorisation perdue au redémarrage -> on la récupère au 1er clic et on charge tout seul (aucune re-sélection).
         $('loadVid').textContent='🎬 '+(project.videoName||'Vidéo'); _armMainVideoAutoReconnect(); return; } } }
   if(project.videoUrl){ try{ vid.src=project.videoUrl; _seekOnce=project.lastTime||0; refreshVidBtn(); return; }catch(e){} }
@@ -4726,7 +4878,7 @@ async function relinkMainVideo(h,f){ try{
     if(h){ try{ await dbPut('blobs',{id:hid,handle:h}); }catch(e){} }   // h peut être null (champ de fichier de secours) -> on garde le chemin
     if(f&&f.name)project.videoName=f.name; if(f&&f.size)project.videoSize=f.size;
     try{ const _p=_filePath(f); if(_p)project.videoPath=_p; }catch(e){}
-    project.videoRef=true; project.videoConverted=false; project.videoUrl='';
+    project.videoRef=true; project.videoConverted=false; project.videoUrl=''; project.videoConvKind=''; window._mlzForceTried=false;
     try{ save(); }catch(e){}
     try{ vid.src=URL.createObjectURL(f); _seekOnce=project.lastTime||0; refreshVidBtn(); }catch(e){}
     try{ await mlzAutoConvert(f); }catch(e){}
@@ -8737,7 +8889,7 @@ async function boardGalleryOpen(){
   g.querySelector('#bgNew').onclick=()=>{ const nm=(g.querySelector('#bgName').value||'Tableau tactique').trim()||'Tableau tactique'; g.style.display='none'; openBoard(boardNewAction(nm)); };
   grid.querySelectorAll('.bgcard').forEach(card=>{ card.onclick=async(ev)=>{ if(ev.target.closest('.bgdel')||ev.target.closest('.bgren'))return; const entry=await dbGet('boards',card.dataset.id); if(!entry)return; g.style.display='none'; const a=JSON.parse(JSON.stringify(entry.data)); a._board=true; a._libId=entry.id; a.name=entry.name; openBoard(a); }; });
   grid.querySelectorAll('.bgdel').forEach(b=>b.onclick=async(ev)=>{ ev.stopPropagation(); if(!confirm('Supprimer définitivement ce tableau tactique ?'))return; await boardLibDelete(b.dataset.id); boardGalleryOpen(); });
-  grid.querySelectorAll('.bgren').forEach(b=>b.onclick=async(ev)=>{ ev.stopPropagation(); const entry=await dbGet('boards',b.dataset.id); if(!entry)return; const nn=prompt('Nouveau nom :',entry.name||'Tableau tactique'); if(nn==null)return; entry.name=nn.trim()||entry.name; entry.updated=Date.now(); await dbPut('boards',entry); boardGalleryOpen(); });
+  grid.querySelectorAll('.bgren').forEach(b=>b.onclick=async(ev)=>{ ev.stopPropagation(); const entry=await dbGet('boards',b.dataset.id); if(!entry)return; const nn=await mlzPrompt('Nouveau nom :',entry.name||'Tableau tactique'); if(nn==null)return; entry.name=nn.trim()||entry.name; entry.updated=Date.now(); await dbPut('boards',entry); boardGalleryOpen(); });
 }
 function boardGalleryClose(){ const g=document.getElementById('boardGallery'); if(g)g.style.display='none'; }
 function openBoard(existing){
@@ -8847,7 +8999,7 @@ async function montageGalleryOpen(){ if(!project)ensureScratchProject();
     try{ mstat&&mstat('Montage du dossier retiré de la liste (dossier conservé).'); }catch(e){} montageGalleryOpen(); });
   grid.querySelectorAll('.mgcard').forEach(card=>{ card.onclick=(ev)=>{ if(ev.target.closest('.mgdel')||ev.target.closest('.mgren'))return; openMontageDoc(card.dataset.id); }; });
   grid.querySelectorAll('.mgdel').forEach(b=>b.onclick=async(ev)=>{ ev.stopPropagation(); if(!confirm('Supprimer ce montage de ta bibliothèque ?'))return; await montLibDelete(b.dataset.id); if(_montDoc===b.dataset.id)_montDoc=null; montageGalleryOpen(); });
-  grid.querySelectorAll('.mgren').forEach(b=>b.onclick=async(ev)=>{ ev.stopPropagation(); const d=await dbGet('montages',b.dataset.id); if(!d)return; const nn=prompt('Nouveau nom :',d.name||'Montage'); if(nn==null)return; d.name=nn.trim()||d.name; d.updated=Date.now(); if(_montDoc===d.id)window._montName=d.name; await dbPut('montages',d); montageGalleryOpen(); });
+  grid.querySelectorAll('.mgren').forEach(b=>b.onclick=async(ev)=>{ ev.stopPropagation(); const d=await dbGet('montages',b.dataset.id); if(!d)return; const nn=await mlzPrompt('Nouveau nom :',d.name||'Montage'); if(nn==null)return; d.name=nn.trim()||d.name; d.updated=Date.now(); if(_montDoc===d.id)window._montName=d.name; await dbPut('montages',d); montageGalleryOpen(); });
 }
 // ===== ONGLET « JOUEURS & ÉQUIPES » : gestion globale (créer, photo, infos), indépendant des dossiers =====
 let _pp={ selId:null, selKind:null, all:[], qP:'', qT:'' };
@@ -8890,8 +9042,8 @@ async function openPlayersPage(){ let ov=document.getElementById('playersPage');
       +'<div style="width:330px;flex:none;overflow:auto;padding:14px;border-left:1px solid #1e262c" id="ppDetails"></div>'
     +'</div>';
   document.getElementById('ppClose').onclick=()=>{ ov.style.display='none'; try{navTo('home');}catch(e){} };
-  document.getElementById('ppNewPlayer').onclick=async()=>{ const nom=prompt('Nom du joueur :'); if(nom===null)return; const prenom=prompt('Prénom :')||''; const p={id:uid(),nom:(nom||'').trim()||'Joueur',prenom:(prenom||'').trim(),poste:'',club:'',pied:'',taille:'',poids:'',photo:'',teamId:null,created:Date.now()}; await dbPut('players',p); _pp.selId=p.id; _pp.selKind='player'; await ppRefresh(); };
-  document.getElementById('ppNewTeam').onclick=async()=>{ const nom=prompt('Nom de l\'équipe :'); if(nom===null)return; const n=(nom||'').trim(); if(!n)return; const p={id:uid(),kind:'team',nom:n,info:'',photo:'',dob:'',created:Date.now()}; await dbPut('players',p); _pp.selId=p.id; _pp.selKind='team'; await ppRefresh(); };
+  document.getElementById('ppNewPlayer').onclick=async()=>{ const _r=await mlzForm('Ajouter un joueur',[{key:'nom',label:'Nom du joueur',placeholder:'ex. Martin'},{key:'prenom',label:'Prénom',placeholder:'ex. Roméo'}],'Ajouter'); if(!_r)return; const nom=_r.nom; const prenom=_r.prenom||''; const p={id:uid(),nom:(nom||'').trim()||'Joueur',prenom:(prenom||'').trim(),poste:'',club:'',pied:'',taille:'',poids:'',photo:'',teamId:null,created:Date.now()}; await dbPut('players',p); _pp.selId=p.id; _pp.selKind='player'; await ppRefresh(); };
+  document.getElementById('ppNewTeam').onclick=async()=>{ const nom=await mlzPrompt('Nom de l\'équipe :'); if(nom===null)return; const n=(nom||'').trim(); if(!n)return; const p={id:uid(),kind:'team',nom:n,info:'',photo:'',dob:'',created:Date.now()}; await dbPut('players',p); _pp.selId=p.id; _pp.selKind='team'; await ppRefresh(); };
   document.getElementById('ppqP').oninput=e=>{ _pp.qP=e.target.value; ppRenderLists(); };
   document.getElementById('ppqT').oninput=e=>{ _pp.qT=e.target.value; ppRenderLists(); };
   await ppRefresh();
@@ -11450,7 +11602,7 @@ async function montageFreeze(){ const c=topVideoClipAt(mPlayT);
       if(!_b){ await drawStaticAt(mPlayT); _b=await new Promise(res=>{ try{ _mcv.toBlob(res,'image/jpeg',0.92); }catch(e){ res(null); } }); }
       if(_b){ _fimg=uid(); await dbPut('blobs',{id:_fimg,blob:_b}); }
     }catch(e){}
-    const fz={id:'fz_'+uid(), src:+srcT.toFixed(3), dur:2.0, annotations:[]}; if(_fimg)fz.imgId=_fimg;
+    const fz={id:'fz_'+uid(), src:+srcT.toFixed(3), dur:2.0, annotations:[]}; if(_fimg){ fz.imgId=_fimg; fz.capX=_fzCapOf(c); }
     c.freezes.push(fz); c.dur=+(c.dur+fz.dur).toFixed(3);
     rippleTrack(c.track); mtlSel=c; mtlSelSet.clear(); mtlSelSet.add(c.id);
     mAssetsDirty=true; save(); renderMTL(); showParam();
@@ -11468,7 +11620,7 @@ async function montageFreeze(){ const c=topVideoClipAt(mPlayT);
     if(!blob){ mstat('Impossible de capturer la frame — relance la lecture puis réessaie.'); return; }
     const imgId=uid(); await dbPut('blobs',{id:imgId,blob});
     if(!a.freezes)a.freezes=[];
-    const fz={id:uid(), time:+srcT.toFixed(3), imgId, annotations:[], states:[{dur:2}]};
+    const fz={id:uid(), time:+srcT.toFixed(3), imgId, annotations:[], states:[{dur:2}], capX:_fzCapOf(c)};
     a.freezes.push(fz);
     c.dur=planAnalytic(a,c.voiceDur||0).dur/(c.speed||1); rippleTrack(c.track);
     mtlSel=c; mtlSelSet.clear(); mtlSelSet.add(c.id);
@@ -12247,7 +12399,18 @@ function setRenderDims(){
 function drawContain(src,sw,sh){ if(!sw||!sh)return; const sc=Math.min(RW/sw,RH/sh); const w=sw*sc,h=sh*sc; try{rctx.drawImage(src,(RW-w)/2,(RH-h)/2,w,h);}catch(e){} }
 // Transformation d'affichage d'un ARRÊT SUR IMAGE : par défaut il REPREND le zoom/position du clip (aucun saut
 // à l'entrée/sortie du gel) ; s'il a ses propres valeurs (fz.zoom/panX/panY/rot), elles priment.
-function _fzXform(fz,c){ c=c||{}; return { zoom:(fz&&fz.zoom!=null)?fz.zoom:c.zoom, panX:(fz&&fz.panX!=null)?fz.panX:c.panX, panY:(fz&&fz.panY!=null)?fz.panY:c.panY, rot:(fz&&fz.rot!=null)?fz.rot:c.rot, opacity:c.opacity }; }
+function _fzXform(fz,c){ c=c||{};
+  const zf=(fz&&fz.zoom!=null)?fz.zoom:c.zoom, pxf=(fz&&fz.panX!=null)?fz.panX:c.panX, pyf=(fz&&fz.panY!=null)?fz.panY:c.panY, rf=(fz&&fz.rot!=null)?fz.rot:c.rot;
+  // s65 : image du gel capturée TELLE QU'AFFICHÉE dans le montage (déjà zoomée/décalée par le clip) -> on
+  // n'applique que la DIFFÉRENCE avec ce cadrage, sinon le zoom était appliqué 2 fois (le gel « grossissait »).
+  // Sans réglage propre au gel (ou après « Reprendre le zoom du clip ») : différence nulle = cadrage identique.
+  const cap=fz&&fz.capX;
+  if(cap){ const zc=cap.zoom||1, zr=(zf||1)/zc;
+    return { zoom:zr, panX:(pxf||0)-zr*(cap.panX||0), panY:(pyf||0)-zr*(cap.panY||0), rot:(rf||0)-(cap.rot||0),
+             opacity:((cap.op!=null&&cap.op<1)?1:c.opacity) }; }
+  return { zoom:zf, panX:pxf, panY:pyf, rot:rf, opacity:c.opacity }; }
+// s65 : cadrage du clip au moment où l'image du gel est capturée depuis l'aperçu du montage
+function _fzCapOf(c){ c=c||{}; return { zoom:c.zoom||1, panX:c.panX||0, panY:c.panY||0, rot:c.rot||0, op:(c.opacity!=null?c.opacity:1) }; }
 function drawClip(src,sw,sh,c){ if(!sw||!sh)return; const z=(c&&c.zoom)||1, px=(c&&c.panX)||0, py=(c&&c.panY)||0, rot=(c&&c.rot)||0, op=(c&&c.opacity!=null)?c.opacity:1;
   if(z===1&&!px&&!py&&!rot&&op===1){ drawContain(src,sw,sh); return; }
   rctx.save(); rctx.globalAlpha=op; rctx.translate(RW/2,RH/2); if(rot)rctx.rotate(rot*Math.PI/180); rctx.translate(px*RW/2,py*RH/2);

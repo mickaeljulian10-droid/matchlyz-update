@@ -45,7 +45,7 @@ WORK = _pick_work_dir()
 WORK.mkdir(parents=True, exist_ok=True)
 # Version du MOTEUR : renvoyée à la fin du rendu pour vérifier que le serveur qui tourne est bien à jour
 # (dessins en parallèle). Si le popup n'affiche PAS cette version, c'est qu'un ancien moteur est resté actif.
-SERVER_VERSION = "s64-rendu-progression"
+SERVER_VERSION = "s66-iphone-affichage"
 _LAST_ENC = "?"   # dernier encodeur vidéo utilisé (h264_videotoolbox = GPU, libx264 = CPU)
 _LAST_WM = "?"    # dernier état filigrane : on=incrusté · none=aucun wm.png · fail=échec (vidéo d'origine gardée)
 _LAST_WMERR = ""  # dernière erreur ffmpeg du filigrane (diagnostic)
@@ -3307,19 +3307,21 @@ def _vinfo_needs_h264(info):
         return False
     return True
 
-def _conv_out_for(path):
+def _conv_out_for(path, tag=""):
     import hashlib
     try:
         st = os.stat(path); key = "%s|%d|%d" % (os.path.abspath(path), st.st_size, int(st.st_mtime))
     except Exception:
         key = os.path.abspath(path or "")
     h = hashlib.sha1(key.encode("utf-8", "ignore")).hexdigest()[:16]
-    return CONV / (h + ".mp4")
+    return CONV / (h + (tag or "") + ".mp4")
 
-def _convert_to_h264(vpath, pid="", target_h=1080):
+def _convert_to_h264(vpath, pid="", target_h=1080, force_h264=False):
     """Transcode vpath -> H.264 8 bits SDR (<=1080p), tonemap HDR->SDR si besoin, progression -> _cp(pid).
-    Essaie videotoolbox (GPU Apple) puis libx264 ; tonemap zscale puis repli simple. Cache réutilisé."""
-    out = _conv_out_for(vpath)
+    Essaie videotoolbox (GPU Apple) puis libx264 ; tonemap zscale puis repli simple. Cache réutilisé.
+    s66 : force_h264=True -> VRAI proxy H.264 (on saute le remux HEVC, qui garde le HEVC et peut rester
+    noir dans l'app) ; fichier de cache distinct (suffixe _h264) pour ne pas réutiliser un remux HEVC."""
+    out = _conv_out_for(vpath, "_h264" if force_h264 else "")
     if out.exists() and out.stat().st_size > 0 and _mp4_ok(str(out)):
         _cp(pid, 100, "déjà converti"); return str(out)
     info = _probe_vinfo(vpath)
@@ -3332,7 +3334,7 @@ def _convert_to_h264(vpath, pid="", target_h=1080):
     # ===== CAS RAPIDE (iPhone HEVC/HDR) : on RETIRE juste l'étiquette HDR, SANS ré-encoder =====
     # L'app décode le HEVC (8 et 10 bits) ; c'est uniquement le tag HDR qui la fait planter en noir.
     # On recopie le flux (quasi instantané) en réécrivant les métadonnées couleur en BT.709 (SDR).
-    if codec in ("hevc", "h265"):
+    if codec in ("hevc", "h265") and not force_h264:
         # On retire les données Dolby Vision (NAL 62/63) PUIS on réécrit l'étiquette couleur en BT.709 (SDR).
         # Sans ré-encodage -> rapide. Si un essai échoue, on log l'erreur ffmpeg dans le Terminal.
         bsf_chain = ("filter_units=remove_types=62|63,"
@@ -3394,7 +3396,7 @@ def _convert_to_h264(vpath, pid="", target_h=1080):
                     with open(errlog) as _f: _tail = _f.read()[-600:]
                     print("  [remux HEVC ÉCHEC] (%s)\n%s" % (os.path.basename(ff), _tail), flush=True)
                 except Exception: pass
-    scale = "scale=-2:%d" % int(target_h)
+    scale = "scale=-2:'min(%d,ih)'" % int(target_h)   # s66 : jamais d'agrandissement (720p reste 720p)
     vf_tonemap = (scale + ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                   "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
     vf_simple  = scale + ",format=yuv420p"
@@ -3785,16 +3787,36 @@ async def import_check(path: str = Form(...)):
     if not path or not os.path.exists(path):
         return {"ok": False, "error": "introuvable"}
     info = await asyncio.to_thread(_probe_vinfo, path)
+    try:
+        print("import_check : %s -> codec=%s pix=%s trc=%s %sx%s needs=%s" % (os.path.basename(path), info.get("codec_name", ""),
+              info.get("pix_fmt", ""), info.get("color_transfer", ""), info.get("width", ""), info.get("height", ""),
+              _vinfo_needs_h264(info)), flush=True)
+    except Exception:
+        pass
     return {"ok": True, "needs": _vinfo_needs_h264(info),
             "codec": info.get("codec_name", ""), "pix": info.get("pix_fmt", ""),
             "trc": info.get("color_transfer", ""), "w": info.get("width", ""), "h": info.get("height", "")}
 
+def _codec_of(path):
+    try:
+        return ((_probe_vinfo(path) or {}).get("codec_name") or "").lower()
+    except Exception:
+        return ""
+
 @app.post("/import_convert")
-async def import_convert(path: str = Form(...), pid: str = Form("")):
+async def import_convert(path: str = Form(...), pid: str = Form(""), force: str = Form("")):
     """Rend la vidéo AFFICHABLE. 1) Voie INSTANTANÉE (iPhone HEVC/HDR) : patch couleur à la volée, 0 recopie.
     2) Repli : transcodage H.264 en cache. Progression via /calib_progress?pid=…"""
     if not path or not os.path.exists(path):
         return JSONResponse({"ok": False, "error": "introuvable"}, status_code=404)
+    # s66 : « Réparer l'image » (bouton de l'app) ou image toujours noire après la voie rapide -> VRAI proxy H.264
+    # (1080p, GPU Apple), lisible partout. Plus lent que le patch instantané, mais fiable à 100 %.
+    if (force or "").strip().lower() in ("1", "true", "h264", "oui"):
+        print("import_convert : proxy H.264 FORCÉ pour %s" % os.path.basename(path), flush=True)
+        out = await asyncio.to_thread(_convert_to_h264, path, pid, 1080, True)
+        if not out:
+            return JSONResponse({"ok": False, "error": "conversion impossible"}, status_code=500)
+        return {"ok": True, "url": "/conv/" + os.path.basename(out), "path": out, "kind": "h264"}
     # HDR (HLG/HDR10) : l'écran noir vient de l'ÉTIQUETTE couleur -> voie INSTANTANÉE (patch moov, 0 recopie).
     # SDR : si c'est noir, c'est le bug d'overlay HEVC de Chromium -> le patch couleur n'y change rien,
     # il FAUT un vrai proxy H.264. On ne tente donc /sdr QUE pour l'HDR.
@@ -3810,12 +3832,16 @@ async def import_convert(path: str = Form(...), pid: str = Form("")):
             tok = None
         if tok:
             _cp(pid, 100, "prête")
-            return {"ok": True, "url": "/sdr/" + tok, "instant": True}
+            print("import_convert : voie instantanée /sdr (patch HDR) pour %s" % os.path.basename(path), flush=True)
+            return {"ok": True, "url": "/sdr/" + tok, "instant": True, "kind": "sdr"}
     # --- SDR HEVC / codecs exotiques : proxy H.264 (1080p, GPU, mis en cache et réutilisé) ---
     out = await asyncio.to_thread(_convert_to_h264, path, pid)
     if not out:
         return JSONResponse({"ok": False, "error": "conversion impossible"}, status_code=500)
-    return {"ok": True, "url": "/conv/" + os.path.basename(out), "path": out}
+    _k = await asyncio.to_thread(_codec_of, out)
+    print("import_convert : %s pour %s (codec sortie %s)" % ("proxy H.264" if _k == "h264" else "remux HEVC",
+          os.path.basename(path), _k or "?"), flush=True)
+    return {"ok": True, "url": "/conv/" + os.path.basename(out), "path": out, "kind": ("h264" if _k == "h264" else "remux")}
 
 @app.post("/import_convert_cancel")
 async def import_convert_cancel(pid: str = Form(...)):
@@ -4528,7 +4554,8 @@ def _seg_plan(d, segs, nframes):
             off = i - i0
             dts = float(s.get("dts") or (1.0 / 24.0))
             pieces.append({"t": "match", "i0": i, "n": j - i, "ts0": float(s["ts0"]) + off * dts, "dts": dts,
-                           "vk": str(s.get("vk") or ""), "ov": any((k in real_ov) for k in range(i, j))})
+                           "vk": str(s.get("vk") or ""), "ov": any((k in real_ov) for k in range(i, j)),
+                           "z": float(s.get("z") or 1.0), "px": float(s.get("px") or 0.0), "py": float(s.get("py") or 0.0)})
             i = j
         else:
             j = i
@@ -4603,6 +4630,28 @@ def _seg_ov_list(d, i0, n, fps, k):
 _SEG_SRCINFO = {}
 _SEG_SCALEVT = {}
 
+def _zoom_vf(w, h, z, px, py):
+    """s65 : reproduit EXACTEMENT le zoom/position d'un clip du montage (drawClip) sur une image déjà mise au
+    format w×h : agrandissement ×z autour du centre, décalé de (px·w/2, py·h/2), bords noirs si on sort de
+    l'image. Avant, un clip zoomé n'était PAS rendu par le moteur : chaque image était redessinée par l'app
+    (très lent, surtout avec une vidéo iPhone)."""
+    try:
+        z = float(z or 1.0); px = float(px or 0.0); py = float(py or 0.0)
+    except Exception:
+        return ""
+    if abs(z - 1.0) < 1e-4 and abs(px) < 1e-4 and abs(py) < 1e-4:
+        return ""
+    zw = max(2, int(round(w * z / 2.0)) * 2); zh = max(2, int(round(h * z / 2.0)) * 2)
+    x0 = zw / 2.0 - w / 2.0 - px * w / 2.0; y0 = zh / 2.0 - h / 2.0 - py * h / 2.0
+    pl = int(max(0.0, -x0) + 0.999); pt = int(max(0.0, -y0) + 0.999)
+    pr = int(max(0.0, x0 + w - zw) + 0.999); pb = int(max(0.0, y0 + h - zh) + 0.999)
+    vf = ",scale=%d:%d:flags=bicubic" % (zw, zh)
+    if pl or pt or pr or pb:
+        pl += pl % 2; pt += pt % 2; pr += pr % 2; pb += pb % 2
+        vf += ",pad=%d:%d:%d:%d:black" % (zw + pl + pr, zh + pt + pb, pl, pt)
+    vf += ",crop=%d:%d:%d:%d" % (w, h, int(round(x0 + pl)), int(round(y0 + pt)))
+    return vf
+
 def _seg_has_scale_vt(ff):
     """scale_vt = redimensionnement PAR LA PUCE GRAPHIQUE (ffmpeg 7+ sur Mac). Testé une fois par ffmpeg."""
     if ff in _SEG_SCALEVT:
@@ -4657,12 +4706,13 @@ def _seg_cmd(ff, pc, d, w, h, fps, vc, wm, hw, vkey):
             inputs += ["-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld",
                        "-ss", "%.4f" % pre, "-t", "%.4f" % span, "-i", src]
             fc.append(("[0:v]trim=start=%.4f,setpts=(PTS-STARTPTS)*%.6f,fps=%d,scale_vt=w=%d:h=%d,hwdownload,format=%s,"
-                       "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black,setsar=1,tpad=stop_mode=clone:stop_duration=3[b0]")
-                      % (fine, sp, fps, tw, th_, ("p010le" if ten else "nv12"), w, h))
+                       "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black,setsar=1%s,tpad=stop_mode=clone:stop_duration=3[b0]")
+                      % (fine, sp, fps, tw, th_, ("p010le" if ten else "nv12"), w, h,
+                         _zoom_vf(w, h, pc.get("z", 1), pc.get("px", 0), pc.get("py", 0))))
         else:
             inputs += (["-hwaccel", "videotoolbox"] if mode == "hw" else []) + ["-ss", "%.4f" % pre, "-t", "%.4f" % span, "-i", src]
-            fc.append("[0:v]trim=start=%.4f,setpts=(PTS-STARTPTS)*%.6f,fps=%d,%s,tpad=stop_mode=clone:stop_duration=3[b0]"
-                      % (fine, sp, fps, fit))
+            fc.append("[0:v]trim=start=%.4f,setpts=(PTS-STARTPTS)*%.6f,fps=%d,%s%s,tpad=stop_mode=clone:stop_duration=3[b0]"
+                      % (fine, sp, fps, fit, _zoom_vf(w, h, pc.get("z", 1), pc.get("px", 0), pc.get("py", 0))))
         cur = "b0"; nin = 1
         if pc.get("ov"):
             lst, _ne = _seg_ov_list(d, int(pc["i0"]), n, fps, pc["k"])
@@ -5582,7 +5632,7 @@ def render_match(sid: str = Form(...), vkey: str = Form(...),
             ts0 = float(seg["ts0"]); dts = float(seg["dts"]) or (1.0 / 24.0)
             rate = 1.0 / dts if dts > 0 else 24.0
             tmp = str(d / ("m_%d_%%06d.jpg" % i0))
-            vf = ("fps=%.6f," % rate) + vf_scale
+            vf = ("fps=%.6f," % rate) + vf_scale + _zoom_vf(w, h, seg.get("z", 1), seg.get("px", 0), seg.get("py", 0))
             # Fenêtre bornée par le TEMPS (pas par un nombre d'images) : plus robuste sur les zones à
             # timing irrégulier des WebM du direct. -ss AVANT -i (ffmpeg 6) = rapide ET précis.
             seg_dur = (count / rate) + 0.20 if rate > 0 else 1.0
