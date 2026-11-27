@@ -4212,6 +4212,30 @@ function _helpCSS(){ if(document.getElementById('helpCSS'))return; const s=docum
   s.textContent="#helpc{position:fixed;inset:0;z-index:200;background:linear-gradient(180deg,#0b0f0e,#070a09);color:#eaf5ef;display:flex;flex-direction:column;font-family:'Montserrat',Arial,sans-serif}#helpc .hh{display:flex;align-items:center;gap:10px;padding:12px 18px;border-bottom:1px solid rgba(0,224,143,.25);background:#0a0d0c}#helpc .hh b{font-size:17px;color:var(--accent)}#helpc .hh .x{margin-left:auto;background:none;border:1px solid var(--line);color:#eaf5ef;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:14px}#helpc .ask{padding:16px 18px;border-bottom:1px solid rgba(255,255,255,.06)}#helpc .askbox{display:flex;gap:8px;max-width:820px;margin:0 auto}#helpc .askbox input{flex:1;background:#12181a;border:1px solid var(--line);border-radius:12px;color:#fff;padding:13px 16px;font-size:15px;outline:none}#helpc .askbox input:focus{border-color:var(--accent)}#helpc .askbox button{background:linear-gradient(180deg,#00e08f,#00b873);color:#062117;border:none;border-radius:12px;padding:0 18px;font-weight:800;cursor:pointer;font-size:14px}#helpc .hint2{max-width:820px;margin:8px auto 0;font-size:12px;color:#8fb0a4;text-align:center}#helpc .bd{flex:1;display:flex;min-height:0}#helpc .side{width:230px;flex:none;border-right:1px solid rgba(255,255,255,.06);overflow:auto;padding:10px}#helpc .side .cat{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#7fae9b;margin:12px 8px 4px}#helpc .side .art{padding:8px 10px;border-radius:8px;cursor:pointer;font-size:13px;color:#cfe6db}#helpc .side .art:hover{background:rgba(0,224,143,.08)}#helpc .side .art.on{background:rgba(0,224,143,.16);color:#fff}#helpc .main{flex:1;overflow:auto;padding:24px 30px}#helpc .main h2{color:var(--accent);font-size:20px;margin:0 0 4px}#helpc .main .meta{font-size:11px;color:#7fae9b;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px}#helpc .main .art-body{max-width:720px;font-size:14.5px;line-height:1.6;color:#dfeee7}#helpc .main .art-body ol,#helpc .main .art-body ul{padding-left:22px}#helpc .main .art-body li{margin:5px 0}#helpc .main .art-body b{color:#fff}#helpc .ansrel{max-width:720px;margin-top:22px;border-top:1px solid rgba(255,255,255,.08);padding-top:14px}#helpc .ansrel .rt{font-size:12px;color:#7fae9b;margin-bottom:8px}#helpc .ansrel a{display:inline-block;background:rgba(0,224,143,.1);border:1px solid rgba(0,224,143,.3);color:#bff3dc;border-radius:20px;padding:5px 12px;margin:0 6px 6px 0;font-size:12.5px;cursor:pointer;text-decoration:none}#helpc .nofind{max-width:720px;background:rgba(255,176,60,.1);border:1px solid rgba(255,176,60,.4);border-radius:12px;padding:16px;color:#ffcf99}#helpc .nofind a{color:var(--accent)}"; document.head.appendChild(s); }
 function _helpCSS2(){ if(document.getElementById('helpCSS2'))return; const s=document.createElement('style'); s.id='helpCSS2';
   s.textContent="#helpc .hfilter{margin-left:auto;background:#12181a;border:1px solid var(--line);border-radius:10px;color:#fff;padding:8px 12px;font-size:13px;outline:none;width:200px;max-width:40vw}#helpc .hfilter:focus{border-color:var(--accent)}#helpc .bd2{flex:1;overflow:auto;padding:16px;max-width:880px;width:100%;margin:0 auto;box-sizing:border-box}#helpc .theme{border:1px solid rgba(255,255,255,.08);border-radius:12px;margin:0 0 12px;overflow:hidden;background:rgba(255,255,255,.02)}#helpc .theme .th{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#0e1413;border:none;color:#eaf5ef;padding:14px 16px;cursor:pointer;font-size:15px;font-weight:800;font-family:inherit;text-align:left}#helpc .theme .th:hover{background:#121a18}#helpc .theme .thc{color:var(--accent);transition:transform .2s;font-size:12px}#helpc .theme.open .thc{transform:rotate(180deg)}#helpc .theme .qs{display:none;padding:2px 10px 10px}#helpc .theme.open .qs{display:block}#helpc .qitem{border-top:1px solid rgba(255,255,255,.05)}#helpc .qitem .q{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 8px;cursor:pointer;font-size:14px;color:#cfe6db}#helpc .qitem .q:hover{color:#fff}#helpc .qitem .qc{color:#7fae9b;transition:transform .2s;font-size:12px}#helpc .qitem.open .qc{transform:rotate(180deg)}#helpc .qitem .a{display:none;padding:2px 8px 14px;font-size:14px;line-height:1.6;color:#dfeee7;max-width:760px}#helpc .qitem.open .a{display:block}#helpc .qitem .a ol,#helpc .qitem .a ul{padding-left:22px}#helpc .qitem .a li{margin:5px 0}#helpc .qitem .a b{color:#fff}#helpc .supportbar{margin:18px 4px 10px;font-size:13px;color:#8fb0a4;text-align:center}#helpc .supportbar a{color:var(--accent)}"; document.head.appendChild(s); }
+/* MLZ-AIDE-EN-LIGNE */
+const MLZ_HELP_URL='https://matchlyz.com/aide.html?app=1';
+function openHelpWeb(){
+  // Aide en ligne en français ; sinon (hors ligne, autre langue) : aide intégrée
+  if((window.LANG&&window.LANG!=='fr')||!navigator.onLine) return openHelpCenter();
+  let w=document.getElementById('helpweb'); if(w) w.remove();
+  w=document.createElement('div'); w.id='helpweb';
+  w.style.cssText='position:fixed;inset:0;z-index:99999;background:#0b0f0e;display:flex;flex-direction:column';
+  w.innerHTML='<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #1d2a24;background:#0b0f0e">'
+    +'<b style="font-size:15px;color:#eafff5">🛠 Aide MatchLyz</b><span style="flex:1"></span>'
+    +'<button class="btn" id="helpwebOff" title="Aide sans connexion">Aide hors ligne</button>'
+    +'<button class="btn" id="helpwebX">✕ Fermer</button></div>'
+    +'<div id="helpwebLd" style="position:absolute;top:60px;left:0;right:0;text-align:center;color:#8aa197;font-size:14px">Chargement de l\'aide…</div>'
+    +'<iframe id="helpwebF" src="'+MLZ_HELP_URL+'" style="flex:1;border:0;width:100%;background:#0b0f0e" allow="clipboard-write"></iframe>';
+  document.body.appendChild(w);
+  let ok=false; const f=w.querySelector('#helpwebF');
+  const close=()=>{ w.remove(); document.removeEventListener('keydown',esc,true); };
+  const esc=e=>{ if(e.key==='Escape'){ e.stopPropagation(); close(); } };
+  document.addEventListener('keydown',esc,true);
+  f.onload=()=>{ ok=true; const l=w.querySelector('#helpwebLd'); if(l) l.remove(); };
+  setTimeout(()=>{ if(!ok&&document.body.contains(w)){ close(); openHelpCenter(); } },10000);   // site injoignable : aide intégrée
+  w.querySelector('#helpwebX').onclick=close;
+  w.querySelector('#helpwebOff').onclick=()=>{ close(); openHelpCenter(); };
+}
 function openHelpCenter(){ _helpCSS(); _helpCSS2(); let w=document.getElementById('helpc'); if(w)w.remove();
   w=document.createElement('div'); w.id='helpc';
   const cats=[...new Set(HELP_KB.map(e=>e.cat))];
@@ -4335,7 +4359,7 @@ function openSettings(){
         <div class="setSub">💬 Tu ne trouves pas ta réponse ? Un lien de contact est disponible en bas du panneau.</div></div>
         <div class="setSec"><h4>À propos</h4>
         <div class="setSub"><b>MatchLyz</b> — by Foot Session<br>Analyse vidéo, montage, Suivi IA & mappage terrain, tag en direct.</div></div>`;
-      $('setHelp').onclick=()=>{ try{$('ovrl').classList.add('hidden');}catch(e){} openHelpCenter(); };
+      $('setHelp').onclick=()=>{ try{$('ovrl').classList.add('hidden');}catch(e){} openHelpWeb(); };
     }
   }
   menu.querySelectorAll('.setCat').forEach(b=>b.onclick=()=>render(b.dataset.cat));
