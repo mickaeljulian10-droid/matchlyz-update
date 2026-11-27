@@ -45,7 +45,7 @@ WORK = _pick_work_dir()
 WORK.mkdir(parents=True, exist_ok=True)
 # Version du MOTEUR : renvoyée à la fin du rendu pour vérifier que le serveur qui tourne est bien à jour
 # (dessins en parallèle). Si le popup n'affiche PAS cette version, c'est qu'un ancien moteur est resté actif.
-SERVER_VERSION = "s66-iphone-affichage"
+SERVER_VERSION = "s68-calibrage-rapide"
 _LAST_ENC = "?"   # dernier encodeur vidéo utilisé (h264_videotoolbox = GPU, libx264 = CPU)
 _LAST_WM = "?"    # dernier état filigrane : on=incrusté · none=aucun wm.png · fail=échec (vidéo d'origine gardée)
 _LAST_WMERR = ""  # dernière erreur ffmpeg du filigrane (diagnostic)
@@ -378,16 +378,27 @@ def _suivi_exit():
     except Exception: pass
 def _gpu_busy():
     with _SUIVI_LOCK: return _SUIVI_ACTIVE > 0
+_CAL_KEEP = [0]   # s68 : >0 pendant un calibrage -> on GARDE la mémoire GPU entre les images (vidée une fois à la fin)
 def _gpu_sync():
     """Force le GPU Apple à TERMINER le calcul en cours avant de rendre la main. Sans ça, une prédiction peut
     rendre la main pendant que le GPU travaille encore -> la suivante démarre dessus -> « command encoder
-    already encoding » -> moteur tué. À appeler dans le verrou, juste après chaque predict."""
+    already encoding » -> moteur tué. À appeler dans le verrou, juste après chaque predict.
+    s68 : pendant un calibrage, on ne VIDE plus la mémoire GPU 3 fois par image (tout devait être réalloué à
+    l'image suivante, très lent sur un Mac à mémoire limitée) : la synchro reste, le vidage se fait une fois à la fin."""
     try:
         import torch
         if hasattr(torch, "mps") and torch.backends.mps.is_available():
             torch.mps.synchronize()
-            try: torch.mps.empty_cache()   # libère la mémoire GPU accumulée -> évite la saturation au recalage
-            except Exception: pass
+            if _CAL_KEEP[0] <= 0:
+                try: torch.mps.empty_cache()   # libère la mémoire GPU accumulée -> évite la saturation au recalage
+                except Exception: pass
+    except Exception:
+        pass
+def _gpu_free():
+    try:
+        import torch
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.synchronize(); torch.mps.empty_cache()
     except Exception:
         pass
 def get_player_model():
@@ -1119,6 +1130,64 @@ def _white_dt(small):
 def line_snap(dt, corners_px):
     """RECALAGE SUR LES LIGNES : ajuste (décalage + échelle en espace image) la projection du terrain
     pour la coller au mieux sur les lignes blanches réelles. Ne déforme pas (garde la perspective de
+    l'ancre), pousse juste le terrain sur le blanc. Renvoie (nouveaux_coins_px, residu_px).
+    s68 : MÊME recherche (mêmes angles, échelles, décalages, même coût, même ordre de choix), mais tous les
+    décalages d'un couple angle/échelle sont évalués d'un coup (numpy) au lieu d'une boucle Python
+    -> résultat IDENTIQUE, calcul bien plus rapide (l'ancienne version reste en repli : _line_snap_ref)."""
+    try:
+        return _line_snap_fast(dt, corners_px)
+    except Exception:
+        return _line_snap_ref(dt, corners_px)
+
+def _line_snap_fast(dt, corners_px):
+    import cv2, numpy as np
+    global _PITCH_PTS
+    if _PITCH_PTS is None: _PITCH_PTS = _pitch_line_pts()
+    Hh, Ww = dt.shape[:2]
+    src = np.array([[0, 0], [105, 0], [105, 68], [0, 68]], dtype="float32")
+    dst = np.array(corners_px, dtype="float32")
+    try: Hf = cv2.getPerspectiveTransform(src, dst)
+    except Exception: return corners_px, None
+    P = cv2.perspectiveTransform(_PITCH_PTS.reshape(-1, 1, 2), Hf).reshape(-1, 2)
+    inb = (P[:, 0] >= 0) & (P[:, 0] < Ww) & (P[:, 1] >= 0) & (P[:, 1] < Hh)
+    P = P[inb]
+    if len(P) < 25: return corners_px, None
+    cen = P.mean(axis=0)
+    def _R(th):
+        c = np.cos(th); s = np.sin(th); return np.array([[c, -s], [s, c]])
+    def costs(s, th, dxs, dys):
+        # mêmes opérations que cost(dx,dy,s,th), pour une grille de décalages (ordre dx puis dy)
+        B = cen + s * ((P - cen) @ _R(th).T)
+        DX = np.repeat(np.asarray(dxs, dtype="float64"), len(dys)); DY = np.tile(np.asarray(dys, dtype="float64"), len(dxs))
+        Qx = B[:, 0][None, :] + DX[:, None]; Qy = B[:, 1][None, :] + DY[:, None]
+        xi = np.clip(Qx.astype(int), 0, Ww - 1); yi = np.clip(Qy.astype(int), 0, Hh - 1)
+        vals = dt[yi, xi]
+        return [float(vals[k].mean()) for k in range(vals.shape[0])], DX, DY
+    def cost1(dx, dy, s, th):
+        Q = cen + s * ((P - cen) @ _R(th).T) + np.array([dx, dy])
+        xi = np.clip(Q[:, 0].astype(int), 0, Ww - 1); yi = np.clip(Q[:, 1].astype(int), 0, Hh - 1)
+        return float(dt[yi, xi].mean())
+    best = (0.0, 0.0, 1.0, 0.0); bc = cost1(0, 0, 1.0, 0.0)
+    for th in (-0.06, -0.03, 0.0, 0.03, 0.06):
+        for s in (0.96, 1.0, 1.04):
+            dxs = list(range(-28, 29, 7)); dys = list(range(-28, 29, 7))
+            cl, DX, DY = costs(s, th, dxs, dys)
+            for k, c in enumerate(cl):
+                if c < bc: bc = c; best = (dxs[k // len(dys)], dys[k % len(dys)], s, th)
+    bx, by, bs, bth = best
+    for th in (bth - 0.02, bth - 0.01, bth, bth + 0.01, bth + 0.02):
+        for s in (bs - 0.02, bs - 0.01, bs, bs + 0.01, bs + 0.02):
+            dxs = list(range(int(bx) - 6, int(bx) + 7, 3)); dys = list(range(int(by) - 6, int(by) + 7, 3))
+            cl, DX, DY = costs(s, th, dxs, dys)
+            for k, c in enumerate(cl):
+                if c < bc: bc = c; best = (dxs[k // len(dys)], dys[k % len(dys)], s, th)
+    dx, dy, s, th = best; R = _R(th)
+    new = [(cen + s * ((np.array(c, dtype="float64") - cen) @ R.T) + np.array([dx, dy])).tolist() for c in corners_px]
+    return new, bc
+
+def _line_snap_ref(dt, corners_px):
+    """RECALAGE SUR LES LIGNES : ajuste (décalage + échelle en espace image) la projection du terrain
+    pour la coller au mieux sur les lignes blanches réelles. Ne déforme pas (garde la perspective de
     l'ancre), pousse juste le terrain sur le blanc. Renvoie (nouveaux_coins_px, residu_px)."""
     import cv2, numpy as np
     global _PITCH_PTS
@@ -1249,11 +1318,14 @@ def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
         import torchvision.transforms as T
         import torchvision.transforms.functional as f
         from PIL import Image
+        import time as _tm
+        _T = globals().setdefault("_PNL_T", {}); _T.clear(); _t0 = _tm.perf_counter()
         dev = P["dev"]; H0, W0 = im.shape[:2]
         im = _suppress_blue(im)   # VEO double tracé : PnLCalib ne doit voir qu'un seul tracé blanc
         t = f.to_tensor(Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))).float().unsqueeze(0)
         if t.shape[-1] != 960: t = T.Resize((540, 960))(t)
         t = t.to(dev); _, _, h, w = t.shape
+        _T["prep"] = _tm.perf_counter() - _t0
         # VERROU + SYNCHRO GPU : ces deux passes du modèle de calibrage tournent sur le GPU Apple. Sans
         # sérialisation + synchro, elles se chevauchaient avec une autre opération GPU -> « command encoder
         # already encoding » -> moteur tué pendant le recalage des lignes. On force une seule à la fois, finie.
@@ -1263,12 +1335,16 @@ def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
                 # AVANT de lancer la 2e (modèle lignes). Sans ce sync intermédiaire, sur Mac Apple 8 Go sous
                 # pression mémoire, la 2e passe démarrait pendant que la 1re encodait encore -> « command encoder
                 # already encoding » -> moteur tué. Un sync après CHAQUE passe = plus aucun chevauchement Metal.
+                _ta = _tm.perf_counter()
                 hm = P["m"](t); _gpu_sync()
+                _tb = _tm.perf_counter(); _T["ia_points"] = _tb - _ta
                 hml = P["ml"](t); _gpu_sync()
+                _tc = _tm.perf_counter(); _T["ia_lignes"] = _tc - _tb
                 # post-traitement des heatmaps AUSSI sur le GPU -> on le fait dans le verrou, puis on resynchronise.
                 kp = P["c2d"](P["kpf"](hm[:, :-1, :, :]), threshold=kp_th)
                 ln = P["c2d"](P["kpf_l"](hml[:, :-1, :, :]), threshold=line_th)
                 _gpu_sync()
+                _T["post"] = _tm.perf_counter() - _tc
         # (Pas de filtrage par masque pelouse ici : il supprimait des détections valides et affaiblissait
         #  la reconnaissance. La confusion ligne/panneau est gérée en aval par la cohérence temporelle
         #  des ancres, qui n'enlève aucune détection.)
@@ -1279,6 +1355,7 @@ def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
             _cdiag("    [PNL-DIAG] img=%dx%d  points-cles=%d  lignes=%d  (seuils kp=%.3f ligne=%.3f)" % (W0, H0, _nk, _nl, kp_th, line_th))
         except Exception as _de:
             _cdiag("    [PNL-DIAG] compteur err: %s" % _de)
+        _tv = _tm.perf_counter()
         cam = P["Cal"](iwidth=W0, iheight=H0, denormalize=True)
         cam.update(kp_dict, lines_dict)
         # Homographie du SOL (terrain plat) + RAFFINEMENT PAR LES LIGNES : l'homographie est optimisée
@@ -1294,6 +1371,7 @@ def pnl_field_pts(im, kp_th=0.3434, line_th=0.7867, refine=True):
                 res = cam.heuristic_voting_ground(refine_lines=False)
             except Exception:
                 res = None
+        _T["calcul_terrain"] = _tm.perf_counter() - _tv
         if not res or res.get("homography") is None:
             _cdiag("    [PNL-DIAG] -> VOTE CAMERA ECHOUE (pas d'homographie) : terrain non reconnu sur cette image")
             return None
@@ -6337,8 +6415,26 @@ def pnl_warm():
 
 _CALIB_CACHE = {}   # VITESSE : on mémorise le résultat de l'auto-calibrage par (clip, instants, params)
 _CALIB_PROG = {}    # pid -> {"p":pourcentage, "msg":texte} : progression live de l'auto-calibrage
+# s67 : ANNULATION RÉELLE d'un calibrage. Avant, quand l'app abandonnait (délai dépassé, fenêtre fermée), le
+# moteur continuait à calculer pour rien en gardant le modèle IA -> le calibrage SUIVANT attendait derrière,
+# dépassait le délai à son tour et l'app retombait sur 1 seule ancre (terrain affiché à 0 s seulement).
+_CAL_CANCEL = set()   # pid à arrêter (demandé par l'app)
+_CAL_ARMED = set()    # pid de calibrages en cours (dans leur bloc protégé) -> annulables sans risque
+class _CalCancelled(Exception):
+    pass
 def _cp(pid, p, msg=""):
-    if pid: _CALIB_PROG[pid] = {"p": int(max(0, min(100, p))), "msg": msg}
+    if pid:
+        _CALIB_PROG[pid] = {"p": int(max(0, min(100, p))), "msg": msg}
+        if pid in _CAL_CANCEL and pid in _CAL_ARMED:
+            raise _CalCancelled()
+
+@app.post("/calib_cancel")
+def calib_cancel(pid: str = Form("")):
+    """L'app abandonne ce calibrage -> le moteur s'arrête à la prochaine étape et libère le modèle IA."""
+    if pid and pid in _CAL_ARMED:
+        _CAL_CANCEL.add(pid)
+        print("calibrage %s : ANNULATION demandée par l'app" % pid, flush=True)
+    return {"ok": True}
 
 @app.get("/calib_progress")
 def calib_progress(pid: str = ""):
@@ -6424,6 +6520,16 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
     clip, 2) PnLCalib sur quelques ANCRES précises, 3) propagation de la calibration le long
     du mouvement réel + points-clés ADAPTATIFS (serrés quand la caméra bouge)."""
     print("RECALAGE demandé — vkey=%s  t0=%.1f t1=%.1f" % (vkey, t0, t1), flush=True)
+    # s67 : même clip, mêmes réglages -> résultat MÉMORISÉ, renvoyé instantanément (relance / réouverture).
+    _ckey = "%s|%.2f|%.2f|%.2f|%d" % (vkey, float(t0 or 0), float(t1 or 0), float(anchor_dt or 0), int(minp or 0))
+    _cached = _CALIB_CACHE.get(_ckey)
+    if _cached and _cached.get("keyframes"):
+        print("  -> calibrage déjà calculé pour ce clip : renvoyé instantanément (%d images)" % len(_cached["keyframes"]), flush=True)
+        try:
+            if pid: _CALIB_PROG[pid] = {"p": 100, "msg": "terminé"}
+        except Exception:
+            pass
+        return _cached
     _suivi_enter()   # TRÈS TÔT : dès la demande de suivi, on bloque tout job ffmpeg GPU en arrière-plan
     vp = _resolve_vid(vkey)   # ignore .part / _win_ ; retrouve le vrai match même après redémarrage
     if not vp or not os.path.exists(vp):
@@ -6443,6 +6549,8 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         print("prep window err:", _pe, flush=True); T_OFF = 0.0
     print("  -> prêt : %s  (t_off=%.1fs, lourde=%s)" % (os.path.basename(vp), T_OFF, _calib_heavy), flush=True)
     try:
+        if pid: _CAL_ARMED.add(pid)   # s67 : à partir d'ici, une annulation demandée par l'app arrête proprement le calcul
+        _CAL_KEEP[0] += 1; _keep_on = True   # s68 : mémoire GPU gardée pendant tout le calibrage
         import cv2, numpy as np, time as _time
         # DÉCODAGE CPU (CAP_FFMPEG) TOUJOURS : c'est la clé anti-crash Metal. Si OpenCV décode la vidéo sur
         # le GPU (VideoToolbox) PENDANT que le modèle de calibrage tourne aussi sur le GPU (Metal/MPS), les
@@ -6561,12 +6669,50 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         if idxs and idxs[-1] != n - 1: idxs.append(n - 1)
         # (plus de plafond : l'émission ci-dessus est déjà pilotée par le mouvement caméra -> le nombre
         #  d'ancres est proportionnel au mouvement, donc un clip long/mouvementé en a naturellement plus.)
+        # s68 : LECTURE EN UN SEUL PASSAGE des images utiles (ancres en pleine taille + images de recalage
+        # réduites), dans l'ORDRE, exactement comme le suivi caméra -> plus de saut dans la vidéo pour chaque
+        # image (chaque saut redécodait depuis l'image clé précédente). Même image n°i que le suivi caméra.
+        _pre_full = {}; _pre_small = {}; _t_read = 0.0
+        try:
+            _tr0 = _time.perf_counter()
+            _e_pre = [0]; _acc = 0.0; _le = times[0]
+            for _i in range(1, n):
+                _acc += mot[_i]; _dtt = times[_i] - _le
+                if _dtt < 0.18: continue
+                if _acc >= 14.0 or _dtt >= 1.2:
+                    _e_pre.append(_i); _le = times[_i]; _acc = 0.0
+            if _e_pre[-1] != n - 1: _e_pre.append(n - 1)
+            _need_full = set(idxs); _need_small = set(_e_pre) | set(idxs)
+            _mb = len(_need_full) * (Ww * Hh * 3) / 1e6 + len(_need_small) * (Ws * Hs * 3) / 1e6
+            if _mb <= 900:   # mémoire bornée (clip très long -> on garde l'ancienne lecture image par image)
+                _capR = _VC(vp); _capR.set(cv2.CAP_PROP_POS_MSEC, a * 1000.0)
+                _last = max(_need_small | _need_full)
+                for _i in range(0, _last + 1):
+                    if not _capR.grab(): break
+                    if _i in _need_full or _i in _need_small:
+                        _okr, _fr = _capR.retrieve()
+                        if not _okr: continue
+                        if _i in _need_full: _pre_full[_i] = _fr
+                        if _i in _need_small: _pre_small[_i] = cv2.resize(_fr, (Ws, Hs)) if _fr.shape[1] != Ws else _fr
+                    if pid and _i % 8 == 0: _cp(pid, 39, "lecture des images…")
+                _capR.release()
+            _t_read = _time.perf_counter() - _tr0
+            print("  lecture en un passage : %d ancres + %d images de recalage en %.1fs (%.0f Mo)" % (len(_pre_full), len(_pre_small), _t_read, _mb), flush=True)
+        except _CalCancelled:
+            raise
+        except Exception as _re:
+            print("  lecture en un passage indisponible (%s) -> lecture image par image" % _re, flush=True)
+            _pre_full = {}; _pre_small = {}
+        _tsum = {"prep": 0.0, "ia_points": 0.0, "ia_lignes": 0.0, "post": 0.0, "calcul_terrain": 0.0}
         cap2 = _VC(vp); anchors = []; anc_idx = set(); _prop_rej = 0; _ai = 0
         print("  %d ancres à analyser (modèle terrain)…" % len(idxs), flush=True)
         for idx in idxs:
             _ai += 1
             if pid: _cp(pid, 40 + int(48 * _ai / max(1, len(idxs))), "ancres IA %d/%d…" % (_ai, len(idxs)))
-            cap2.set(cv2.CAP_PROP_POS_MSEC, times[idx] * 1000.0); ok, fr = cap2.read()
+            if idx in _pre_full:
+                ok, fr = True, _pre_full[idx]
+            else:
+                cap2.set(cv2.CAP_PROP_POS_MSEC, times[idx] * 1000.0); ok, fr = cap2.read()
             if not ok: continue
             globals()["_PNL_ERR"] = None
             # ANCRES : pas de raffinement lignes ici — la passe de recalage lignes dédiée (ci-dessous)
@@ -6574,7 +6720,11 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
             # (gain ~plusieurs secondes par ancre).
             _ta0 = _time.perf_counter()
             pts = field_pts(fr, minp, refine=False)
-            print("    ancre %d/%d @%.1fs -> %d pts (%.1fs)" % (_ai, len(idxs), times[idx] + T_OFF, len(pts or []), _time.perf_counter() - _ta0), flush=True)
+            _pt = dict(globals().get("_PNL_T") or {})
+            for _k in _tsum: _tsum[_k] += float(_pt.get(_k, 0.0))
+            print("    ancre %d/%d @%.1fs -> %d pts (%.1fs)  [préparation %.2f | IA points %.2f | IA lignes %.2f | post %.2f | calcul terrain %.2f]"
+                  % (_ai, len(idxs), times[idx] + T_OFF, len(pts or []), _time.perf_counter() - _ta0,
+                     _pt.get("prep", 0), _pt.get("ia_points", 0), _pt.get("ia_lignes", 0), _pt.get("post", 0), _pt.get("calcul_terrain", 0)), flush=True)
             if pts and len(pts) >= 4:
                 err = globals().get("_PNL_ERR")
                 if err is not None: _anc_errs.append(float(err))
@@ -6589,6 +6739,12 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
                 elif _quad_ok(cs[0], Ws, Hs):
                     _cdiag("    ancre @%.1fs REJETÉE (terrain aberrant : inversé/démesuré)" % (times[idx] + T_OFF))
         cap2.release(); _tAnc = _time.perf_counter()
+        try:
+            _na = max(1, _ai)
+            print("  DÉTAIL moyen par ancre : préparation %.2fs | IA points %.2fs | IA lignes %.2fs | post %.2fs | calcul terrain %.2fs  (lecture images %.1fs au total)"
+                  % (_tsum["prep"] / _na, _tsum["ia_points"] / _na, _tsum["ia_lignes"] / _na, _tsum["post"] / _na, _tsum["calcul_terrain"] / _na, _t_read), flush=True)
+        except Exception:
+            pass
         _cdiag("  ancres terrain VALIDES : %d / %d  (si 0 -> terrain non reconnu)" % (len(anchors), len(idxs)))
         if not anchors:
             print("  -> AUCUNE ancre valide : le terrain n'est pas reconnu sur ce clip -> recalage lignes NON lancé (calibrage auto impossible, passe en manuel).", flush=True)
@@ -6633,11 +6789,14 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         for i in emit_idx:
             _ei += 1
             if pid: _cp(pid, 90 + int(9 * _ei / max(1, len(emit_idx))), "recalage lignes…")
-            cap4.set(cv2.CAP_PROP_POS_MSEC, times[i] * 1000.0); okf, fr = cap4.read()
             dt = None
-            if okf:
-                small = cv2.resize(fr, (Ws, Hs)) if fr.shape[1] != Ws else fr
-                dt = _white_dt(small)
+            if i in _pre_small:
+                small = _pre_small[i]; dt = _white_dt(small)
+            else:
+                cap4.set(cv2.CAP_PROP_POS_MSEC, times[i] * 1000.0); okf, fr = cap4.read()
+                if okf:
+                    small = cv2.resize(fr, (Ws, Hs)) if fr.shape[1] != Ws else fr
+                    dt = _white_dt(small)
             # CANDIDATS : les 2 ancres qui encadrent le mieux l'image. On propage depuis chacune, on
             # recale sur les lignes, et on GARDE la meilleure (résidu le plus faible) -> corrige la dérive
             # héritée d'un seul côté (médiane en biais / touche qui déborde sur les images faibles).
@@ -6727,6 +6886,13 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         _cp(pid, 100, "terminé")
         _result = {"keyframes": out, "n": len(out), "anchors": len(anchors), "cam": cam, "field_ranges": field_ranges, "metrics": _metrics}
         _result = _json_safe(_result)   # types natifs -> plus de 500 silencieuse à la sérialisation
+        try:   # s67 : mémorisé pour une relance instantanée (40 clips max)
+            if out:
+                _CALIB_CACHE[_ckey] = _result
+                while len(_CALIB_CACHE) > 40:
+                    _CALIB_CACHE.pop(next(iter(_CALIB_CACHE)))
+        except Exception:
+            pass
         try:
             import json as _json
             _sz = len(_json.dumps(_result))
@@ -6734,12 +6900,25 @@ def calibrate_smart(vkey: str = Form(...), t0: float = Form(0.0), t1: float = Fo
         except Exception as _je:
             _cdiag("==> RETOUR calibrate_smart : PAYLOAD NON-JSON malgré nettoyage -> " + str(_je))
         return _result
+    except _CalCancelled:
+        print("  -> calibrage ARRÊTÉ (abandonné par l'app) : modèle IA libéré pour le suivant", flush=True)
+        return {"keyframes": [], "n": 0, "cancelled": True}
     except Exception as e:
         import traceback
         _cdiag("==> RETOUR calibrate_smart : ERREUR -> " + str(e))
         _cdiag(traceback.format_exc())
         traceback.print_exc(); return JSONResponse({"error": str(e)}, status_code=500)
     finally:
+        try:
+            _CAL_ARMED.discard(pid); _CAL_CANCEL.discard(pid)
+        except Exception:
+            pass
+        try:
+            if locals().get("_keep_on"):
+                _CAL_KEEP[0] = max(0, _CAL_KEEP[0] - 1)
+                if _CAL_KEEP[0] == 0: _gpu_free()   # s68 : vidage UNE fois, à la fin du calibrage
+        except Exception:
+            pass
         _suivi_exit()
 
 @app.get("/ai_status")
@@ -7140,6 +7319,21 @@ def _warmup_models():
     # saturent la mémoire -> swap -> TOUT le rendu du montage devient 2× plus lent. Les modèles se
     # chargent tout seuls à la 1re utilisation du Suivi IA / calibrage (léger délai la 1re fois, une seule fois).
     # Pour forcer le préchauffage (machines avec beaucoup de RAM) : lancer avec MATCHLYZ_WARMUP=1.
+    # s68 : Mac avec 16 Go de mémoire ou plus -> on précharge UNIQUEMENT le modèle de calibrage terrain, en
+    # arrière-plan (le 1er Suivi IA ne paie plus le chargement). Sur 8 Go on ne touche à rien (mémoire limitée).
+    try:
+        _mem = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
+    except Exception:
+        _mem = 0
+    if _mem >= 15.5e9 and _os.environ.get("MATCHLYZ_NO_WARMUP") != "1" and _os.environ.get("MATCHLYZ_WARMUP") != "1":
+        def _wp():
+            try:
+                import numpy as _np
+                get_pnl(); pnl_field_pts(_np.zeros((720, 1280, 3), dtype="uint8"))
+                print("Calibrage terrain préchargé (Mac %.0f Go) — 1er Suivi IA sans attente." % (_mem / 1e9), flush=True)
+            except Exception as _e:
+                print("préchargement calibrage:", _e, flush=True)
+        threading.Thread(target=_wp, daemon=True).start()
     if _os.environ.get("MATCHLYZ_WARMUP") != "1":
         return
     if _os.environ.get("MATCHLYZ_NO_WARMUP") == "1":

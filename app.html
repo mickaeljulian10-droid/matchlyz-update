@@ -7922,10 +7922,11 @@ function consolidateCalibs(a, win){ win=win||0.7; if(!a||!a.calibs||a.calibs.len
   }
   keep.sort((x,y)=>x.t-y.t); a.calibs=keep; if(typeof aiwin!=='undefined'&&aiwin)aiwin._hc=null; }
 // Calibration IA sur TOUT le clip (suit la caméra) : remplace les points-clés par une série dense.
-function aiCancelAutoCal(){ try{ aiwin._calProgOn=false; }catch(e){} try{ aiwin._calBusy=false; }catch(e){} try{ if(aiwin._calAbort){ aiwin._calAbort.abort(); aiwin._calAbort=null; } }catch(e){} try{ if(typeof aiBarHide==='function')aiBarHide(); }catch(e){} }
+function aiCancelAutoCal(){ try{ if(aiwin._calProgOn && aiwin._calPid){ const fd=new FormData(); fd.append('pid',aiwin._calPid); fetch(AI_BASE+'/calib_cancel',{method:'POST',body:fd}).catch(()=>{}); } }catch(e){} try{ aiwin._calProgOn=false; }catch(e){} try{ aiwin._calBusy=false; }catch(e){} try{ if(aiwin._calAbort){ aiwin._calAbort.abort(); aiwin._calAbort=null; } }catch(e){} try{ if(typeof aiBarHide==='function')aiBarHide(); }catch(e){} }
 async function aiCalibrateClip(vkey){ const a=aiwin.action; const pid='cal_'+Math.random().toString(36).slice(2); const fd=new FormData(); fd.append('vkey',vkey); fd.append('t0',a.in||0); fd.append('t1',a.out||0); fd.append('anchor_dt','1.5'); fd.append('minp',(window.aiMinP||15)); fd.append('pid',pid);
   const ac=(typeof AbortController!=='undefined')?new AbortController():null; aiwin._calAbort=ac; aiwin._calProgOn=true;
-  (async()=>{ while(aiwin._calProgOn){ try{ const s=await fetch(AI_BASE+'/calib_progress?pid='+pid).then(r=>r.json()); if(aiwin._calProgOn&&s&&s.p!=null&&aiwin.open&&aiwin.calMode&&(!(aiwin.calPts||[]).length)) aiBar('📐 Calibrage auto en fond '+pctBar(s.p)+' <span class="hint">'+(s.msg||'')+' — ou place tes repères à la main</span>'); }catch(e){} await new Promise(r=>setTimeout(r,400)); } })();
+  aiwin._calPid=pid; aiwin._calLastProg=Date.now(); let _lastKey='';   // s67 : on sait quand le moteur AVANCE (pas de délai fixe)
+  (async()=>{ while(aiwin._calProgOn){ try{ const s=await fetch(AI_BASE+'/calib_progress?pid='+pid).then(r=>r.json()); if(s&&s.p!=null){ const k=s.p+'|'+(s.msg||''); if(k!==_lastKey){ _lastKey=k; aiwin._calLastProg=Date.now(); } } if(aiwin._calProgOn&&s&&s.p!=null&&aiwin.open&&aiwin.calMode&&(!(aiwin.calPts||[]).length)) aiBar('📐 Calibrage auto en fond '+pctBar(s.p)+' <span class="hint">'+(s.msg||'')+' — ou place tes repères à la main</span>'); }catch(e){} await new Promise(r=>setTimeout(r,400)); } })();
   try{ const r=await fetch(AI_BASE+'/calibrate_smart',Object.assign({method:'POST',body:fd},ac?{signal:ac.signal}:{})).then(r=>r.json()); aiwin._calProgOn=false;
     if(r&&r.keyframes&&r.keyframes.length){ migrateCalib(a); a.calibs=[];
       a.camPath=(r.cam&&r.cam.length)?r.cam.map(s=>({t:+s.t, r:s.r.map(p=>[+p[0],+p[1]])})):null;
@@ -7981,20 +7982,30 @@ async function aiAutoCalibOnOpen(){ const a=aiwin.action; if(!a||!aiwin.open)ret
     if(!aiwin.open||aiwin.action!==a||!aiwin.calMode)return;
     if((aiwin.calPts||[]).length>0)return;   // tu es déjà passé en manuel -> on n'écrase pas
     if(!vkey){ _goMan(); aiBar('📐 Moteur non détecté — place 4-6 repères à la main puis ✅ Valider.'); setTimeout(aiBarHide,6000); return; }
-    // Délai : un calibrage normal peut prendre ~30-60 s. On coupe à 90 s (cas vraiment bloqué) -> bascule manuel.
-    let n=0; try{ n=await _withTimeout(aiCalibrateClip(vkey),90000); }catch(e){}
+    // s67 : PLUS DE COUPURE FIXE À 90 s. Sur un ordinateur chargé, un calibrage de 12 ancres peut dépasser 90 s :
+    // l'app abandonnait alors le résultat complet et retombait sur UNE seule ancre (terrain affiché à 0 s
+    // seulement). Maintenant on attend TANT QUE LE MOTEUR AVANCE ; on ne coupe que s'il ne bouge plus pendant
+    // 2 min (vraiment bloqué) ou au-delà de 15 min.
+    let n=0; try{ n=await _withStall(aiCalibrateClip(vkey),120000,900000); }catch(e){}
     if((aiwin.calPts||[]).length>0){ aiCancelAutoCal(); return; }
-    if(!n){ try{ if(await _withTimeout(aiAutoCalAt(vkey,a.in||0),40000))n++; }catch(e){} }
+    let _partial=false;
+    if(!n){ try{ aiCancelAutoCal(); }catch(e){} }   // s67 : on ARRÊTE d'abord le calcul bloqué côté moteur (sinon le repli attend derrière lui)
+    if(!n){ try{ if(await _withTimeout(aiAutoCalAt(vkey,a.in||0),40000)){ n++; _partial=true; } }catch(e){} }
     aiCancelAutoCal();
     if(!aiwin.open||aiwin.action!==a||!aiwin.calMode)return;
     if((aiwin.calPts||[]).length>0)return;
     save();
     if(hasCalib(a)){ aiCalLoadAt(vid.currentTime); aiwinParams(); renderAiTimeline();
       const bad=(a.calibs||[]).filter(c=>c.ok===false).length;
-      aiBar(bad?('⚠️ Calibrage AUTO fait — '+bad+' zone(s) à vérifier (✏️), ou ✅ Valider.'):'✅ Calibrage AUTO réussi. Vérifie puis ✅ Valider.'); setTimeout(aiBarHide,6500);
+      if(_partial){ aiBar('⚠️ Calibrage PARTIEL (1 seul instant) : le moteur n\'a pas répondu à temps. Clique 📐 Terrain puis « 🎥 Propager sur tout le clip », ou place tes repères.'); setTimeout(aiBarHide,9000); }
+      else { aiBar(bad?('⚠️ Calibrage AUTO fait — '+bad+' zone(s) à vérifier (✏️), ou ✅ Valider.'):'✅ Calibrage AUTO réussi. Vérifie puis ✅ Valider.'); setTimeout(aiBarHide,6500); }
     } else { _goMan(); aiBar('📐 L\'auto n\'a pas reconnu le terrain (fréquent VEO/amateur) → MANUEL : place 4-6 repères puis ✅ Valider.'); setTimeout(aiBarHide,7000); }
   } finally { aiwin._calBusy=false; } })();
 }
+function _withStall(p,stallMs,maxMs){ return new Promise((res,rej)=>{ const t0=Date.now(); let done=false;
+  const iv=setInterval(()=>{ const last=Math.max(t0,(typeof aiwin!=='undefined'&&aiwin&&aiwin._calLastProg)||0);
+    if(Date.now()-last>stallMs || Date.now()-t0>maxMs){ clearInterval(iv); if(!done){ done=true; rej(new Error('stall')); } } },1000);
+  Promise.resolve(p).then(v=>{ clearInterval(iv); if(!done){ done=true; res(v); } }, e=>{ clearInterval(iv); if(!done){ done=true; rej(e); } }); }); }
 function _withTimeout(p,ms){ return Promise.race([ Promise.resolve(p), new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), ms||20000)) ]); }
 // PROPAGATION : depuis TES mappages/corrections manuels, suit la caméra + recale sur les lignes.
 async function aiPropagateCalib(vkey, fromT){ const a=aiwin.action; const cs=calibList(a); if(!cs.length){ alert('Mappe d\'abord le terrain (4 points) avant de propager.'); return 0; }
